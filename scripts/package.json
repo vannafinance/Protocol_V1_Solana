@@ -1,0 +1,25 @@
+{
+  "name": "vanna-lending-scripts",
+  "version": "0.2.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "One CLI script covering every vanna_lending instruction, run against a real Devnet deployment.",
+  "scripts": {
+    "postinstall": "patch-package",
+    "devnet": "tsx src/devnet.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "0.32.1",
+    "@pythnetwork/hermes-client": "^3.1.0",
+    "@pythnetwork/pyth-solana-receiver": "^0.16.0",
+    "@pythnetwork/solana-utils": "^0.6.0",
+    "@solana/spl-token": "0.4.15",
+    "@solana/web3.js": "1.98.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "patch-package": "^8.0.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
