@@ -760,6 +760,57 @@ pub fn ix_public_liquidate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn ix_user_deposit_and_borrow(
+    authority: &Pubkey,
+    deposit_mint: &Pubkey,
+    deposit_price_update: &Pubkey,
+    borrow_mint: &Pubkey,
+    borrow_price_update: &Pubkey,
+    deposit_amount: u64,
+    borrow_amount: u64,
+    max_debt_shares: u128,
+    remaining: &[AccountMeta],
+) -> Instruction {
+    let (protocol_config, _) = protocol_config_pda();
+    let (margin_account, _) = margin_pda(authority);
+    let (deposit_asset_config, _) = asset_config_pda(deposit_mint);
+    let deposit_source_token_account = get_associated_token_address(authority, deposit_mint);
+    let deposit_margin_vault = margin_vault_ata(&margin_account, deposit_mint);
+    let (borrow_asset_config, _) = asset_config_pda(borrow_mint);
+    let (borrow_reserve, _) = reserve_pda(borrow_mint);
+    let (debt_position, _) = debt_position_pda(&margin_account, &borrow_reserve);
+    let borrow_reserve_vault = get_associated_token_address(&borrow_reserve, borrow_mint);
+    let borrow_margin_vault = margin_vault_ata(&margin_account, borrow_mint);
+    let mut accounts = vanna_lending::accounts::UserDepositAndBorrow {
+        authority: *authority,
+        protocol_config,
+        margin_account,
+        deposit_asset_config,
+        deposit_mint: *deposit_mint,
+        deposit_price_update: *deposit_price_update,
+        deposit_source_token_account,
+        deposit_margin_vault,
+        borrow_asset_config,
+        borrow_reserve,
+        debt_position,
+        borrow_price_update: *borrow_price_update,
+        borrow_mint: *borrow_mint,
+        borrow_reserve_vault,
+        borrow_margin_vault,
+        token_program: anchor_spl::token::ID,
+        associated_token_program: anchor_spl::associated_token::ID,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    accounts.extend_from_slice(remaining);
+    Instruction {
+        program_id: vanna_lending::ID,
+        accounts,
+        data: vanna_lending::instruction::UserDepositAndBorrow { deposit_amount, borrow_amount, max_debt_shares }.data(),
+    }
+}
+
 /// Builds the ordered `remaining_accounts` metas for one active collateral group
 /// (`AssetConfig`, margin vault ATA, Pyth `PriceUpdateV2`), all read-only.
 pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {

@@ -21,7 +21,9 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-fn apply_accrual(reserve: &mut Account<Reserve>, now: i64) -> Result<()> {
+// `pub(crate)` (not private) so `instructions::composite::user_deposit_and_borrow` can reuse the
+// exact same accrual step instead of duplicating it.
+pub(crate) fn apply_accrual(reserve: &mut Account<Reserve>, now: i64) -> Result<()> {
     let accrual = accrue(reserve, now)?;
     reserve.total_borrow_assets = accrual.new_total_borrow_assets;
     reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;

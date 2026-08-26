@@ -211,4 +211,15 @@ pub mod vanna_lending {
     pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
         instructions::liquidation::public_liquidate(ctx, max_repay_assets, min_collateral_out)
     }
+
+    // -- Composite -----------------------------------------------------------
+
+    pub fn user_deposit_and_borrow(
+        ctx: Context<UserDepositAndBorrow>,
+        deposit_amount: u64,
+        borrow_amount: u64,
+        max_debt_shares: u128,
+    ) -> Result<()> {
+        instructions::composite::user_deposit_and_borrow(ctx, deposit_amount, borrow_amount, max_debt_shares)
+    }
 }

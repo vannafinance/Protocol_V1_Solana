@@ -1,0 +1,60 @@
+diff --git a/node_modules/@pythnetwork/solana-utils/dist/cjs/index.cjs b/node_modules/@pythnetwork/solana-utils/dist/cjs/index.cjs
+index 652a696..819b87e 100644
+--- a/node_modules/@pythnetwork/solana-utils/dist/cjs/index.cjs
++++ b/node_modules/@pythnetwork/solana-utils/dist/cjs/index.cjs
+@@ -28,8 +28,9 @@ _export(exports, {
+         return _transaction.sendTransactions;
+     },
+     get sendTransactionsJito () {
+-        return _jito.sendTransactionsJito;
++        // Lazily required — jito-ts (and its own pinned old @solana/web3.js/rpc-websockets)
++        // is only loaded if a caller actually touches this export.
++        return require("./jito.cjs").sendTransactionsJito;
+     }
+ });
+ const _transaction = require("./transaction.cjs");
+-const _jito = require("./jito.cjs");
+diff --git a/node_modules/@pythnetwork/solana-utils/dist/cjs/transaction.cjs b/node_modules/@pythnetwork/solana-utils/dist/cjs/transaction.cjs
+index af43bb0..3a8e746 100644
+--- a/node_modules/@pythnetwork/solana-utils/dist/cjs/transaction.cjs
++++ b/node_modules/@pythnetwork/solana-utils/dist/cjs/transaction.cjs
+@@ -39,7 +39,11 @@ _export(exports, {
+ });
+ const _web3 = require("@solana/web3.js");
+ const _bs58 = /*#__PURE__*/ _interop_require_default(require("bs58"));
+-const _jito = require("./jito.cjs");
++// Lazily required — jito-ts (and its own pinned old @solana/web3.js/rpc-websockets) is only
++// loaded the first time a caller actually passes a `jitoTipLamports` priority-fee option.
++function _jito() {
++    return require("./jito.cjs");
++}
+ function _interop_require_default(obj) {
+     return obj && obj.__esModule ? obj : {
+         default: obj
+@@ -120,7 +124,7 @@ class TransactionBuilder {
+                 ...this.transactionInstructions.at(-1)?.instructions ?? [],
+                 instruction,
+                 this.transactionInstructions.length % JITO_BUNDLE_SIZE === 0 // This transaction may be the first of a Jito bundle, so we leave room for a Jito tip transfer.
+-                 ? (0, _jito.buildJitoTipInstruction)(this.payer, 1) : _web3.ComputeBudgetProgram.setComputeUnitPrice({
++                 ? (0, _jito().buildJitoTipInstruction)(this.payer, 1) : _web3.ComputeBudgetProgram.setComputeUnitPrice({
+                     microLamports: 1
+                 }),
+                 _web3.ComputeBudgetProgram.setComputeUnitLimit({
+@@ -172,7 +176,7 @@ class TransactionBuilder {
+                 }));
+             }
+             if (args.jitoTipLamports && index % JITO_BUNDLE_SIZE === 0) {
+-                instructionsWithComputeBudget.push((0, _jito.buildJitoTipInstruction)(this.payer, args.jitoTipLamports));
++                instructionsWithComputeBudget.push((0, _jito().buildJitoTipInstruction)(this.payer, args.jitoTipLamports));
+             }
+             // This handles an edge case where a single instruction is too big and therefore needs to be by itself without any compute budget instructions or jito tips
+             const instructionsToSend = [];
+@@ -216,7 +220,7 @@ class TransactionBuilder {
+                 }));
+             }
+             if (args.jitoTipLamports && index % JITO_BUNDLE_SIZE === 0) {
+-                instructionsWithComputeBudget.push((0, _jito.buildJitoTipInstruction)(this.payer, args.jitoTipLamports));
++                instructionsWithComputeBudget.push((0, _jito().buildJitoTipInstruction)(this.payer, args.jitoTipLamports));
+             }
+             // This handles an edge case where a single instruction is too big and therefore needs to be by itself without any compute budget instructions or jito tips
+             const instructionsToSend = [];
