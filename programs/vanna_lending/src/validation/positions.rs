@@ -103,8 +103,6 @@ pub fn scan_and_validate_positions<'info>(
             mint: asset_config.mint,
             valuation: CollateralValuation {
                 collateral_value,
-                ltv_bps: asset_config.ltv_bps,
-                liquidation_threshold_bps: asset_config.liquidation_threshold_bps,
             },
         });
     }

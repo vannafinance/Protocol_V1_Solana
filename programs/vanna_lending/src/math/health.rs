@@ -1,5 +1,5 @@
 use super::fixed_point::{checked_pow10, mul_div_floor};
-use crate::constants::{BASIS_POINTS, USD_VALUE_DECIMALS, WAD};
+use crate::constants::{BALANCE_TO_BORROW_THRESHOLD_WAD, USD_VALUE_DECIMALS, WAD};
 use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 
@@ -65,12 +65,12 @@ pub fn value_to_token_amount(
 }
 
 /// One collateral asset's contribution to a health snapshot. `collateral_value` must already be
-/// the rounded-down USD value of the credited amount (see `normalize_token_value`).
+/// the rounded-down USD value of the credited amount (see `normalize_token_value`). The canonical
+/// Vanna Solidity/Soroban risk formula values every credited asset at its full oracle value and
+/// applies one account-level 1.10 collateral-to-debt threshold.
 #[derive(Clone, Copy)]
 pub struct CollateralValuation {
     pub collateral_value: u128,
-    pub ltv_bps: u16,
-    pub liquidation_threshold_bps: u16,
 }
 
 /// One debt position's contribution to a health snapshot. `debt_value` must already be the
@@ -90,45 +90,43 @@ pub struct HealthSnapshot {
 }
 
 impl HealthSnapshot {
-    /// Spec §7.6 — no debt is trivially healthy; otherwise borrow power must cover debt value.
+    /// Mirrors Solidity/Soroban exactly: zero debt is healthy; otherwise HF must be > 1.10.
     pub fn is_borrow_healthy(&self) -> bool {
-        self.total_debt_value == 0 || self.borrow_power >= self.total_debt_value
+        self.total_debt_value == 0
+            || self.borrow_health_factor_wad > BALANCE_TO_BORROW_THRESHOLD_WAD
     }
 
-    /// Spec §6.5 — liquidatable only once liquidation-threshold-weighted collateral falls short.
+    /// The strict healthy check makes equality at 1.10 liquidatable, matching the references.
     pub fn is_liquidatable(&self) -> bool {
-        self.total_debt_value > 0 && self.liquidation_collateral_value < self.total_debt_value
+        self.total_debt_value > 0
+            && self.liquidation_health_factor_wad <= BALANCE_TO_BORROW_THRESHOLD_WAD
     }
 }
 
-fn health_factor_wad(numerator: u128, denominator: u128) -> u128 {
+fn health_factor_wad(numerator: u128, denominator: u128) -> Result<u128> {
     if denominator == 0 {
-        u128::MAX
+        Ok(u128::MAX)
     } else {
-        mul_div_floor(numerator, WAD, denominator).unwrap_or(u128::MAX)
+        // Never convert overflow into "infinite health". The Solidity reference has uint256 and
+        // Soroban uses U256; with Solana's u128 accumulator an overflow must fail closed.
+        mul_div_floor(numerator, WAD, denominator)
     }
 }
 
-/// Spec §7.6 health calculation, driven entirely from already-validated per-asset valuations —
-/// the caller (instruction handler) is responsible for ensuring `collaterals`/`debts` cover every
-/// canonical active index on the margin account (spec `validate_complete_positions`).
+/// Canonical Vanna health calculation, matching both reference implementations:
+/// `health_factor = total_collateral_usd / total_debt_usd`.
+///
+/// Borrowed assets held by the margin account are included by the instruction handlers as
+/// collateral, so a new borrow increases both sides of the ratio just as it does in Solidity and
+/// Soroban. The caller remains responsible for supplying every active position.
 pub fn calculate_health(
     collaterals: &[CollateralValuation],
     debts: &[DebtValuation],
 ) -> Result<HealthSnapshot> {
-    let mut borrow_power: u128 = 0;
-    let mut liquidation_collateral_value: u128 = 0;
+    let mut total_collateral_value: u128 = 0;
     for c in collaterals {
-        let ltv_component = mul_div_floor(c.collateral_value, c.ltv_bps as u128, BASIS_POINTS as u128)?;
-        borrow_power = borrow_power.checked_add(ltv_component).ok_or(VannaError::MathOverflow)?;
-
-        let liq_component = mul_div_floor(
-            c.collateral_value,
-            c.liquidation_threshold_bps as u128,
-            BASIS_POINTS as u128,
-        )?;
-        liquidation_collateral_value = liquidation_collateral_value
-            .checked_add(liq_component)
+        total_collateral_value = total_collateral_value
+            .checked_add(c.collateral_value)
             .ok_or(VannaError::MathOverflow)?;
     }
 
@@ -139,12 +137,16 @@ pub fn calculate_health(
             .ok_or(VannaError::MathOverflow)?;
     }
 
+    let health_factor = health_factor_wad(total_collateral_value, total_debt_value)?;
+
     Ok(HealthSnapshot {
-        borrow_power,
-        liquidation_collateral_value,
+        // Keep the established snapshot/event field names for client compatibility. Both now
+        // contain the same raw collateral total because Vanna uses one account-level threshold.
+        borrow_power: total_collateral_value,
+        liquidation_collateral_value: total_collateral_value,
         total_debt_value,
-        borrow_health_factor_wad: health_factor_wad(borrow_power, total_debt_value),
-        liquidation_health_factor_wad: health_factor_wad(liquidation_collateral_value, total_debt_value),
+        borrow_health_factor_wad: health_factor,
+        liquidation_health_factor_wad: health_factor,
     })
 }
 
@@ -191,17 +193,80 @@ mod tests {
     }
 
     #[test]
-    fn borrow_power_uses_ltv_liquidation_uses_threshold() {
+    fn health_ratio_overflow_fails_closed() {
+        let result = calculate_health(
+            &[CollateralValuation {
+                collateral_value: u128::MAX,
+            }],
+            &[DebtValuation { debt_value: 1 }],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn health_uses_raw_collateral_and_single_reference_threshold() {
         let collaterals = [CollateralValuation {
             collateral_value: 1_000_000_000, // $1
-            ltv_bps: 8_000,
-            liquidation_threshold_bps: 8_500,
         }];
-        let debts = [DebtValuation { debt_value: 850_000_000 }]; // $0.85
+        let debts = [DebtValuation { debt_value: 900_000_000 }]; // HF = 1.111... > 1.10
         let snap = calculate_health(&collaterals, &debts).unwrap();
-        assert_eq!(snap.borrow_power, 800_000_000);
-        assert_eq!(snap.liquidation_collateral_value, 850_000_000);
-        assert!(!snap.is_borrow_healthy()); // 800m < 850m debt -> would-be borrow unhealthy
-        assert!(!snap.is_liquidatable()); // 850m liq value == 850m debt -> not yet liquidatable
+        assert_eq!(snap.borrow_power, 1_000_000_000);
+        assert_eq!(snap.liquidation_collateral_value, 1_000_000_000);
+        assert!(snap.is_borrow_healthy());
+        assert!(!snap.is_liquidatable());
+    }
+
+    #[test]
+    fn equality_at_reference_threshold_is_unhealthy_and_liquidatable() {
+        let collaterals = [CollateralValuation {
+            collateral_value: 1_100_000_000,
+        }];
+        let debts = [DebtValuation { debt_value: 1_000_000_000 }];
+        let snap = calculate_health(&collaterals, &debts).unwrap();
+        assert_eq!(snap.borrow_health_factor_wad, BALANCE_TO_BORROW_THRESHOLD_WAD);
+        assert!(!snap.is_borrow_healthy());
+        assert!(snap.is_liquidatable());
+    }
+
+    #[test]
+    fn projected_leverage_matches_solidity_and_soroban() {
+        // A $10 wallet deposit at 5x borrows $40. Borrowed funds remain in the
+        // margin account, so projected collateral is $50 and debt is $40.
+        let five_x = calculate_health(
+            &[CollateralValuation {
+                collateral_value: 50_000_000_000,
+            }],
+            &[DebtValuation {
+                debt_value: 40_000_000_000,
+            }],
+        )
+        .unwrap();
+        assert_eq!(five_x.borrow_health_factor_wad, 1_250_000_000_000_000_000);
+        assert!(five_x.is_borrow_healthy());
+
+        // 10x is still above the canonical 1.10 threshold: $100 / $90 = 1.111...
+        let ten_x = calculate_health(
+            &[CollateralValuation {
+                collateral_value: 100_000_000_000,
+            }],
+            &[DebtValuation {
+                debt_value: 90_000_000_000,
+            }],
+        )
+        .unwrap();
+        assert!(ten_x.is_borrow_healthy());
+
+        // 11x lands exactly at 1.10 and must fail because the reference uses `>`.
+        let eleven_x = calculate_health(
+            &[CollateralValuation {
+                collateral_value: 110_000_000_000,
+            }],
+            &[DebtValuation {
+                debt_value: 100_000_000_000,
+            }],
+        )
+        .unwrap();
+        assert!(!eleven_x.is_borrow_healthy());
+        assert!(eleven_x.is_liquidatable());
     }
 }

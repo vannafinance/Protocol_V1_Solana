@@ -10,7 +10,7 @@ const USDC_FEED: [u8; 32] = [1u8; 32];
 const WSOL_FEED: [u8; 32] = [2u8; 32];
 const USDC_PRICE: i64 = 100_000_000; // $1.00 @ exponent -8
 const WSOL_PRICE_HEALTHY: i64 = 20_000_000_000; // $200.00 @ exponent -8
-const WSOL_PRICE_CRASHED: i64 = 17_000_000_000; // $170.00 @ exponent -8 -- just enough to trip the 80% liquidation threshold
+const WSOL_PRICE_CRASHED: i64 = 15_000_000_000; // $150.00 @ exponent -8 -- HF becomes 1500/1390 < 1.10
 
 /// A margin account borrows USDC against WSOL collateral while WSOL is healthy, the price then
 /// crashes, and a liquidator partially repays the debt and seizes WSOL collateral with a bonus.
@@ -69,7 +69,7 @@ fn liquidation_after_price_crash() {
     send(&mut svm, &borrower, &[ix_user_open_debt_position(&borrower.pubkey(), &borrower.pubkey(), &margin, &usdc_mint)], &[])
         .expect("open USDC debt");
 
-    let borrow_amount = 1_390 * 10u64.pow(6); // just under the $1,400 (70% * $2,000) borrow power
+    let borrow_amount = 1_390 * 10u64.pow(6);
     let remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
     send(
         &mut svm,
@@ -96,7 +96,7 @@ fn liquidation_after_price_crash() {
     )
     .expect("withdraw borrowed USDC out of the margin account");
 
-    // WSOL crashes just enough that liquidation-threshold-weighted collateral falls below debt.
+    // After borrowed USDC is withdrawn, WSOL crashes enough that raw collateral/debt HF <= 1.10.
     set_price(&mut svm, &wsol_price_update, WSOL_FEED, WSOL_PRICE_CRASHED, 0, -8, now);
 
     // Liquidator repays part of the USDC debt and seizes WSOL collateral with the configured bonus.

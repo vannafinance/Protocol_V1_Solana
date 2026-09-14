@@ -277,8 +277,6 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
         )?;
         collaterals.push(CollateralValuation {
             collateral_value,
-            ltv_bps: ctx.accounts.asset_config.ltv_bps,
-            liquidation_threshold_bps: ctx.accounts.asset_config.liquidation_threshold_bps,
         });
     }
 

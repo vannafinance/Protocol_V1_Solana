@@ -80,7 +80,7 @@ fn deposit_and_borrow_creates_margin_and_debt_position_in_one_tx() {
     let (margin, _) = margin_pda(&borrower.pubkey());
     // Brand-new margin account: no other active positions to scan, so `remaining` is empty.
     let deposit_amount = 10 * 10u64.pow(9); // 10 WSOL ~= $2,000
-    let borrow_amount = 500 * 10u64.pow(6); // 500 USDC, well within 70% LTV of $2,000
+    let borrow_amount = 500 * 10u64.pow(6); // Projected HF = ($2,000 + $500) / $500 = 5.0
     let res = send(
         &mut svm,
         &borrower,
@@ -163,9 +163,10 @@ fn deposit_and_borrow_rejects_unhealthy_borrow() {
     let borrower = funded_keypair(&mut svm);
     mint_to_wallet(&mut svm, &f.admin, &f.wsol_mint, &f.admin, &borrower.pubkey(), 100 * 10u64.pow(9));
 
-    // 1 WSOL ~= $200 deposited, but try to borrow $1,000 of USDC — far past 70% LTV.
+    // 1 WSOL ~= $200 deposited. A $2,000 borrow lands exactly at HF 1.10, so
+    // $2,500 is unambiguously below the strict reference threshold.
     let deposit_amount = 1 * 10u64.pow(9);
-    let borrow_amount = 1_000 * 10u64.pow(6);
+    let borrow_amount = 2_500 * 10u64.pow(6);
     let res = send(
         &mut svm,
         &borrower,

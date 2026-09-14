@@ -267,8 +267,6 @@ pub fn user_deposit_and_borrow(
     )?;
     collaterals.push(CollateralValuation {
         collateral_value: deposit_collateral_value,
-        ltv_bps: ctx.accounts.deposit_asset_config.ltv_bps,
-        liquidation_threshold_bps: ctx.accounts.deposit_asset_config.liquidation_threshold_bps,
     });
 
     // Borrow asset's own projected debt value (existing + new shares, priced with its own feed).
@@ -325,8 +323,6 @@ pub fn user_deposit_and_borrow(
         )?;
         collaterals.push(CollateralValuation {
             collateral_value: borrow_side_collateral_value,
-            ltv_bps: ctx.accounts.borrow_asset_config.ltv_bps,
-            liquidation_threshold_bps: ctx.accounts.borrow_asset_config.liquidation_threshold_bps,
         });
     }
 

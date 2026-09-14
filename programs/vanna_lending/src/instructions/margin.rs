@@ -300,8 +300,6 @@ pub fn user_withdraw_collateral(
     )?;
     collaterals.push(CollateralValuation {
         collateral_value: projected_value,
-        ltv_bps: ctx.accounts.asset_config.ltv_bps,
-        liquidation_threshold_bps: ctx.accounts.asset_config.liquidation_threshold_bps,
     });
 
     let debt_valuations: Vec<_> = debts.into_iter().map(|d| d.valuation).collect();

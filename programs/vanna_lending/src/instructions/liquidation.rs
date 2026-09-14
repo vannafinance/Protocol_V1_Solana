@@ -96,8 +96,6 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
         .iter()
         .map(|c| CollateralValuation {
             collateral_value: c.valuation.collateral_value,
-            ltv_bps: c.valuation.ltv_bps,
-            liquidation_threshold_bps: c.valuation.liquidation_threshold_bps,
         })
         .collect();
     let other_debt_valuations: Vec<DebtValuation> =
@@ -134,8 +132,6 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     let mut pre_collaterals = other_collateral_valuations.clone();
     pre_collaterals.push(CollateralValuation {
         collateral_value: current_collateral_value,
-        ltv_bps: ctx.accounts.collateral_asset_config.ltv_bps,
-        liquidation_threshold_bps: ctx.accounts.collateral_asset_config.liquidation_threshold_bps,
     });
     let health_before = calculate_health(&pre_collaterals, &pre_debts)?;
     require!(health_before.is_liquidatable(), VannaError::PositionHealthy);
@@ -254,8 +250,6 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     let mut post_collaterals = other_collateral_valuations;
     post_collaterals.push(CollateralValuation {
         collateral_value: post_collateral_value,
-        ltv_bps: ctx.accounts.collateral_asset_config.ltv_bps,
-        liquidation_threshold_bps: ctx.accounts.collateral_asset_config.liquidation_threshold_bps,
     });
     let health_after = calculate_health(&post_collaterals, &post_debts)?;
     require!(

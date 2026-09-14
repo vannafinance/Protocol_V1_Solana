@@ -30,6 +30,7 @@ import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetInde
 import { fetchLivePrice, refreshPrice } from "./devnet-pyth";
 import {
   accrue,
+  BALANCE_TO_BORROW_THRESHOLD_WAD,
   calculateHealth,
   debtSharesToAssetsUp,
   formatHealthFactorWad,
@@ -143,7 +144,7 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
     debtBreakdown.push({ asset: info.key, amountRaw: currentDebtRaw, valueUsd });
   }
 
-  const collaterals = collateralBreakdown.map((c) => ({ collateralValue: c.valueUsd, ltvBps: c.ltvBps, liquidationThresholdBps: c.liquidationThresholdBps }));
+  const collaterals = collateralBreakdown.map((c) => ({ collateralValue: c.valueUsd }));
   const debts = debtBreakdown.map((d) => ({ debtValue: d.valueUsd }));
   const health = calculateHealth(collaterals, debts);
 
@@ -870,8 +871,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
           totalDebtValue: formatUsd(health.totalDebtValue),
           borrowHealthFactor: formatHealthFactorWad(health.borrowHealthFactorWad),
           liquidationHealthFactor: formatHealthFactorWad(health.liquidationHealthFactorWad),
-          isBorrowHealthy: health.totalDebtValue === 0n || health.borrowPower >= health.totalDebtValue,
-          isLiquidatable: health.totalDebtValue > 0n && health.liquidationCollateralValue < health.totalDebtValue,
+          isBorrowHealthy: health.totalDebtValue === 0n || health.borrowHealthFactorWad > BALANCE_TO_BORROW_THRESHOLD_WAD,
+          isLiquidatable: health.totalDebtValue > 0n && health.liquidationHealthFactorWad <= BALANCE_TO_BORROW_THRESHOLD_WAD,
         },
         null,
         2,
@@ -900,8 +901,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
           totalDebtValue: formatUsd(health.totalDebtValue),
           borrowHealthFactor: formatHealthFactorWad(health.borrowHealthFactorWad),
           liquidationHealthFactor: formatHealthFactorWad(health.liquidationHealthFactorWad),
-          isBorrowHealthy: health.totalDebtValue === 0n || health.borrowPower >= health.totalDebtValue,
-          isLiquidatable: health.totalDebtValue > 0n && health.liquidationCollateralValue < health.totalDebtValue,
+          isBorrowHealthy: health.totalDebtValue === 0n || health.borrowHealthFactorWad > BALANCE_TO_BORROW_THRESHOLD_WAD,
+          isLiquidatable: health.totalDebtValue > 0n && health.liquidationHealthFactorWad <= BALANCE_TO_BORROW_THRESHOLD_WAD,
         },
         null,
         2,

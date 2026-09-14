@@ -7,6 +7,7 @@
  */
 
 export const WAD = 10n ** 18n;
+export const BALANCE_TO_BORROW_THRESHOLD_WAD = 1_100_000_000_000_000_000n;
 export const USD_VALUE_DECIMALS = 9;
 export const BASIS_POINTS = 10_000n;
 export const SECONDS_PER_YEAR = 31_536_000n;
@@ -137,8 +138,6 @@ export function supplySharesToAssetsDown(shares: bigint, totalShareSupply: bigin
 
 export interface CollateralValuation {
   collateralValue: bigint;
-  ltvBps: number;
-  liquidationThresholdBps: number;
 }
 
 export interface DebtValuation {
@@ -160,21 +159,21 @@ function healthFactorWad(numerator: bigint, denominator: bigint): bigint {
 
 /** `math/health.rs::calculate_health`. */
 export function calculateHealth(collaterals: CollateralValuation[], debts: DebtValuation[]): HealthSnapshot {
-  let borrowPower = 0n;
-  let liquidationCollateralValue = 0n;
+  let totalCollateralValue = 0n;
   for (const c of collaterals) {
-    borrowPower += mulDivFloor(c.collateralValue, BigInt(c.ltvBps), BASIS_POINTS);
-    liquidationCollateralValue += mulDivFloor(c.collateralValue, BigInt(c.liquidationThresholdBps), BASIS_POINTS);
+    totalCollateralValue += c.collateralValue;
   }
   let totalDebtValue = 0n;
   for (const d of debts) totalDebtValue += d.debtValue;
 
   return {
-    borrowPower,
-    liquidationCollateralValue,
+    // Compatibility names retained for existing CLI consumers. Vanna's canonical risk model
+    // uses the same raw collateral total for borrow and liquidation health.
+    borrowPower: totalCollateralValue,
+    liquidationCollateralValue: totalCollateralValue,
     totalDebtValue,
-    borrowHealthFactorWad: healthFactorWad(borrowPower, totalDebtValue),
-    liquidationHealthFactorWad: healthFactorWad(liquidationCollateralValue, totalDebtValue),
+    borrowHealthFactorWad: healthFactorWad(totalCollateralValue, totalDebtValue),
+    liquidationHealthFactorWad: healthFactorWad(totalCollateralValue, totalDebtValue),
   };
 }
 

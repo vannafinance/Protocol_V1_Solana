@@ -20,6 +20,13 @@ pub const MAX_ASSETS: usize = 8;
 /// Fixed-point scale used for `borrow_index_wad` and reported health-factor ratios.
 pub const WAD: u128 = 1_000_000_000_000_000_000;
 
+/// Minimum collateral-to-debt ratio required after a borrow or collateral withdrawal.
+///
+/// This deliberately mirrors the canonical Solidity `balanceToBorrowThreshold` and
+/// Soroban `BALANCE_TO_BORROW_THRESHOLD`: an account is healthy only when
+/// `total_collateral_value / total_debt_value > 1.10`. Equality is unhealthy.
+pub const BALANCE_TO_BORROW_THRESHOLD_WAD: u128 = 1_100_000_000_000_000_000;
+
 /// Decimal precision used for internal USD valuations (nano-USD: 1e9 per US dollar).
 /// Deliberately smaller than WAD so collateral/debt value sums stay far from u128 overflow
 /// while retaining far more precision than any supported token's decimals or Pyth exponent.

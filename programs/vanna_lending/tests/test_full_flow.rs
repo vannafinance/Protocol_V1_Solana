@@ -98,7 +98,7 @@ fn full_protocol_flow() {
     );
     assert!(res.is_ok(), "open USDC debt position failed: {res:?}");
 
-    let borrow_amount = 500 * 10u64.pow(6); // 500 USDC, well within $1,400 borrow power (70% LTV * $2,000)
+    let borrow_amount = 500 * 10u64.pow(6); // Projected HF = ($2,000 + $500) / $500 = 5.0
     let remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
     let res = send(
         &mut svm,

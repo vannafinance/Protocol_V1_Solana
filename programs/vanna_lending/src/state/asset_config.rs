@@ -2,6 +2,9 @@ use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 
 /// Spec §4.2 `AssetConfig` — token identity, oracle identity, and risk limits for one mint.
+/// `ltv_bps` and `liquidation_threshold_bps` remain in the deployed account layout for backward
+/// compatibility, but Vanna V1 health uses the canonical account-wide 1.10 threshold. The
+/// liquidation bonus remains active in seize-amount calculations.
 #[account]
 #[derive(InitSpace)]
 pub struct AssetConfig {
@@ -24,8 +27,8 @@ pub struct AssetConfig {
 }
 
 impl AssetConfig {
-    /// Spec §4.2 required invariants on LTV/threshold/bonus. Called on registration and on every
-    /// config update, after applying the proposed values.
+    /// Preserves the already-deployed configuration invariants and account/API compatibility.
+    /// LTV and per-asset liquidation threshold do not participate in V1 health calculation.
     pub fn validate_risk_parameters(
         ltv_bps: u16,
         liquidation_threshold_bps: u16,
