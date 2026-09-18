@@ -1,4 +1,5 @@
 use crate::constants::CLASSIC_SPL_TOKEN_PROGRAM;
+use crate::constants::TOKEN_2022_PROGRAM;
 use crate::errors::VannaError;
 use crate::state::asset_config::AssetConfig;
 use crate::state::margin_account::MarginAccount;
@@ -51,7 +52,10 @@ pub fn assert_reserve_action_allowed(status_byte: u8, action: ProtocolAction) ->
 pub fn validate_asset_config(asset: &AssetConfig, mint: &Pubkey, token_program: &Pubkey) -> Result<()> {
     require_keys_eq!(asset.mint, *mint, VannaError::InvalidMint);
     require_keys_eq!(asset.token_program, *token_program, VannaError::InvalidTokenProgram);
-    require_keys_eq!(*token_program, CLASSIC_SPL_TOKEN_PROGRAM, VannaError::InvalidTokenProgram);
+    require!(
+        *token_program == CLASSIC_SPL_TOKEN_PROGRAM || *token_program == TOKEN_2022_PROGRAM,
+        VannaError::InvalidTokenProgram
+    );
     Ok(())
 }
 

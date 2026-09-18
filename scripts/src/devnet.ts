@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * One CLI for every vanna_lending instruction against real Solana Devnet.
+ * One CLI for every vanna_lending instruction against a local Surfpool mainnet fork.
  *
  * Usage:
  *   npx tsx src/devnet.ts <command> [--flag value ...]
@@ -23,6 +23,7 @@ import {
   log,
   programAs,
   PYTH_FEED_IDS,
+  tokenProgramFor,
 } from "./devnet-env";
 import { ata, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
 import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
@@ -46,6 +47,8 @@ const MODE_NAMES = ["Normal", "BorrowPaused", "WithdrawOnly", "Halted"];
 const RISK_DEFAULTS: Record<AssetKey, { ltv: number; liqThreshold: number; liqBonus: number }> = {
   usdc: { ltv: 8000, liqThreshold: 8500, liqBonus: 500 },
   wsol: { ltv: 7000, liqThreshold: 8000, liqBonus: 500 },
+  tslax: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
+  googlx: { ltv: 6000, liqThreshold: 7000, liqBonus: 700 },
 };
 
 interface Ctx {
@@ -56,13 +59,15 @@ interface Ctx {
   program: anchor.Program;
 }
 
-/** Refreshes real Pyth prices for both registered assets — needed by any instruction that scans
+/** Refreshes real Pyth prices for every registered asset — needed by any instruction that scans
  * every active position on a margin account (borrow, withdraw-collateral, liquidate). */
-async function refreshBothPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
-  log("refreshing Pyth prices", "usdc + wsol (any active position needs a fresh price)");
+async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
+  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx (including Kamino collateral)");
   return {
     usdc: await refreshPrice(ctx.conn, ctx.anchorWallet, "usdc"),
     wsol: await refreshPrice(ctx.conn, ctx.anchorWallet, "wsol"),
+    tslax: await refreshPrice(ctx.conn, ctx.anchorWallet, "tslax"),
+    googlx: await refreshPrice(ctx.conn, ctx.anchorWallet, "googlx"),
   };
 }
 
@@ -200,7 +205,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         protocolConfig,
         underlyingMint: mint,
         assetConfig,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
         systemProgram: SystemProgram.programId,
       })
       .rpc();
@@ -232,9 +237,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         underlyingMint: mint,
         reserve,
-        liquidityVault: ata(reserve, mint),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
+        shareTokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -457,7 +463,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [assetConfig] = assetConfigPda(mint);
     const marginVault = ata(margin, mint);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, { excludeCollateral: asset });
 
     const sig = await program.methods
@@ -542,7 +548,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [debtPosition] = debtPositionPda(margin, reserve);
     const marginVault = ata(margin, mint);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
       excludeCollateral: asset,
       excludeDebt: asset,
@@ -645,7 +651,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [debtPosition] = debtPositionPda(margin, debtReserve);
     const [collateralAssetConfig] = assetConfigPda(collateralMint);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
       excludeCollateral: collateralAsset,
       excludeDebt: debtAsset,

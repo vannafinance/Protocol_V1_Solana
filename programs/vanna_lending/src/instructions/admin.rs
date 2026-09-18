@@ -7,7 +7,8 @@ use crate::state::protocol_config::{OperatingMode, ProtocolConfig};
 use crate::state::reserve::{Reserve, ReserveStatus};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{Mint as TokenMint, Token};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 
 // ---------------------------------------------------------------------------
 // initialize_protocol
@@ -159,7 +160,7 @@ pub struct AdminRegisterAsset<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init,
         payer = payer,
@@ -168,7 +169,7 @@ pub struct AdminRegisterAsset<'info> {
         bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -301,7 +302,7 @@ pub struct AdminInitializeReserve<'info> {
         bump = asset_config.bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init,
         payer = payer,
@@ -314,19 +315,24 @@ pub struct AdminInitializeReserve<'info> {
         init,
         payer = payer,
         associated_token::mint = underlying_mint,
-        associated_token::authority = reserve
+        associated_token::authority = reserve,
+        associated_token::token_program = token_program,
     )]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init,
         payer = payer,
         mint::decimals = underlying_mint.decimals,
         mint::authority = reserve,
+        mint::token_program = share_token_program,
         seeds = [SHARE_MINT_SEED, underlying_mint.key().as_ref()],
         bump
     )]
-    pub share_mint: Box<Account<'info, Mint>>,
-    pub token_program: Program<'info, Token>,
+    pub share_mint: Box<Account<'info, TokenMint>>,
+    /// Token program for the underlying mint (classic SPL or Token-2022).
+    pub token_program: Interface<'info, TokenInterface>,
+    /// Classic SPL Token program — share mints are always classic SPL.
+    pub share_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -398,7 +404,7 @@ pub struct AdminUpdateReserveConfig<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         mut,
         seeds = [RESERVE_SEED, underlying_mint.key().as_ref()],
@@ -468,18 +474,18 @@ pub struct AdminCollectProtocolFees<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         mut,
         seeds = [RESERVE_SEED, underlying_mint.key().as_ref()],
         bump = reserve.bump
     )]
     pub reserve: Box<Account<'info, Reserve>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = reserve)]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = protocol_config.treasury)]
-    pub treasury_ata: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    #[account(mut, token::mint = underlying_mint, token::authority = reserve, token::token_program = token_program)]
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = protocol_config.treasury, token::token_program = token_program)]
+    pub treasury_ata: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn admin_collect_protocol_fees(ctx: Context<AdminCollectProtocolFees>, amount: u64) -> Result<()> {

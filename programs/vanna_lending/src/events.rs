@@ -210,3 +210,37 @@ pub struct Liquidated {
     pub event_sequence: u64,
     pub timestamp: i64,
 }
+
+#[event]
+pub struct LiteStrategyRegistered {
+    pub strategy_config: Pubkey,
+    pub underlying_mint: Pubkey,
+    pub kamino_reserve: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct LiteOpened {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub equity: u64,
+    pub borrowed: u64,
+    pub deposited: u64,
+    pub kamino_collateral: u64,
+    pub debt_shares: u128,
+    pub borrow_health_factor_wad: u128,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct LiteClosed {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub redeemed: u64,
+    pub debt_repaid: u64,
+    pub residual: u64,
+    pub debt_shares_burned: u128,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}

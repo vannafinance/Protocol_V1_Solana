@@ -6,7 +6,8 @@
   "description": "One CLI script covering every vanna_lending instruction, run against a real Devnet deployment.",
   "scripts": {
     "postinstall": "patch-package",
-    "devnet": "tsx src/devnet.ts"
+    "devnet": "tsx src/devnet.ts",
+    "lite-fork": "tsx src/lite-fork.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

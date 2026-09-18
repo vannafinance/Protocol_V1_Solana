@@ -9,9 +9,6 @@ skip-lint = false
 [programs.localnet]
 vanna_lending = "BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg"
 
-[programs.devnet]
-vanna_lending = "BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg"
-
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"

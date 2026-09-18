@@ -20,7 +20,7 @@ pub enum VannaError {
     InvalidBump,
     #[msg("Mint does not match the expected asset mint")]
     InvalidMint,
-    #[msg("Token program is not the classic SPL Token Program")]
+    #[msg("Token program must be classic SPL Token or Token-2022")]
     InvalidTokenProgram,
     #[msg("Token account authority does not match the expected PDA")]
     InvalidVaultAuthority,
@@ -100,4 +100,18 @@ pub enum VannaError {
     NonEmptyDebtPosition,
     #[msg("Collateral vault still holds a raw token balance")]
     NonEmptyVault,
+    #[msg("Kamino program id is invalid")]
+    InvalidKaminoProgram,
+    #[msg("Kamino market/reserve accounts do not match the registered strategy")]
+    InvalidKaminoAccounts,
+    #[msg("Lite strategy is disabled")]
+    LiteStrategyDisabled,
+    #[msg("A lite position already exists for this margin account")]
+    LitePositionExists,
+    #[msg("No lite position found for this margin account")]
+    NoLitePosition,
+    #[msg("Leverage is outside the allowed range")]
+    InvalidLeverage,
+    #[msg("Jupiter margin swap route or balance delta is invalid")]
+    InvalidSwapRoute,
 }

@@ -2,6 +2,7 @@ import * as anchor from "@coral-xyz/anchor";
 import { AccountMeta, PublicKey } from "@solana/web3.js";
 import { assetConfigPda, debtPositionPda, marginPda, reservePda } from "./pda";
 import { AssetKey, ASSET_MINTS } from "./devnet-env";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { ata } from "./devnet-cli";
 
 /** Sentinel for an empty slot in `MarginAccount.collateral_asset_indexes`/`debt_asset_indexes`. */
@@ -29,6 +30,7 @@ export async function getAssetIndexMap(program: anchor.Program): Promise<Record<
 }
 
 interface MarginAccountData {
+  reserved: number[];
   collateralAssetIndexes: number[];
   debtAssetIndexes: number[];
 }
@@ -82,6 +84,24 @@ export async function buildRemainingAccounts(
     );
   }
 
+  const registry = Buffer.from(marginAccount.reserved);
+  const count = registry[0];
+  if (count > 8) throw new Error("Invalid Kamino position registry");
+  const seeds = [Buffer.alloc(0), ...Array.from({length:count}, (_, i) => registry.subarray(1 + i * 2, 3 + i * 2))];
+  for (const seed of seeds) {
+  const [position] = PublicKey.findProgramAddressSync([Buffer.from("lite_position"),margin.toBuffer(),seed],program.programId);
+  metas.push({pubkey:position,isWritable:false,isSigner:false});
+  const accounts = program.account as any;
+  const lite = await accounts.litePosition.fetchNullable(position);
+  if (lite) {
+    const strategy = await accounts.liteStrategyConfig.fetch(lite.strategyConfig);
+    const item = Object.values(indexMap).find(i=>i.mint.equals(lite.underlyingMint));
+    if (!item || !priceAccounts[item.key]) throw new Error("Missing price/config for Kamino collateral");
+    metas.push(...[lite.strategyConfig,item.assetConfig,
+      getAssociatedTokenAddressSync(strategy.reserveCollateralMint,margin,true,strategy.collateralTokenProgram),
+      strategy.kaminoReserve,priceAccounts[item.key]].map(pubkey=>({pubkey,isWritable:false,isSigner:false})));
+  }
+  }
   return metas;
 }
 

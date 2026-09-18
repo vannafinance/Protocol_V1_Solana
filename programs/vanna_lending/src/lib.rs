@@ -1,6 +1,7 @@
 pub mod constants;
 pub mod errors;
 pub mod events;
+pub mod external;
 pub mod instructions;
 pub mod math;
 pub mod oracle;
@@ -15,6 +16,10 @@ declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
 #[program]
 pub mod vanna_lending {
     use super::*;
+
+    pub fn user_margin_swap<'info>(ctx: Context<'info, UserMarginSwap<'info>>, amount_in: u64, min_amount_out: u64, route_account_count: u16, route_data: Vec<u8>) -> Result<()> {
+        instructions::swap::user_margin_swap(ctx, amount_in, min_amount_out, route_account_count, route_data)
+    }
 
     // -- Governance -----------------------------------------------------
 
@@ -140,6 +145,10 @@ pub mod vanna_lending {
         instructions::admin::admin_collect_protocol_fees(ctx, amount)
     }
 
+    pub fn admin_register_lite_strategy(ctx: Context<AdminRegisterLiteStrategy>) -> Result<()> {
+        instructions::lite::admin_register_lite_strategy(ctx)
+    }
+
     // -- Margin lifecycle -------------------------------------------------
 
     pub fn user_create_margin(ctx: Context<UserCreateMargin>) -> Result<()> {
@@ -221,5 +230,19 @@ pub mod vanna_lending {
         max_debt_shares: u128,
     ) -> Result<()> {
         instructions::composite::user_deposit_and_borrow(ctx, deposit_amount, borrow_amount, max_debt_shares)
+    }
+
+    // -- Lite / Stocks (Kamino) ----------------------------------------------
+
+    pub fn lite_open(ctx: Context<LiteOpen>, equity: u64, leverage_bps: u64) -> Result<()> {
+        instructions::lite::lite_open(ctx, equity, leverage_bps)
+    }
+
+    pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u64) -> Result<()> {
+        instructions::lite::lite_reduce(ctx, exit_bps, min_underlying_out)
+    }
+
+    pub fn lite_close(ctx: Context<LiteClose>, min_underlying_out: u64) -> Result<()> {
+        instructions::lite::lite_close(ctx, min_underlying_out)
     }
 }

@@ -58,8 +58,8 @@ export function toBigInt(bn: anchor.BN): bigint {
   return BigInt(bn.toString());
 }
 
-export function ata(owner: PublicKey, mint: PublicKey): PublicKey {
-  return getAssociatedTokenAddressSync(mint, owner, true);
+export function ata(owner: PublicKey, mint: PublicKey, tokenProgram?: PublicKey): PublicKey {
+  return getAssociatedTokenAddressSync(mint, owner, true, tokenProgram);
 }
 
 export async function tokenBalance(connection: Connection, tokenAccount: PublicKey): Promise<bigint> {

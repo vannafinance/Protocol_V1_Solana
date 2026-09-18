@@ -17,7 +17,7 @@ use crate::validation::positions::scan_and_validate_positions;
 use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // ---------------------------------------------------------------------------
@@ -58,18 +58,24 @@ pub struct UserDepositAndBorrow<'info> {
     // --- Deposit (collateral) side ---
     #[account(seeds = [ASSET_SEED, deposit_mint.key().as_ref()], bump = deposit_asset_config.bump)]
     pub deposit_asset_config: Box<Account<'info, AssetConfig>>,
-    pub deposit_mint: Box<Account<'info, Mint>>,
+    pub deposit_mint: Box<InterfaceAccount<'info, Mint>>,
     /// Pyth price update for the deposited asset.
     pub deposit_price_update: Box<Account<'info, PriceUpdateV2>>,
-    #[account(mut, token::mint = deposit_mint, token::authority = authority)]
-    pub deposit_source_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = deposit_mint,
+        token::authority = authority,
+        token::token_program = token_program
+    )]
+    pub deposit_source_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = deposit_mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub deposit_margin_vault: Box<Account<'info, TokenAccount>>,
+    pub deposit_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // --- Borrow side ---
     #[account(seeds = [ASSET_SEED, borrow_mint.key().as_ref()], bump = borrow_asset_config.bump)]
@@ -87,20 +93,27 @@ pub struct UserDepositAndBorrow<'info> {
     pub debt_position: Box<Account<'info, DebtPosition>>,
     /// Pyth price update for the borrowed asset.
     pub borrow_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub borrow_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = borrow_mint, token::authority = borrow_reserve)]
-    pub borrow_reserve_vault: Box<Account<'info, TokenAccount>>,
+    pub borrow_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        token::mint = borrow_mint,
+        token::authority = borrow_reserve,
+        token::token_program = token_program
+    )]
+    pub borrow_reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     /// Borrowed funds land here as protocol-controlled collateral credit (spec §1.2), same as
     /// plain `user_borrow`.
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = borrow_mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub borrow_margin_vault: Box<Account<'info, TokenAccount>>,
+    pub borrow_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_program: Program<'info, Token>,
+    /// Both legs must share a token program (classic SPL or Token-2022).
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -139,11 +152,13 @@ pub fn user_deposit_and_borrow(
         &ctx.accounts.deposit_margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.deposit_mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
     verify_associated_token_account(
         &ctx.accounts.borrow_margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.borrow_mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
 
     let clock = Clock::get()?;
@@ -251,6 +266,7 @@ pub fn user_deposit_and_borrow(
         &clock,
         Some(ctx.accounts.deposit_asset_config.asset_index),
         Some(ctx.accounts.borrow_asset_config.asset_index),
+        None,
     )?;
     let mut collaterals: Vec<CollateralValuation> = scanned_collaterals.into_iter().map(|c| c.valuation).collect();
     let mut debts: Vec<DebtValuation> = other_debts.into_iter().map(|d| d.valuation).collect();

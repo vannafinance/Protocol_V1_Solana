@@ -282,6 +282,7 @@ pub fn ix_admin_initialize_reserve(
             liquidity_vault,
             share_mint,
             token_program: anchor_spl::token::ID,
+            share_token_program: anchor_spl::token::ID,
             associated_token_program: anchor_spl::associated_token::ID,
             system_program: anchor_lang::system_program::ID,
         }
@@ -495,6 +496,7 @@ pub fn ix_lender_supply(lender: &Pubkey, mint: &Pubkey, assets: u64, min_shares_
             share_mint,
             lender_share_account,
             token_program: anchor_spl::token::ID,
+            share_token_program: anchor_spl::token::ID,
             associated_token_program: anchor_spl::associated_token::ID,
             system_program: anchor_lang::system_program::ID,
         }
@@ -524,6 +526,7 @@ pub fn ix_lender_redeem(lender: &Pubkey, mint: &Pubkey, shares: u64, min_assets_
             share_mint,
             lender_share_account,
             token_program: anchor_spl::token::ID,
+            share_token_program: anchor_spl::token::ID,
         }
         .to_account_metas(None),
         data: vanna_lending::instruction::LenderRedeem { shares, min_assets_out }.data(),
@@ -624,6 +627,7 @@ pub fn ix_user_borrow(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
+    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -705,6 +709,7 @@ pub fn ix_user_withdraw_collateral(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
+    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -753,6 +758,7 @@ pub fn ix_public_liquidate(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
+    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -804,6 +810,7 @@ pub fn ix_user_deposit_and_borrow(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
+    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin_account.as_ref()], &vanna_lending::ID).0, false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,

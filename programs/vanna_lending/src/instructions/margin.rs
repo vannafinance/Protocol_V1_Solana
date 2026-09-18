@@ -11,7 +11,7 @@ use crate::validation::positions::scan_and_validate_positions;
 use crate::validation::token::{transfer_in_measured, transfer_out_checked, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{close_account, CloseAccount, Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{close_account, CloseAccount, Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // ---------------------------------------------------------------------------
@@ -102,17 +102,23 @@ pub struct UserDepositCollateral<'info> {
     pub margin_account: Box<Account<'info, MarginAccount>>,
     #[account(seeds = [ASSET_SEED, mint.key().as_ref()], bump = asset_config.bump)]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub source_token_account: Box<Account<'info, TokenAccount>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = authority,
+        token::token_program = token_program
+    )]
+    pub source_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub margin_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -126,6 +132,7 @@ pub fn user_deposit_collateral(ctx: Context<UserDepositCollateral>, amount: u64)
         &ctx.accounts.margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
 
     let was_zero = ctx.accounts.margin_vault.amount == 0;
@@ -184,10 +191,15 @@ pub struct UserCloseCollateralPosition<'info> {
     pub margin_account: Box<Account<'info, MarginAccount>>,
     #[account(seeds = [ASSET_SEED, mint.key().as_ref()], bump = asset_config.bump)]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = margin_account)]
-    pub margin_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = margin_account,
+        token::token_program = token_program
+    )]
+    pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn user_close_collateral_position(ctx: Context<UserCloseCollateralPosition>) -> Result<()> {
@@ -200,6 +212,7 @@ pub fn user_close_collateral_position(ctx: Context<UserCloseCollateralPosition>)
         &ctx.accounts.margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
 
     let authority_key = ctx.accounts.margin_account.authority;
@@ -244,15 +257,25 @@ pub struct UserWithdrawCollateral<'info> {
     pub margin_account: Box<Account<'info, MarginAccount>>,
     #[account(seeds = [ASSET_SEED, mint.key().as_ref()], bump = asset_config.bump)]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub mint: Box<Account<'info, Mint>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
     /// Pyth price update for the withdrawn asset itself (the other active positions' price
     /// updates are supplied via `remaining_accounts`, see `scan_and_validate_positions`).
     pub price_update: Box<Account<'info, PriceUpdateV2>>,
-    #[account(mut, token::mint = mint, token::authority = authority)]
-    pub destination_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = mint, token::authority = margin_account)]
-    pub margin_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = authority,
+        token::token_program = token_program
+    )]
+    pub destination_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = margin_account,
+        token::token_program = token_program
+    )]
+    pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn user_withdraw_collateral(
@@ -266,6 +289,7 @@ pub fn user_withdraw_collateral(
         &ctx.accounts.margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
     require!(amount > 0, VannaError::ZeroAmount);
     require!(ctx.accounts.margin_vault.amount >= amount, VannaError::InsufficientCollateral);
@@ -279,6 +303,7 @@ pub fn user_withdraw_collateral(
         ctx.program_id,
         &clock,
         Some(ctx.accounts.asset_config.asset_index),
+        None,
         None,
     )?;
     let mut collaterals: Vec<CollateralValuation> =

@@ -18,7 +18,7 @@ use crate::validation::positions::scan_and_validate_positions;
 use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // `pub(crate)` (not private) so `instructions::composite::user_deposit_and_borrow` can reuse the
@@ -159,19 +159,20 @@ pub struct UserBorrow<'info> {
     pub debt_position: Box<Account<'info, DebtPosition>>,
     /// Pyth price update for the borrowed asset itself.
     pub price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = reserve)]
-    pub reserve_vault: Box<Account<'info, TokenAccount>>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = mint, token::authority = reserve, token::token_program = token_program)]
+    pub reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     /// Borrowed funds land here as protocol-controlled collateral credit (spec §1.2). Created on
     /// first use if this margin account has never held this asset before.
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub margin_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -185,6 +186,7 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
         &ctx.accounts.margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
     require!(assets > 0, VannaError::ZeroAmount);
 
@@ -222,6 +224,7 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
         &clock,
         Some(ctx.accounts.asset_config.asset_index),
         Some(ctx.accounts.asset_config.asset_index),
+        None,
     )?;
     let mut collaterals: Vec<CollateralValuation> =
         scanned_collaterals.into_iter().map(|c| c.valuation).collect();
@@ -369,12 +372,12 @@ pub struct UserRepayFromMargin<'info> {
         bump = debt_position.bump
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = margin_account)]
-    pub margin_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = mint, token::authority = reserve)]
-    pub reserve_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = mint, token::authority = margin_account, token::token_program = token_program)]
+    pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = mint, token::authority = reserve, token::token_program = token_program)]
+    pub reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64, repay_all: bool) -> Result<()> {
@@ -383,6 +386,7 @@ pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64
         &ctx.accounts.margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
     let now = Clock::get()?.unix_timestamp;
     apply_accrual(&mut ctx.accounts.reserve, now)?;
@@ -491,12 +495,12 @@ pub struct PublicRepayFromWallet<'info> {
         bump = debt_position.bump
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
-    pub mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = mint, token::authority = payer)]
-    pub payer_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = mint, token::authority = reserve)]
-    pub reserve_vault: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = mint, token::authority = payer, token::token_program = token_program)]
+    pub payer_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = mint, token::authority = reserve, token::token_program = token_program)]
+    pub reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn public_repay_from_wallet(ctx: Context<PublicRepayFromWallet>, max_assets: u64, repay_all: bool) -> Result<()> {

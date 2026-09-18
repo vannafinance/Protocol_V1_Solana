@@ -106,8 +106,45 @@ impl MarginAccount {
         self.debt_asset_indexes.iter().copied().filter(|v| *v != EMPTY_ASSET_INDEX)
     }
 
+    /// Reserved bytes: count followed by up to MAX_ASSETS little-endian u16 indexes.
+    /// All-zero legacy accounts have no indexed positions; their legacy PDA is always scanned.
+    pub fn lite_indexes(&self) -> Result<Vec<u16>> {
+        let count = self.reserved[0] as usize;
+        require!(count <= MAX_ASSETS, VannaError::IncompletePositionAccounts);
+        let mut indexes = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = 1 + 2 * i;
+            let index = u16::from_le_bytes([self.reserved[offset], self.reserved[offset + 1]]);
+            require!(!indexes.contains(&index), VannaError::DuplicateAssetIndex);
+            indexes.push(index);
+        }
+        Ok(indexes)
+    }
+
+    pub fn register_lite(&mut self, index: u16) -> Result<()> {
+        let indexes = self.lite_indexes()?;
+        if indexes.contains(&index) { return Ok(()); }
+        require!(indexes.len() < MAX_ASSETS, VannaError::TooManyAssets);
+        let offset = 1 + 2 * indexes.len();
+        self.reserved[offset..offset + 2].copy_from_slice(&index.to_le_bytes());
+        self.reserved[0] += 1;
+        Ok(())
+    }
+
+    pub fn unregister_lite(&mut self, index: u16) -> Result<()> {
+        let mut indexes = self.lite_indexes()?;
+        require!(indexes.contains(&index), VannaError::IncompletePositionAccounts);
+        indexes.retain(|i| *i != index);
+        self.reserved[..1 + 2 * MAX_ASSETS].fill(0);
+        self.reserved[0] = indexes.len() as u8;
+        for (i, index) in indexes.iter().enumerate() {
+            self.reserved[1 + 2 * i..3 + 2 * i].copy_from_slice(&index.to_le_bytes());
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.collateral_count == 0 && self.debt_count == 0
+        self.collateral_count == 0 && self.debt_count == 0 && self.reserved[0] == 0
     }
 
     pub fn next_event_sequence(&mut self) -> Result<u64> {
@@ -119,6 +156,34 @@ impl MarginAccount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lite_registry_preserves_layout_and_removes_only_target() {
+        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
+        assert!(m.lite_indexes().unwrap().is_empty());
+        m.register_lite(3).unwrap();
+        m.register_lite(2).unwrap();
+        m.register_lite(3).unwrap();
+        assert_eq!(m.lite_indexes().unwrap(), vec![3, 2]);
+        assert!(!m.is_empty());
+        m.unregister_lite(3).unwrap();
+        assert_eq!(m.lite_indexes().unwrap(), vec![2]);
+        m.unregister_lite(2).unwrap();
+        assert!(m.is_empty());
+        assert_eq!(m.reserved, [0u8; 96]);
+    }
+
+    #[test]
+    fn lite_registry_rejects_overflow_and_corruption() {
+        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
+        for i in 0..MAX_ASSETS as u16 { m.register_lite(i).unwrap(); }
+        assert!(m.register_lite(MAX_ASSETS as u16).is_err());
+        m.reserved[0] = 9;
+        assert!(m.lite_indexes().is_err());
+        m.reserved[0] = 2;
+        m.reserved[3] = m.reserved[1];
+        assert!(m.lite_indexes().is_err());
+    }
 
     #[test]
     fn add_and_remove_collateral_roundtrips() {
