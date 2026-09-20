@@ -202,13 +202,19 @@ pub fn user_margin_swap<'info>(
     )?;
     ctx.accounts.input_vault.reload()?;
     ctx.accounts.output_vault.reload()?;
+    // Only underflow-guarded, not re-checked against `min_amount_out`: this transfer is purely
+    // internal plumbing (escrow -> the margin's own vault), not a market-priced hop, so it carries
+    // no real slippage risk. Re-applying the same market-derived `min_amount_out` here double-
+    // charges any Token-2022 transfer-fee mint's fee against a threshold that was only ever sized
+    // for a single fee application (the one Jupiter's own quote/`otherAmountThreshold` accounts
+    // for, checked above at the escrow). For a fee-bearing output mint (e.g. a PreStocks token)
+    // that made every such swap spuriously trip `SlippageExceeded`, even with zero real slippage.
     let received = ctx
         .accounts
         .output_vault
         .amount
         .checked_sub(vault_output_before)
         .ok_or(VannaError::SlippageExceeded)?;
-    require!(received >= min_amount_out, VannaError::SlippageExceeded);
     require!(
         vault_input_before.checked_sub(ctx.accounts.input_vault.amount) == Some(amount_in),
         VannaError::InvalidSwapRoute

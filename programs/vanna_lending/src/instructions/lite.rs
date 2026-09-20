@@ -1579,10 +1579,16 @@ fn lra_leg2_swap<'info>(
         swapped_out,
     )?;
     accounts.margin_stock_vault.reload()?;
-    require!(
-        accounts.margin_stock_vault.amount.checked_sub(stock_vault_before) == Some(swapped_out),
-        VannaError::VaultAccountingInvariantFailed
-    );
+    // Underflow-guarded only, not an exact-equality check against `swapped_out`: this transfer is
+    // purely internal (escrow -> the margin's own vault), and if `stock_mint` carries a Token-2022
+    // transfer-fee extension (e.g. a PreStocks token), the vault receives strictly less than
+    // `swapped_out` by design — an exact-equality check here would always fail for such a mint.
+    // See the identical fix in `user_margin_swap` (swap.rs) for the same root cause.
+    accounts
+        .margin_stock_vault
+        .amount
+        .checked_sub(stock_vault_before)
+        .ok_or(VannaError::VaultAccountingInvariantFailed)?;
 
     // Any yield asset the route didn't consume (estimate > actual route amount) isn't stranded —
     // sweep it back into the margin's own vault; the caller folds it into the final health check
