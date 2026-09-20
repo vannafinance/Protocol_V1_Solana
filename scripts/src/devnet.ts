@@ -362,11 +362,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         reserve,
         underlyingMint: mint,
-        lenderTokenAccount: ata(wallet.publicKey, mint),
-        liquidityVault: ata(reserve, mint),
+        lenderTokenAccount: ata(wallet.publicKey, mint, tokenProgramFor(asset)),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
         lenderShareAccount: ata(wallet.publicKey, shareMint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -391,11 +391,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         reserve,
         underlyingMint: mint,
-        lenderTokenAccount: ata(wallet.publicKey, mint),
-        liquidityVault: ata(reserve, mint),
+        lenderTokenAccount: ata(wallet.publicKey, mint, tokenProgramFor(asset)),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
         lenderShareAccount: ata(wallet.publicKey, shareMint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
       })
       .rpc();
     log("lender_redeem", `${asset} shares=${shares.toString()} tx=${sig}`);
