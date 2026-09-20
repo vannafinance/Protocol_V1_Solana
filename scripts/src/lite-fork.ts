@@ -38,23 +38,59 @@ import {
 const KLEND = new PublicKey("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
 const XSTOCKS_MARKET = new PublicKey("5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua");
 const MARKET_AUTHORITY = new PublicKey("2Z7zhqp1eddmHNmEqexftST6DFPWmoL4QqfgiG5uJMJx");
+const MAIN_MARKET = new PublicKey("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF");
+const MAIN_MARKET_AUTHORITY = new PublicKey("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo");
 
-const KAMINO_RESERVES: Record<"tslax" | "googlx", {
+type KaminoLiteKey = "tslax" | "googlx" | "usdc" | "wsol";
+
+const KAMINO_RESERVES: Record<KaminoLiteKey, {
+  market: PublicKey;
+  marketAuthority: PublicKey;
   reserve: PublicKey;
   liquidityVault: PublicKey;
   collateralMint: PublicKey;
 }> = {
   tslax: {
+    market: XSTOCKS_MARKET,
+    marketAuthority: MARKET_AUTHORITY,
     reserve: new PublicKey("5iTiczqgUegqA3PpoNpotizMbY9n1sRWr3oL6igKvWuf"),
     liquidityVault: new PublicKey("AvhRUjab47DCo9efnzmDha8xUeQFEs36Yywv1x8t3T2W"),
     collateralMint: new PublicKey("6bZpUNY1qmbvQBgCmfQJUA377X63ATvnpCHYh8hQnfjC"),
   },
   googlx: {
+    market: XSTOCKS_MARKET,
+    marketAuthority: MARKET_AUTHORITY,
     reserve: new PublicKey("4wg6rEkGgHaEuxMduP46C1xFZ24Lnp5YgdNkZAHxFzsN"),
     liquidityVault: new PublicKey("5vjGDURj7kT6HZtoSmfG9NgTak7deQ9u3uWgdktXv32G"),
     collateralMint: new PublicKey("FL41HF8KMuMmYHxGgHezsa5MLUKmNSsu32cC8Qru7TnB"),
   },
+  // Kamino MAIN market (not xStocks) — used by the One-Click cross-asset carry
+  // trade's yield leg (swap stock -> USDC/SOL, then lite_supply into these).
+  usdc: {
+    market: MAIN_MARKET,
+    marketAuthority: MAIN_MARKET_AUTHORITY,
+    reserve: new PublicKey("D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59"),
+    liquidityVault: new PublicKey("Bgq7trRgVMeq33yt235zM2onQ4bRDBsY5EWiTetF4qw6"),
+    collateralMint: new PublicKey("B8V6WVjPxW1UGwVDfxH2d2r8SyT4cqn7dQRK6XneVa7D"),
+  },
+  wsol: {
+    market: MAIN_MARKET,
+    marketAuthority: MAIN_MARKET_AUTHORITY,
+    reserve: new PublicKey("d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q"),
+    liquidityVault: new PublicKey("GafNuUXj9rxGLn4y79dPu6MHSuPWeJR6UtTWuexpGh3U"),
+    collateralMint: new PublicKey("2UywZrUdyqs5vDchy7fKQJKau2RVyuzBev2XKGPDSiX1"),
+  },
 };
+
+/** Same set `stockKey` accepts, plus USDC/SOL for the main-market Kamino strategies. */
+function kaminoLiteKey(symbol: string): KaminoLiteKey {
+  const v = symbol.toLowerCase();
+  if (v === "tslax" || v === "tsla") return "tslax";
+  if (v === "googlx" || v === "googl") return "googlx";
+  if (v === "usdc") return "usdc";
+  if (v === "wsol" || v === "sol") return "wsol";
+  throw new Error(`unsupported lite key "${symbol}" — use TSLAX|GOOGLX|USDC|SOL`);
+}
 
 const INSTRUCTIONS_SYSVAR = new PublicKey("Sysvar1nstructions1111111111111111111111111");
 
@@ -142,7 +178,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
       log("skip", "adminRegisterLiteStrategy not in IDL");
       return;
     }
-    const key = stockKey(optionalArg(args, "symbol", "TSLAX"));
+    const key = kaminoLiteKey(optionalArg(args, "symbol", "TSLAX"));
     const mint = ASSET_MINTS[key];
     const kamino = KAMINO_RESERVES[key];
     const [protocolConfig] = protocolConfigPda();
@@ -156,8 +192,8 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         underlyingMint: mint,
         kaminoProgram: KLEND,
-        lendingMarket: XSTOCKS_MARKET,
-        lendingMarketAuthority: MARKET_AUTHORITY,
+        lendingMarket: kamino.market,
+        lendingMarketAuthority: kamino.marketAuthority,
         kaminoReserve: kamino.reserve,
         reserveLiquiditySupply: kamino.liquidityVault,
         reserveCollateralMint: kamino.collateralMint,
@@ -354,6 +390,51 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
       })
       .rpc();
     log("lite-open", `${key} equity=${args.equity} levBps=${leverageBps.toString()} tx=${sig}`);
+  },
+
+  "lite-supply": async ({ args, wallet, program }) => {
+    if (!hasIx(program, "lite_supply", "liteSupply")) {
+      log("skip", "liteSupply not in IDL — run `anchor build` and refresh the IDL");
+      return;
+    }
+    const key = kaminoLiteKey(optionalArg(args, "symbol", "USDC"));
+    const amount = toBaseUnits(requireArg(args, "amount"), ASSET_DECIMALS[key]);
+    const mint = ASSET_MINTS[key];
+    const kamino = KAMINO_RESERVES[key];
+    const tp = tokenProgramFor(key);
+    const [protocolConfig] = protocolConfigPda();
+    const [assetConfig] = assetConfigPda(mint);
+    const [margin] = marginPda(wallet.publicKey);
+    const [liteStrategy] = liteStrategyPda(mint);
+    const [litePosition] = litePositionPda(margin);
+    const marginSourceAccount = getAssociatedTokenAddressSync(mint, margin, true, tp);
+    const marginDestinationCollateral = getAssociatedTokenAddressSync(kamino.collateralMint, margin, true, TOKEN_PROGRAM_ID);
+
+    const sig = await method(program, "lite_supply", "liteSupply")(amount)
+      .accounts({
+        owner: wallet.publicKey,
+        protocolConfig,
+        assetConfig,
+        underlyingMint: mint,
+        marginAccount: margin,
+        marginSourceAccount,
+        liteStrategy,
+        litePosition,
+        kaminoProgram: KLEND,
+        lendingMarket: kamino.market,
+        lendingMarketAuthority: kamino.marketAuthority,
+        kaminoReserve: kamino.reserve,
+        reserveLiquiditySupply: kamino.liquidityVault,
+        reserveCollateralMint: kamino.collateralMint,
+        marginDestinationCollateral,
+        instructionSysvarAccount: INSTRUCTIONS_SYSVAR,
+        tokenProgram: tp,
+        collateralTokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+    log("lite-supply", `${key} amount=${args.amount} tx=${sig}`);
   },
 
   status: async ({ args, program }) => {

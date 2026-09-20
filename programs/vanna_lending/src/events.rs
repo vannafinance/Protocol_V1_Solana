@@ -244,3 +244,16 @@ pub struct LiteClosed {
     pub event_sequence: u64,
     pub timestamp: i64,
 }
+
+/// Cross-asset unwind of a `lite_supply` position: redeem from Kamino, swap into a different
+/// mint, repay that mint's debt — all atomically. See `lite_reduce_and_repay`.
+#[event]
+pub struct LiteReducedAndRepaid {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub redeemed: u64,
+    pub swapped_out: u64,
+    pub debt_repaid: u64,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}

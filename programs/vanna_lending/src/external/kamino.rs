@@ -8,7 +8,7 @@ use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
-    program::{invoke, invoke_signed},
+    program::invoke_signed,
 };
 
 /// CPI accounts for Kamino deposit/redeem. Unused legs may point at the same infos.
@@ -47,10 +47,13 @@ fn account_infos<'a, 'info>(accounts: &KaminoCpiAccounts<'a, 'info>) -> [Account
     ]
 }
 
-/// `deposit_reserve_liquidity` — §6 left column. `owner` must sign (typically the user).
+/// `deposit_reserve_liquidity` — §6 left column. `owner` must sign — either a real wallet
+/// (pass an empty `signer_seeds`) or a PDA like the margin account (pass its `signer_seeds`,
+/// mirroring `redeem_reserve_collateral` below).
 pub fn deposit_reserve_liquidity<'info>(
     accounts: &KaminoCpiAccounts<'_, 'info>,
     liquidity_amount: u64,
+    signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     require!(liquidity_amount > 0, VannaError::ZeroAmount);
 
@@ -78,7 +81,7 @@ pub fn deposit_reserve_liquidity<'info>(
         accounts: metas,
         data,
     };
-    invoke(&ix, &account_infos(accounts))?;
+    invoke_signed(&ix, &account_infos(accounts), signer_seeds)?;
     Ok(())
 }
 

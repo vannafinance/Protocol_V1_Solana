@@ -68,6 +68,10 @@ pub mod known_mints {
     pub const TSLAX: &str = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB";
     /// Alphabet xStock (Token-2022, 8 decimals).
     pub const GOOGLX: &str = "XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN";
+    /// Anthropic PreStock (prestocks.com, Token-2022, 9 decimals). No real Pyth feed exists.
+    pub const ANTHROPIC: &str = "Pren1FvFX6J3E4kXhJuCiAD5aDmGEb7qJRncwA8Lkhw";
+    /// OpenAI PreStock (prestocks.com, Token-2022, 9 decimals). No real Pyth feed exists.
+    pub const OPENAI: &str = "PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF";
 }
 
 /// Kamino xStocks market addresses — reference only; live source of truth is LiteStrategyConfig.
@@ -86,6 +90,31 @@ pub mod kamino_reference {
         pub const RESERVE: &str = "4wg6rEkGgHaEuxMduP46C1xFZ24Lnp5YgdNkZAHxFzsN";
         pub const LIQUIDITY_VAULT: &str = "5vjGDURj7kT6HZtoSmfG9NgTak7deQ9u3uWgdktXv32G";
         pub const COLLATERAL_MINT: &str = "FL41HF8KMuMmYHxGgHezsa5MLUKmNSsu32cC8Qru7TnB";
+    }
+}
+
+/// Kamino main market addresses — reference only. Not wired into any Vanna instruction; the
+/// One-Click cross-asset carry trade (deposit/borrow a stock, swap the total into USDC/SOL, then
+/// supply it here) calls Kamino's `deposit_reserve_liquidity`/`redeem_reserve_collateral`
+/// directly from the frontend (no Vanna CPI), the same permissionless instructions used above,
+/// just against these reserves instead of the xStocks market's. Addresses verified by decoding
+/// the live Reserve accounts on mainnet (klend-sdk), not just trusting Kamino's REST API — that
+/// API's own reserve list returned four different USDC reserves for this one market; this is the
+/// one with real liquidity, the other three are effectively retired (~0 available liquidity).
+pub mod kamino_main_market {
+    pub const MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
+    pub const MARKET_AUTHORITY: &str = "9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo";
+
+    pub mod sol {
+        pub const RESERVE: &str = "d4A2prbA2whesmvHaL88BH6Ewn5N4bTSU2Ze8P6Bc4Q";
+        pub const LIQUIDITY_VAULT: &str = "GafNuUXj9rxGLn4y79dPu6MHSuPWeJR6UtTWuexpGh3U";
+        pub const COLLATERAL_MINT: &str = "2UywZrUdyqs5vDchy7fKQJKau2RVyuzBev2XKGPDSiX1";
+    }
+
+    pub mod usdc {
+        pub const RESERVE: &str = "D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59";
+        pub const LIQUIDITY_VAULT: &str = "Bgq7trRgVMeq33yt235zM2onQ4bRDBsY5EWiTetF4qw6";
+        pub const COLLATERAL_MINT: &str = "B8V6WVjPxW1UGwVDfxH2d2r8SyT4cqn7dQRK6XneVa7D";
     }
 }
 

@@ -238,11 +238,33 @@ pub mod vanna_lending {
         instructions::lite::lite_open(ctx, equity, leverage_bps)
     }
 
+    pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64) -> Result<()> {
+        instructions::lite::lite_supply(ctx, amount)
+    }
+
     pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u64) -> Result<()> {
         instructions::lite::lite_reduce(ctx, exit_bps, min_underlying_out)
     }
 
     pub fn lite_close(ctx: Context<LiteClose>, min_underlying_out: u64) -> Result<()> {
         instructions::lite::lite_close(ctx, min_underlying_out)
+    }
+
+    pub fn lite_reduce_and_repay<'info>(
+        ctx: Context<'info, LiteReduceAndRepay<'info>>,
+        exit_bps: u16,
+        min_yield_out: u64,
+        min_stock_out: u64,
+        route_account_count: u16,
+        route_data: Vec<u8>,
+    ) -> Result<()> {
+        instructions::lite::lite_reduce_and_repay(
+            ctx,
+            exit_bps,
+            min_yield_out,
+            min_stock_out,
+            route_account_count,
+            route_data,
+        )
     }
 }
