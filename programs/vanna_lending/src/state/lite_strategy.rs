@@ -80,4 +80,33 @@ mod tests {
         p.set_debt_shares(0);
         assert_eq!(p.debt_shares(30), 0);
     }
+
+    /// Mirrors `lite_supply`'s attribution bump: `current_attributed + attribute_shares_delta`,
+    /// capped on read by `.min(outstanding)`. Exercises a fresh position (starts at 0) and a
+    /// top-up on top of an already-attributed position.
+    #[test]
+    fn debt_attribution_accumulates_across_leveraged_supply_top_ups() {
+        let mut p = LitePosition {
+            margin_account: Pubkey::default(),
+            strategy_config: Pubkey::default(),
+            underlying_mint: Pubkey::default(),
+            kamino_collateral_amount: 0,
+            deposited_underlying: 0,
+            equity_underlying: 0,
+            bump: 0,
+            reserved: [0; 64],
+        };
+        // Fresh position, first leveraged supply attributes exactly the borrowed shares.
+        let current = p.debt_shares(1_000);
+        p.set_debt_shares(current + 40);
+        assert_eq!(p.debt_shares(1_000), 40);
+
+        // A second leveraged supply (top-up) adds on top rather than overwriting.
+        let current = p.debt_shares(1_000);
+        p.set_debt_shares(current + 25);
+        assert_eq!(p.debt_shares(1_000), 65);
+
+        // Attribution is still capped by whatever's actually outstanding on the reserve.
+        assert_eq!(p.debt_shares(50), 50);
+    }
 }

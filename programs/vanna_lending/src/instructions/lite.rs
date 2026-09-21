@@ -564,6 +564,22 @@ pub struct LiteSupply<'info> {
         token::token_program = token_program
     )]
     pub margin_source_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// Vanna's own reserve for `underlying_mint` — needed only to attribute a same-transaction
+    /// borrow to this Kamino position (see `attribute_shares_delta` below); read-only, not the
+    /// Kamino reserve.
+    #[account(seeds = [RESERVE_SEED, underlying_mint.key().as_ref()], bump = reserve.bump)]
+    pub reserve: Box<Account<'info, Reserve>>,
+    /// Vanna's own debt position for `underlying_mint` on this margin account — `init_if_needed`
+    /// so plain (non-leveraged) supply callers that never borrowed this asset still work; in that
+    /// case `attribute_shares_delta` is 0 and this stays untouched at its freshly-initialized zero.
+    #[account(
+        init_if_needed,
+        payer = owner,
+        space = 8 + DebtPosition::INIT_SPACE,
+        seeds = [DEBT_SEED, margin_account.key().as_ref(), reserve.key().as_ref()],
+        bump
+    )]
+    pub debt_position: Box<Account<'info, DebtPosition>>,
     #[account(
         seeds = [LITE_STRATEGY_SEED, underlying_mint.key().as_ref()],
         bump = lite_strategy.bump,
@@ -615,7 +631,7 @@ pub struct LiteSupply<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64) -> Result<()> {
+pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta: u128) -> Result<()> {
     require!(amount > 0, VannaError::ZeroAmount);
     assert_protocol_action_allowed(
         ctx.accounts.protocol_config.operating_mode,
@@ -714,6 +730,19 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64) -> Result<()> {
         .checked_add(amount)
         .ok_or(VannaError::MathOverflow)?;
 
+    // Attribute a same-transaction borrow of `underlying_mint` to this Kamino position, so a
+    // later `lite_reduce`/`lite_close` knows to repay `debt_position` from the redemption instead
+    // of forwarding the whole amount to the wallet. 0 for the plain (non-leveraged) supply path —
+    // `debt_shares()`'s own `.min(outstanding)` on read caps this defensively either way.
+    if attribute_shares_delta > 0 {
+        let current_attributed = position.debt_shares(ctx.accounts.debt_position.borrow_shares);
+        position.set_debt_shares(
+            current_attributed
+                .checked_add(attribute_shares_delta)
+                .ok_or(VannaError::MathOverflow)?,
+        );
+    }
+
     let event_sequence = ctx.accounts.margin_account.next_event_sequence()?;
     emit!(LiteOpened {
         margin_account: ctx.accounts.margin_account.key(),
@@ -722,7 +751,7 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64) -> Result<()> {
         borrowed: 0,
         deposited: amount,
         kamino_collateral: ctoken_received,
-        debt_shares: 0,
+        debt_shares: attribute_shares_delta,
         borrow_health_factor_wad: 0,
         event_sequence,
         timestamp: clock.unix_timestamp,
@@ -927,11 +956,14 @@ pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u
         ctx.accounts.reserve.total_borrow_shares,
         ctx.accounts.reserve.total_borrow_assets,
     )?;
-    require!(
-        redeemed >= current_debt_assets,
-        VannaError::InsufficientCollateral
-    );
-    let repay_amount = current_debt_assets;
+    // Cap at what was actually redeemed rather than hard-failing the whole exit: `current_debt_
+    // assets` is ceil-rounded and keeps accruing interest independently of Kamino's own yield, so
+    // by the time of a real-world close (days/weeks after open, not the seconds-apart timing of a
+    // quick test) it can end up a few raw units above `redeemed` even on a full-percentage exit.
+    // Same "repay what you can from what came back" pattern `lite_reduce_and_repay`'s leg3 already
+    // uses for its cross-asset repay — any shortfall just stays outstanding as (tiny) residual
+    // debt rather than blocking the redeem+repay entirely.
+    let repay_amount = current_debt_assets.min(redeemed);
     let mut shares_burned = 0u128;
     if repay_amount > 0 {
         let received = transfer_out_checked_measured(
@@ -947,7 +979,16 @@ pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u
             received == repay_amount,
             VannaError::VaultAccountingInvariantFailed
         );
-        shares_burned = target_shares;
+        shares_burned = if repay_amount >= current_debt_assets {
+            target_shares
+        } else {
+            mul_div_floor(
+                repay_amount as u128,
+                ctx.accounts.reserve.total_borrow_shares,
+                ctx.accounts.reserve.total_borrow_assets as u128,
+            )?
+            .min(target_shares)
+        };
         ctx.accounts.reserve.accounted_liquidity_assets = ctx
             .accounts
             .reserve

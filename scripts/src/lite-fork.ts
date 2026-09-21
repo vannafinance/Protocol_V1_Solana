@@ -27,6 +27,7 @@ import {
 import { optionalArg, parseArgs, requireArg, toBaseUnits } from "./devnet-cli";
 import {
   assetConfigPda,
+  debtPositionPda,
   litePositionPda,
   liteStrategyPda,
   marginPda,
@@ -399,18 +400,25 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     }
     const key = kaminoLiteKey(optionalArg(args, "symbol", "USDC"));
     const amount = toBaseUnits(requireArg(args, "amount"), ASSET_DECIMALS[key]);
+    // Attributes a same-transaction borrow of this mint to the Kamino position, so a
+    // later lite-reduce/lite-close repays it instead of forwarding everything to the
+    // wallet — see `lite_supply`'s `attribute_shares_delta` arg. 0 (default) for a
+    // plain unleveraged supply.
+    const attributeSharesDelta = new anchor.BN(optionalArg(args, "attribute", "0"));
     const mint = ASSET_MINTS[key];
     const kamino = KAMINO_RESERVES[key];
     const tp = tokenProgramFor(key);
     const [protocolConfig] = protocolConfigPda();
     const [assetConfig] = assetConfigPda(mint);
     const [margin] = marginPda(wallet.publicKey);
+    const [reserve] = reservePda(mint);
+    const [debtPosition] = debtPositionPda(margin, reserve);
     const [liteStrategy] = liteStrategyPda(mint);
     const [litePosition] = litePositionPda(margin);
     const marginSourceAccount = getAssociatedTokenAddressSync(mint, margin, true, tp);
     const marginDestinationCollateral = getAssociatedTokenAddressSync(kamino.collateralMint, margin, true, TOKEN_PROGRAM_ID);
 
-    const sig = await method(program, "lite_supply", "liteSupply")(amount)
+    const sig = await method(program, "lite_supply", "liteSupply")(amount, attributeSharesDelta)
       .accounts({
         owner: wallet.publicKey,
         protocolConfig,
@@ -418,6 +426,8 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         underlyingMint: mint,
         marginAccount: margin,
         marginSourceAccount,
+        reserve,
+        debtPosition,
         liteStrategy,
         litePosition,
         kaminoProgram: KLEND,
@@ -434,7 +444,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         systemProgram: SystemProgram.programId,
       })
       .rpc();
-    log("lite-supply", `${key} amount=${args.amount} tx=${sig}`);
+    log("lite-supply", `${key} amount=${args.amount} attribute=${attributeSharesDelta.toString()} tx=${sig}`);
   },
 
   status: async ({ args, program }) => {

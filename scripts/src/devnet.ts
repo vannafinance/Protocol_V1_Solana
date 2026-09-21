@@ -436,7 +436,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [margin] = marginPda(wallet.publicKey);
     const [assetConfig] = assetConfigPda(mint);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
     const sig = await program.methods
       .userDepositCollateral(amount)
       .accounts({
@@ -445,9 +446,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         marginAccount: margin,
         assetConfig,
         mint,
-        sourceTokenAccount: ata(wallet.publicKey, mint),
+        sourceTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -465,7 +466,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [margin] = marginPda(wallet.publicKey);
     const [assetConfig] = assetConfigPda(mint);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
 
     const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, { excludeCollateral: asset });
@@ -479,9 +481,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         mint,
         priceUpdate: priceAccounts[asset],
-        destinationTokenAccount: ata(wallet.publicKey, mint),
+        destinationTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
       })
       .remainingAccounts(remainingAccounts)
       .rpc();

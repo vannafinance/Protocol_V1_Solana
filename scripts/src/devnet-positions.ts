@@ -1,7 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { AccountMeta, PublicKey } from "@solana/web3.js";
 import { assetConfigPda, debtPositionPda, marginPda, reservePda } from "./pda";
-import { AssetKey, ASSET_MINTS } from "./devnet-env";
+import { AssetKey, ASSET_MINTS, tokenProgramFor } from "./devnet-env";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { ata } from "./devnet-cli";
 
@@ -15,18 +15,26 @@ export interface AssetIndexInfo {
   assetConfig: PublicKey;
 }
 
-/** Fetches both registered `AssetConfig`s and maps `asset_index -> {key, mint, assetConfig}`. */
+/**
+ * Fetches registered `AssetConfig`s and maps `asset_index -> {key, mint, assetConfig}`. Uses
+ * `fetchNullable`, not `fetch`: not every fork/deployment has registered every `ASSET_MINTS`
+ * entry (e.g. a minimal local fork that only bootstraps SOL/USDC/TSLAx/GOOGLx, skipping
+ * anthropic/openai) — a hard `fetch` used to throw "Account does not exist" and break every
+ * borrow/withdraw/liquidate command project-wide, even ones that never touch the missing asset.
+ */
 export async function getAssetIndexMap(program: anchor.Program): Promise<Record<AssetKey, AssetIndexInfo>> {
   const entries = await Promise.all(
     (Object.keys(ASSET_MINTS) as AssetKey[]).map(async (key) => {
       const mint = ASSET_MINTS[key];
       const [assetConfigAddress] = assetConfigPda(mint);
-      const account = await (program.account as Record<string, { fetch(a: PublicKey): Promise<{ assetIndex: number }> }>)
-        .assetConfig.fetch(assetConfigAddress);
+      const account = await (
+        program.account as Record<string, { fetchNullable(a: PublicKey): Promise<{ assetIndex: number } | null> }>
+      ).assetConfig.fetchNullable(assetConfigAddress);
+      if (!account) return null;
       return [key, { key, index: account.assetIndex, mint, assetConfig: assetConfigAddress }] as const;
     }),
   );
-  return Object.fromEntries(entries) as Record<AssetKey, AssetIndexInfo>;
+  return Object.fromEntries(entries.filter((e): e is NonNullable<typeof e> => e !== null)) as Record<AssetKey, AssetIndexInfo>;
 }
 
 interface MarginAccountData {
@@ -65,7 +73,7 @@ export async function buildRemainingAccounts(
     if (!info || info.key === opts.excludeCollateral) continue;
     metas.push(
       { pubkey: info.assetConfig, isWritable: false, isSigner: false },
-      { pubkey: ata(margin, info.mint), isWritable: false, isSigner: false },
+      { pubkey: ata(margin, info.mint, tokenProgramFor(info.key)), isWritable: false, isSigner: false },
       { pubkey: priceAccounts[info.key], isWritable: false, isSigner: false },
     );
   }
