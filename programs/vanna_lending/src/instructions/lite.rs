@@ -703,6 +703,20 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta
         .ok_or(VannaError::MathUnderflow)?;
     require!(ctoken_received > 0, VannaError::SlippageExceeded);
 
+    // `underlying_mint` may have been credited as ordinary active collateral by whatever put it
+    // in `margin_source_account` (e.g. `user_borrow` crediting a fresh borrow — spec §1.2). This
+    // deposit CPI can fully drain that vault into Kamino, where the value continues to be
+    // tracked, just via the separate lite-position mechanism instead — clear the stale ordinary-
+    // collateral flag when that happens, the same way `swap`/`borrowing`/`margin` already do
+    // whenever a vault they touch empties out. Without this, a later plain deposit of the same
+    // asset fails `add_active_collateral`'s `DuplicateAssetIndex` guard.
+    ctx.accounts.margin_source_account.reload()?;
+    if ctx.accounts.margin_source_account.amount == 0
+        && ctx.accounts.margin_account.is_collateral_active(ctx.accounts.asset_config.asset_index)
+    {
+        ctx.accounts.margin_account.remove_active_collateral(ctx.accounts.asset_config.asset_index)?;
+    }
+
     if !position_seed(&ctx.accounts.lite_position.key(), &ctx.accounts.margin_account.key(), ctx.accounts.asset_config.asset_index).is_empty() {
         ctx.accounts.margin_account.register_lite(ctx.accounts.asset_config.asset_index)?;
     }
