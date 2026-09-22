@@ -159,7 +159,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
 
   "register-xstocks": async () => {
     const { spawnSync } = await import("node:child_process");
-    for (const asset of ["tslax", "googlx"] as AssetKey[]) {
+    for (const asset of ["tslax", "googlx", "aaplx"] as AssetKey[]) {
       spawnSync("npx", ["tsx", "src/devnet.ts", "register-asset", "--asset", asset], {
         cwd: __dirname + "/..",
         stdio: "inherit",
@@ -171,7 +171,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         env: process.env,
       });
     }
-    log("register-xstocks", "TSLAx + GOOGLx registered (or already present)");
+    log("register-xstocks", "TSLAx + GOOGLx + AAPLx registered (or already present)");
   },
 
   "register-lite-strategy": async ({ args, wallet, program }) => {

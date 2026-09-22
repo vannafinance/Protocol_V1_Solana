@@ -16,6 +16,7 @@ const REFERENCE_PRICE_USD: Record<AssetKey, number> = {
   wsol: 190,
   tslax: 250,
   googlx: 175,
+  aaplx: 340,
   anthropic: 1020,
   openai: 1030,
 };

@@ -15,13 +15,14 @@ import * as path from "node:path";
 export const DEVNET_RPC_URL =
   process.env.DEVNET_RPC_URL ?? process.env.FORK_RPC_URL ?? "http://127.0.0.1:8899";
 
-export type AssetKey = "usdc" | "wsol" | "tslax" | "googlx" | "anthropic" | "openai";
+export type AssetKey = "usdc" | "wsol" | "tslax" | "googlx" | "aaplx" | "anthropic" | "openai";
 
 /** Real mainnet USDC (cloned onto the Surfpool fork by address). */
 export const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 export const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 export const TSLAX_MINT = new PublicKey("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
 export const GOOGLX_MINT = new PublicKey("XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN");
+export const AAPLX_MINT = new PublicKey("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp");
 /** Real mainnet PreStocks (prestocks.com) tokens — Token-2022, no real Pyth feed exists. */
 export const ANTHROPIC_MINT = new PublicKey("Pren1FvFX6J3E4kXhJuCiAD5aDmGEb7qJRncwA8Lkhw");
 export const OPENAI_MINT = new PublicKey("PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF");
@@ -31,6 +32,7 @@ export const ASSET_MINTS: Record<AssetKey, PublicKey> = {
   wsol: WSOL_MINT,
   tslax: TSLAX_MINT,
   googlx: GOOGLX_MINT,
+  aaplx: AAPLX_MINT,
   anthropic: ANTHROPIC_MINT,
   openai: OPENAI_MINT,
 };
@@ -39,6 +41,7 @@ export const ASSET_DECIMALS: Record<AssetKey, number> = {
   wsol: 9,
   tslax: 8,
   googlx: 8,
+  aaplx: 8,
   anthropic: 9,
   openai: 9,
 };
@@ -48,6 +51,7 @@ export const ASSET_TOKEN_PROGRAM: Record<AssetKey, PublicKey> = {
   wsol: TOKEN_PROGRAM_ID,
   tslax: TOKEN_2022_PROGRAM_ID,
   googlx: TOKEN_2022_PROGRAM_ID,
+  aaplx: TOKEN_2022_PROGRAM_ID,
   anthropic: TOKEN_2022_PROGRAM_ID,
   openai: TOKEN_2022_PROGRAM_ID,
 };
@@ -62,6 +66,7 @@ export const PYTH_FEED_IDS: Record<AssetKey, string> = {
   wsol: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
   tslax: "e6da44bff5b8b06897a3739dd331b440d6662595bb862e37046892c568ae3fc0",
   googlx: "ad519718d387de4f0d7d29ea16a3730ce42e49c59fef6fba6fc9bac477645f6f",
+  aaplx: "aaba35e6f33fb973bb2201d48a79ae24795affa6ba8bd50a93dcaf7da0030f36",
   anthropic: "e2b7d8199aa16dfcefcb89b6614e0a95c08bc283745412d209d0b3ca099b0721",
   openai: "1847efd0848d500cd781f05957ca787d64e80cfc7cefd734337fc9858626e634",
 };
@@ -78,8 +83,8 @@ export function feedIdToBytes(hex: string): number[] {
 
 export function assetKeyFromString(value: string): AssetKey {
   const v = value.toLowerCase();
-  if (v === "usdc" || v === "wsol" || v === "tslax" || v === "googlx" || v === "anthropic" || v === "openai") return v;
-  throw new Error(`unknown asset "${value}" — expected usdc|wsol|tslax|googlx|anthropic|openai`);
+  if (v === "usdc" || v === "wsol" || v === "tslax" || v === "googlx" || v === "aaplx" || v === "anthropic" || v === "openai") return v;
+  throw new Error(`unknown asset "${value}" — expected usdc|wsol|tslax|googlx|aaplx|anthropic|openai`);
 }
 
 export function tokenProgramFor(asset: AssetKey): PublicKey {
