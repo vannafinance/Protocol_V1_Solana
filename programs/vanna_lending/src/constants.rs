@@ -15,7 +15,14 @@ pub const DEBT_SEED: &[u8] = b"debt";
 
 /// Maximum number of distinct active collateral (or debt) assets a single margin account may hold.
 /// Bounds the canonical index arrays so every health check has a predictable, fixed cost.
-pub const MAX_ASSETS: usize = 8;
+/// Raised from 8 -> 24: `MarginAccount`'s own `#[derive(InitSpace)]` grows the account's
+/// allocated size accordingly for newly created accounts (an extra 64 bytes of rent — trivial).
+/// This changes the struct's byte layout, though: any margin account created under the old
+/// MAX_ASSETS=8 layout has zeroed (not `EMPTY_ASSET_INDEX`-filled) bytes where the new index
+/// slots now live, which would misread as "asset index 0 active". Redeploying this requires a
+/// fresh margin-account state (a full fork/devnet rebootstrap), not an in-place upgrade of
+/// existing accounts.
+pub const MAX_ASSETS: usize = 24;
 
 /// Fixed-point scale used for `borrow_index_wad` and reported health-factor ratios.
 pub const WAD: u128 = 1_000_000_000_000_000_000;

@@ -178,7 +178,7 @@ mod tests {
         let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
         for i in 0..MAX_ASSETS as u16 { m.register_lite(i).unwrap(); }
         assert!(m.register_lite(MAX_ASSETS as u16).is_err());
-        m.reserved[0] = 9;
+        m.reserved[0] = (MAX_ASSETS + 1) as u8;
         assert!(m.lite_indexes().is_err());
         m.reserved[0] = 2;
         m.reserved[3] = m.reserved[1];

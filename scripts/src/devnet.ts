@@ -169,7 +169,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     // only keypair this CLI can actually sign with. There is no `--admin` override anymore: an
     // unrelated pubkey can no longer be named admin without that pubkey's own signature.
     const treasury = new PublicKey(optionalArg(args, "treasury", wallet.publicKey.toBase58()));
-    const maxAssets = Number(optionalArg(args, "max-assets", "8"));
+    const maxAssets = Number(optionalArg(args, "max-assets", "24")); // matches MAX_ASSETS in constants.rs
     const [protocolConfig] = protocolConfigPda();
     const sig = await program.methods
       .initializeProtocol(treasury, maxAssets)
