@@ -55,6 +55,12 @@ fn verify_pda(actual: &Pubkey, seeds: &[&[u8]], bump: u8, program_id: &Pubkey) -
 /// Reserves encountered here are accrued in-memory (fresh values feed the health check) but not
 /// persisted — only the caller's own named reserve, if any, is written back. This keeps the scan
 /// read-only and avoids taking unnecessary write locks on reserves the instruction isn't touching.
+// Defensive: this loops over every remaining account doing per-position health-check math,
+// with several locals of its own — inlined into an already-large caller frame (several
+// `lite_*`/margin instructions have many locals of their own), it's a plausible contributor
+// to the same class of BPF stack-frame overflow fixed at `do_redeem_reserve_collateral`'s
+// call site. `#[inline(never)]` keeps it in its own frame regardless of caller size.
+#[inline(never)]
 pub fn scan_and_validate_positions<'info>(
     margin_key: &Pubkey,
     margin: &MarginAccount,
