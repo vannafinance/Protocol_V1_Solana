@@ -137,6 +137,16 @@ pub fn admin_register_lite_strategy(ctx: Context<AdminRegisterLiteStrategy>) -> 
 
 /// Empty final seed preserves the original PDA and its bump. Additional stocks use
 /// the immutable asset index. Constraints still enforce the complete canonical PDA.
+///
+/// `#[inline(never)]`: this runs INSIDE a `seeds = [...]` constraint on `LiteClose`'s
+/// `lite_position` account, i.e. as part of Anchor's macro-generated `try_accounts` —
+/// already documented (via a real compiler warning on the sibling `LiteReduceAndRepay`
+/// struct) as a large, stack-pressured function. `find_program_address`'s own bump-search
+/// loop is exactly the kind of per-call local state that's cheap on its own but expensive
+/// once folded into an already-large caller frame; keeping this un-inlined is a low-risk
+/// way to rule it out as a contributor to the live "Access violation in stack frame N"
+/// crash traced to this same instruction family.
+#[inline(never)]
 pub fn position_seed(position: &Pubkey, margin: &Pubkey, asset_index: u16) -> Vec<u8> {
     let legacy = Pubkey::find_program_address(&[LITE_POSITION_SEED, margin.as_ref()], &crate::ID).0;
     if *position == legacy { Vec::new() } else { asset_index.to_le_bytes().to_vec() }
@@ -878,45 +888,37 @@ pub fn lite_close(ctx: Context<LiteClose>, min_underlying_out: u64) -> Result<()
 /// locals of its own (share/amount math, signer seeds, etc.) live across this call, and a
 /// live BPF simulation crashed with "Access violation in stack frame N" right at this CPI —
 /// a genuine stack overflow once this call's own account-struct construction (13
-/// `AccountInfo`s) got folded into `lite_reduce`'s already-large frame. Taking only these
-/// primitive/reference parameters (not the whole `Context`) keeps `lite_reduce`'s other
-/// locals out of this frame entirely, rather than just hinting the compiler not to inline —
-/// confirmed live: reproduced the crash's exact shape (rich multi-position account, partial-
-/// bps Kamino exit on a shared position) against the real deployed program; this fix removes
-/// the crash there.
+/// `AccountInfo`s) got folded into `lite_reduce`'s already-large frame.
+///
+/// Takes `&LiteClose` (one reference) plus the two scalars actually needed, NOT 13 separate
+/// `AccountInfo` references — a first attempt at this split used 15 individual parameters
+/// and did NOT fix the live crash (re-tested against the real deployed program): the BPF
+/// backend's own diagnostic on a similar oversized function elsewhere in this file literally
+/// says "decrease stack usage or **remove parameters from the call**" — with more parameters
+/// than fit in registers, the CALLER still has to spill the extra ones onto its OWN frame to
+/// marshal the call, which is exactly the caller-side pressure this split was meant to avoid.
+/// Passing the whole accounts struct by reference keeps this call to 3 arguments regardless
+/// of how many individual accounts it ends up touching.
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
 fn do_redeem_reserve_collateral<'info>(
-    kamino_program: &AccountInfo<'info>,
-    margin_account: &AccountInfo<'info>,
-    lending_market: &AccountInfo<'info>,
-    lending_market_authority: &AccountInfo<'info>,
-    kamino_reserve: &AccountInfo<'info>,
-    underlying_mint: &AccountInfo<'info>,
-    reserve_liquidity_supply: &AccountInfo<'info>,
-    reserve_collateral_mint: &AccountInfo<'info>,
-    margin_underlying_account: &AccountInfo<'info>,
-    margin_collateral_account: &AccountInfo<'info>,
-    collateral_token_program: &AccountInfo<'info>,
-    token_program: &AccountInfo<'info>,
-    instruction_sysvar_account: &AccountInfo<'info>,
+    accounts: &LiteClose<'info>,
     collateral_amount: u64,
     margin_signer_seeds: &[&[&[u8]]],
 ) -> Result<()> {
     let cpi = KaminoCpiAccounts {
-        klend_program: kamino_program,
-        owner: margin_account,
-        lending_market,
-        lending_market_authority,
-        reserve: kamino_reserve,
-        reserve_liquidity_mint: underlying_mint,
-        reserve_liquidity_supply,
-        reserve_collateral_mint,
-        user_liquidity_account: margin_underlying_account,
-        user_collateral_account: margin_collateral_account,
-        collateral_token_program,
-        liquidity_token_program: token_program,
-        instruction_sysvar: instruction_sysvar_account,
+        klend_program: &accounts.kamino_program.to_account_info(),
+        owner: &accounts.margin_account.to_account_info(),
+        lending_market: &accounts.lending_market.to_account_info(),
+        lending_market_authority: &accounts.lending_market_authority.to_account_info(),
+        reserve: &accounts.kamino_reserve.to_account_info(),
+        reserve_liquidity_mint: &accounts.underlying_mint.to_account_info(),
+        reserve_liquidity_supply: &accounts.reserve_liquidity_supply.to_account_info(),
+        reserve_collateral_mint: &accounts.reserve_collateral_mint.to_account_info(),
+        user_liquidity_account: &accounts.margin_underlying_account.to_account_info(),
+        user_collateral_account: &accounts.margin_collateral_account.to_account_info(),
+        collateral_token_program: &accounts.collateral_token_program.to_account_info(),
+        liquidity_token_program: &accounts.token_program.to_account_info(),
+        instruction_sysvar: &accounts.instruction_sysvar_account.to_account_info(),
     };
     kamino::redeem_reserve_collateral(&cpi, collateral_amount, margin_signer_seeds)
 }
@@ -981,23 +983,7 @@ pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u
     let margin_signer_seeds: &[&[&[u8]]] =
         &[&[MARGIN_SEED, authority_key.as_ref(), &[margin_bump]]];
 
-    do_redeem_reserve_collateral(
-        &ctx.accounts.kamino_program.to_account_info(),
-        &ctx.accounts.margin_account.to_account_info(),
-        &ctx.accounts.lending_market.to_account_info(),
-        &ctx.accounts.lending_market_authority.to_account_info(),
-        &ctx.accounts.kamino_reserve.to_account_info(),
-        &ctx.accounts.underlying_mint.to_account_info(),
-        &ctx.accounts.reserve_liquidity_supply.to_account_info(),
-        &ctx.accounts.reserve_collateral_mint.to_account_info(),
-        &ctx.accounts.margin_underlying_account.to_account_info(),
-        &ctx.accounts.margin_collateral_account.to_account_info(),
-        &ctx.accounts.collateral_token_program.to_account_info(),
-        &ctx.accounts.token_program.to_account_info(),
-        &ctx.accounts.instruction_sysvar_account.to_account_info(),
-        collateral_amount,
-        margin_signer_seeds,
-    )?;
+    do_redeem_reserve_collateral(ctx.accounts, collateral_amount, margin_signer_seeds)?;
     ctx.accounts.margin_collateral_account.reload()?;
     require!(
         receipts_before.checked_sub(ctx.accounts.margin_collateral_account.amount)
