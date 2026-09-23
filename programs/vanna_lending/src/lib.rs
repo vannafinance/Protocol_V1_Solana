@@ -242,12 +242,12 @@ pub mod vanna_lending {
         instructions::lite::lite_supply(ctx, amount, attribute_shares_delta)
     }
 
-    pub fn lite_reduce(ctx: Context<LiteClose>, exit_bps: u16, min_underlying_out: u64) -> Result<()> {
-        instructions::lite::lite_reduce(ctx, exit_bps, min_underlying_out)
+    pub fn lite_reduce_redeem(ctx: Context<LiteReduceRedeem>, exit_bps: u16, min_underlying_out: u64) -> Result<()> {
+        instructions::lite::lite_reduce_redeem(ctx, exit_bps, min_underlying_out)
     }
 
-    pub fn lite_close(ctx: Context<LiteClose>, min_underlying_out: u64) -> Result<()> {
-        instructions::lite::lite_close(ctx, min_underlying_out)
+    pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result<()> {
+        instructions::lite::lite_reduce_repay(ctx, exit_bps)
     }
 
     pub fn lite_reduce_and_repay<'info>(

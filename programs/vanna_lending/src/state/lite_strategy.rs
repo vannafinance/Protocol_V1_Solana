@@ -56,6 +56,34 @@ impl LitePosition {
         self.reserved[..16].copy_from_slice(&shares.to_le_bytes());
         self.reserved[16] = 1;
     }
+
+    /// Splitting a same-asset exit into two instructions (`lite_reduce_redeem` then
+    /// `lite_reduce_repay`, one transaction) — see those instructions' doc comments for
+    /// why — needs somewhere to carry the real, CPI-measured redeemed amount from the
+    /// first instruction to the second (the second can't just re-derive it, since the
+    /// margin's underlying vault may hold unrelated pre-existing balance too). Reuses
+    /// `reserved` bytes 17..=25 (byte 16 is already the `debt_shares` flag above),
+    /// preserving the deployed account layout for existing positions — a real position
+    /// closing for the first time under the split flow will read byte 25 as 0 (no pending
+    /// redeem), which is the correct default. `target_shares`/`attributed_shares` don't
+    /// need to be carried across: nothing in between the two instructions (same
+    /// transaction, atomic) can change the inputs they're computed from, so
+    /// `lite_reduce_repay` just recomputes them fresh from `exit_bps` + live state.
+    pub fn set_pending_redeem(&mut self, redeemed: u64) {
+        self.reserved[17..25].copy_from_slice(&redeemed.to_le_bytes());
+        self.reserved[25] = 1;
+    }
+    /// Reads and clears the pending redeem set by `set_pending_redeem`. `None` if there
+    /// isn't one (e.g. `lite_reduce_repay` called without a preceding `lite_reduce_redeem`
+    /// in the same transaction).
+    pub fn take_pending_redeem(&mut self) -> Option<u64> {
+        if self.reserved[25] != 1 {
+            return None;
+        }
+        let redeemed = u64::from_le_bytes(self.reserved[17..25].try_into().unwrap());
+        self.reserved[17..26].fill(0);
+        Some(redeemed)
+    }
 }
 
 #[cfg(test)]

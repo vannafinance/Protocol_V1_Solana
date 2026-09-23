@@ -114,4 +114,8 @@ pub enum VannaError {
     InvalidLeverage,
     #[msg("Jupiter margin swap route or balance delta is invalid")]
     InvalidSwapRoute,
+    #[msg("A previous lite_reduce_redeem hasn't been repaid yet by lite_reduce_repay")]
+    PendingLiteRedeem,
+    #[msg("No pending redeem to repay — call lite_reduce_redeem first")]
+    NoPendingLiteRedeem,
 }
