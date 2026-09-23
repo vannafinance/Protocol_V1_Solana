@@ -29,6 +29,13 @@ pub struct KaminoCpiAccounts<'a, 'info> {
     pub instruction_sysvar: &'a AccountInfo<'info>,
 }
 
+// BPF gives each stack frame a fixed 4KB budget. If this gets inlined into a caller that
+// already has a large frame of its own (e.g. `lite_reduce`, with its own several locals),
+// the combined frame can exceed that budget and crash with "Access violation in stack
+// frame N" — a real, live failure seen on `lite_reduce` (confirmed via a genuine on-chain
+// simulation, not a test). `#[inline(never)]` forces this into its own frame instead of
+// being folded into the caller's, which is the standard fix for this BPF failure class.
+#[inline(never)]
 fn account_infos<'a, 'info>(accounts: &KaminoCpiAccounts<'a, 'info>) -> [AccountInfo<'info>; 13] {
     [
         accounts.owner.clone(),
@@ -50,6 +57,7 @@ fn account_infos<'a, 'info>(accounts: &KaminoCpiAccounts<'a, 'info>) -> [Account
 /// `deposit_reserve_liquidity` — §6 left column. `owner` must sign — either a real wallet
 /// (pass an empty `signer_seeds`) or a PDA like the margin account (pass its `signer_seeds`,
 /// mirroring `redeem_reserve_collateral` below).
+#[inline(never)]
 pub fn deposit_reserve_liquidity<'info>(
     accounts: &KaminoCpiAccounts<'_, 'info>,
     liquidity_amount: u64,
@@ -86,6 +94,7 @@ pub fn deposit_reserve_liquidity<'info>(
 }
 
 /// `redeem_reserve_collateral` — §6 right column. `owner` may be a PDA (`signer_seeds`).
+#[inline(never)]
 pub fn redeem_reserve_collateral<'info>(
     accounts: &KaminoCpiAccounts<'_, 'info>,
     collateral_amount: u64,
