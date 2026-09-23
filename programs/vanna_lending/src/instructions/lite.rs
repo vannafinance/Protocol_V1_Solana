@@ -1152,8 +1152,7 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
     // by the time of a real-world close (days/weeks after open, not the seconds-apart timing of a
     // quick test) it can end up a few raw units above `redeemed` even on a full-percentage exit.
     // Same "repay what you can from what came back" pattern `lite_reduce_and_repay`'s leg3 already
-    // uses for its cross-asset repay — any shortfall just stays outstanding as (tiny) residual
-    // debt rather than blocking the redeem+repay entirely.
+    // uses for its cross-asset repay.
     let repay_amount = current_debt_assets.min(redeemed);
     let mut shares_burned = 0u128;
     if repay_amount > 0 {
@@ -1170,7 +1169,28 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
             received == repay_amount,
             VannaError::VaultAccountingInvariantFailed
         );
-        shares_burned = if repay_amount >= current_debt_assets {
+        // On a FULL (100%) exit, always fully clear this position's debt-share attribution —
+        // using `debt_position.borrow_shares` directly (the reserve's own authoritative,
+        // current value), NOT `target_shares` (an estimate derived from THIS LitePosition's
+        // own stored attribution, which can itself be a few shares short of the debt
+        // position's real remaining balance — e.g. after an earlier PARTIAL exit from the
+        // same pooled position by a different stock sharing it: that exit's own ceil/floor
+        // share-vs-asset rounding can leave this position's stored attribution understating
+        // what's actually left to repay, even when this exit's own `repay_amount` exactly
+        // matches its own `current_debt_assets`). Safe to zero the WHOLE debt_position here:
+        // by definition of a 100% exit, nothing else can still be attributed to it once this
+        // lands (any other stock sharing this pool already had its own share reduced to 0 by
+        // its own prior close). A caller doing a full exit (see `closeCrossAssetCarryTrade`'s
+        // `returnStockCollateral`) immediately follows this with a 100% withdrawal of this
+        // position's OTHER (stock) collateral in a separate instruction, whose own health
+        // check would otherwise see this now-uncollateralized dust debt and reject the
+        // withdrawal — turning an unpayable few raw units into a fully stuck position. The
+        // reserve absorbs this dust (a one-time, sub-cent shift in its own shares-to-assets
+        // exchange rate, in ITS favor). A partial exit still uses the exact proportional
+        // share, leaving genuine residual debt outstanding as before.
+        shares_burned = if exit_bps == 10_000 {
+            ctx.accounts.debt_position.borrow_shares
+        } else if repay_amount >= current_debt_assets {
             target_shares
         } else {
             mul_div_floor(
