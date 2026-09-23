@@ -21,9 +21,38 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::{
     associated_token::AssociatedToken,
+    token_2022::spl_token_2022::{
+        self,
+        extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    },
     token_interface::{Mint, TokenAccount, TokenInterface},
 };
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+/// The input leg (margin vault -> escrow, just below) is a real Token-2022 transfer: for
+/// a mint with a `TransferFeeConfig` extension (e.g. a PreStocks token like ANTHROPIC/
+/// OPENAI, currently 1%), only `amount - fee` actually lands in the escrow. The client
+/// already accounts for this when sizing the Jupiter quote (see `computeInputTransferFeeRaw`
+/// on the frontend), so this just re-derives the same fee on-chain to verify the escrow
+/// received exactly what's expected — not a flat `amount_in` match, which broke every
+/// fee-bearing input mint.
+fn expected_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, amount: u64) -> Result<u64> {
+    if *token_program != anchor_spl::token_2022::ID {
+        return Ok(0);
+    }
+    let data = mint_ai.try_borrow_data()?;
+    let mint_state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data)
+        .map_err(|_| VannaError::InvalidMint)?;
+    match mint_state.get_extension::<TransferFeeConfig>() {
+        Ok(fee_config) => {
+            let epoch = Clock::get()?.epoch;
+            Ok(fee_config
+                .calculate_epoch_fee(epoch, amount)
+                .ok_or(VannaError::MathOverflow)?)
+        }
+        Err(_) => Ok(0),
+    }
+}
 
 pub const SWAP_SEED: &[u8] = b"margin_swap";
 pub const JUPITER: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
@@ -136,6 +165,14 @@ pub fn user_margin_swap<'info>(
     let output_before = ctx.accounts.output_escrow.amount;
     let vault_input_before = ctx.accounts.input_vault.amount;
     let vault_output_before = ctx.accounts.output_vault.amount;
+    let expected_input_fee = expected_transfer_fee(
+        &ctx.accounts.input_mint.to_account_info(),
+        &ctx.accounts.input_token_program.key(),
+        amount_in,
+    )?;
+    let expected_escrow_receipt = amount_in
+        .checked_sub(expected_input_fee)
+        .ok_or(VannaError::MathUnderflow)?;
     transfer_out_checked(
         &ctx.accounts.input_token_program,
         &ctx.accounts.input_mint,
@@ -147,7 +184,7 @@ pub fn user_margin_swap<'info>(
     )?;
     ctx.accounts.input_escrow.reload()?;
     require!(
-        ctx.accounts.input_escrow.amount.checked_sub(input_before) == Some(amount_in),
+        ctx.accounts.input_escrow.amount.checked_sub(input_before) == Some(expected_escrow_receipt),
         VannaError::InvalidSwapRoute
     );
 
