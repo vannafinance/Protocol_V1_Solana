@@ -15,18 +15,6 @@ This repository contains the on-chain program, written with Anchor.
 | **Tech walkthrough** | <a href="https://www.youtube.com/watch?v=bF8RSiVm2JU" target="_blank" rel="noopener noreferrer">YouTube: Vanna Solana walkthrough</a> |
 
 
-## Product walkthrough video
-
-_Video coming soon._
-
-<!-- When the video is ready, replace the line above with (VIDEO_ID = the part after watch?v=):
-<a href="https://www.youtube.com/watch?v=VIDEO_ID" target="_blank" rel="noopener noreferrer"><img src="https://img.youtube.com/vi/VIDEO_ID/maxresdefault.jpg" alt="Vanna Solana product walkthrough" /></a>
--->
-
-## Tech walkthrough video
-
-<a href="https://www.youtube.com/watch?v=bF8RSiVm2JU" target="_blank" rel="noopener noreferrer"><img src="https://img.youtube.com/vi/bF8RSiVm2JU/maxresdefault.jpg" alt="Vanna Solana tech walkthrough" /></a>
-
 ## What the program does
 
 | Area | What it does | Docs |
