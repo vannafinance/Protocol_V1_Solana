@@ -1,16 +1,14 @@
 /**
- * Pure BigInt replicas of the on-chain fixed-point math in `programs/vanna_lending/src/math/*.rs`
- * — used only for **client-side display** (computing a live health factor, current debt, APR,
- * etc. to show a user). These never influence what actually gets submitted on-chain: every
- * mutating instruction still has its true numbers validated by the program itself. If this ever
- * disagrees with the program, the program is right — this is a read-only convenience.
+ * BigInt replicas of the on-chain math in `programs/vanna_lending/src/math/*.rs`, for display only
+ * (live health factor, current debt, APRs). The program re-validates everything it executes, so if
+ * this ever disagrees with it, the program is right.
  */
 
 export const WAD = 10n ** 18n;
 export const BALANCE_TO_BORROW_THRESHOLD_WAD = 1_100_000_000_000_000_000n;
 export const USD_VALUE_DECIMALS = 9;
 export const BASIS_POINTS = 10_000n;
-export const SECONDS_PER_YEAR = 31_536_000n;
+export const SECONDS_PER_YEAR = 31_556_952n;
 /** Anchor decodes Rust's `u128::MAX` health-factor sentinel ("infinite health") as this value. */
 export const U128_MAX = (1n << 128n) - 1n;
 
@@ -26,7 +24,10 @@ function pow10(n: number): bigint {
   return 10n ** BigInt(n);
 }
 
-/** `math/health.rs::normalize_token_value` — token amount + oracle price -> nano-USD value. */
+/**
+ * `math/health.rs::normalize_token_value`
+ * value = token_amount * price * 10^(price_exponent - token_decimals + USD_VALUE_DECIMALS)
+ */
 export function normalizeTokenValue(
   tokenAmount: bigint,
   price: bigint,
@@ -43,31 +44,45 @@ export function normalizeTokenValue(
   return roundUp ? mulDivCeil(base, 1n, factor) : mulDivFloor(base, 1n, factor);
 }
 
-/** `math/interest.rs::utilization_bps`. */
-export function utilizationBps(accountedLiquidityAssets: bigint, totalBorrowAssets: bigint): bigint {
-  const gross = accountedLiquidityAssets + totalBorrowAssets;
-  if (gross === 0n) return 0n;
-  return mulDivFloor(totalBorrowAssets, BASIS_POINTS, gross);
+/** `state/reserve.rs::RateCurve` — WAD-scaled borrow-rate curve coefficients. */
+export interface RateCurve {
+  linearCoeffWad: bigint;
+  jumpCoeffWad: bigint;
+  rateMultiplierWad: bigint;
 }
 
-/** `math/interest.rs::kink_rate_bps` — annualized borrow APR in basis points. */
-export function kinkRateBps(
-  utilBps: bigint,
-  baseRateBps: number,
-  slope1Bps: number,
-  slope2Bps: number,
-  optimalUtilizationBps: number,
-): bigint {
-  const optimal = BigInt(optimalUtilizationBps);
-  const base = BigInt(baseRateBps);
-  if (utilBps <= optimal) {
-    if (optimal === 0n) return base;
-    return base + mulDivFloor(BigInt(slope1Bps), utilBps, optimal);
+/**
+ * `math/interest.rs::utilization_wad`
+ * utilization = total_borrows / (liquidity + total_borrows)
+ */
+export function utilizationWad(accountedLiquidityAssets: bigint, totalBorrowAssets: bigint): bigint {
+  const gross = accountedLiquidityAssets + totalBorrowAssets;
+  if (gross === 0n) return 0n;
+  return mulDivFloor(totalBorrowAssets, WAD, gross);
+}
+
+/** `math/interest.rs::wad_pow` — square-and-multiply, each step rounded half-up. */
+function wadPow(base: bigint, exp: number): bigint {
+  if (base === 0n) return exp === 0 ? WAD : 0n;
+  const half = WAD / 2n;
+  let result = exp % 2 === 1 ? base : WAD;
+  for (let e = Math.floor(exp / 2); e > 0; e = Math.floor(e / 2)) {
+    base = (base * base + half) / WAD;
+    if (e % 2 === 1) result = (result * base + half) / WAD;
   }
-  const excessRoom = BASIS_POINTS - optimal;
-  const excessUtilization = utilBps - optimal;
-  const slope2Component = mulDivFloor(BigInt(slope2Bps), excessUtilization, excessRoom);
-  return base + BigInt(slope1Bps) + slope2Component;
+  return result;
+}
+
+/**
+ * `math/interest.rs::borrow_rate_per_second_wad`
+ * borrow_rate = rate_multiplier * (u * linear_coeff + u^32 * linear_coeff + u^64 * jump_coeff) / SECONDS_PER_YEAR
+ */
+export function borrowRatePerSecondWad(curve: RateCurve, utilWad: bigint): bigint {
+  const polynomial =
+    mulDivFloor(utilWad, curve.linearCoeffWad, WAD) +
+    mulDivFloor(wadPow(utilWad, 32), curve.linearCoeffWad, WAD) +
+    mulDivFloor(wadPow(utilWad, 64), curve.jumpCoeffWad, WAD);
+  return mulDivFloor(curve.rateMultiplierWad, polynomial, SECONDS_PER_YEAR * WAD);
 }
 
 export interface ReserveLike {
@@ -76,10 +91,7 @@ export interface ReserveLike {
   accruedProtocolFees: bigint;
   borrowIndexWad: bigint;
   lastUpdateTimestamp: bigint;
-  baseRateBps: number;
-  slope1Bps: number;
-  slope2Bps: number;
-  optimalUtilizationBps: number;
+  rateCurve: RateCurve;
   reserveFactorBps: number;
 }
 
@@ -90,8 +102,11 @@ export interface AccrualResult {
   interestAccrued: bigint;
 }
 
-/** `math/interest.rs::accrue`, projected to `now` — the on-chain reserve fields are only true as
- * of `last_update_timestamp`; this brings them current for display without sending a transaction. */
+/**
+ * `math/interest.rs::accrue`, projected to `now`. On-chain fields are only current as of
+ * `last_update_timestamp`; this brings them up to date without a transaction.
+ * interest = ceil(total_borrows * borrow_rate * elapsed), protocol_fee = interest * reserve_factor
+ */
 export function accrue(reserve: ReserveLike, now: bigint): AccrualResult {
   const elapsed = now - reserve.lastUpdateTimestamp;
   if (elapsed <= 0n || reserve.totalBorrowAssets === 0n) {
@@ -103,12 +118,9 @@ export function accrue(reserve: ReserveLike, now: bigint): AccrualResult {
     };
   }
 
-  const util = utilizationBps(reserve.accountedLiquidityAssets, reserve.totalBorrowAssets);
-  const rateBps = kinkRateBps(util, reserve.baseRateBps, reserve.slope1Bps, reserve.slope2Bps, reserve.optimalUtilizationBps);
-
-  const numerator = reserve.totalBorrowAssets * rateBps * elapsed;
-  const denominator = BASIS_POINTS * SECONDS_PER_YEAR;
-  const interest = mulDivCeil(numerator, 1n, denominator);
+  const util = utilizationWad(reserve.accountedLiquidityAssets, reserve.totalBorrowAssets);
+  const growthWad = borrowRatePerSecondWad(reserve.rateCurve, util) * elapsed;
+  const interest = mulDivCeil(reserve.totalBorrowAssets, growthWad, WAD);
 
   const protocolFee = mulDivFloor(interest, BigInt(reserve.reserveFactorBps), BASIS_POINTS);
   const newTotalBorrowAssets = reserve.totalBorrowAssets + interest;
@@ -119,21 +131,13 @@ export function accrue(reserve: ReserveLike, now: bigint): AccrualResult {
   return { newTotalBorrowAssets, newAccruedProtocolFees, newBorrowIndexWad, interestAccrued: interest };
 }
 
-/** `math/shares.rs::debt_shares_to_assets_up`. */
+/**
+ * `math/shares.rs::debt_shares_to_assets_up`
+ * debt = ceil(borrow_shares * total_borrows / total_borrow_shares)
+ */
 export function debtSharesToAssetsUp(borrowShares: bigint, totalBorrowShares: bigint, totalBorrowAssets: bigint): bigint {
   if (totalBorrowShares === 0n) return 0n;
   return mulDivCeil(borrowShares, totalBorrowAssets, totalBorrowShares);
-}
-
-/** `math/shares.rs::lender_total_assets`. */
-export function lenderTotalAssets(accountedLiquidityAssets: bigint, totalBorrowAssets: bigint, accruedProtocolFees: bigint): bigint {
-  return accountedLiquidityAssets + totalBorrowAssets - accruedProtocolFees;
-}
-
-/** `math/shares.rs::supply_shares_to_assets_down`. */
-export function supplySharesToAssetsDown(shares: bigint, totalShareSupply: bigint, lenderTotalAssetsNow: bigint): bigint {
-  if (totalShareSupply === 0n) return 0n;
-  return mulDivFloor(shares, lenderTotalAssetsNow, totalShareSupply);
 }
 
 export interface CollateralValuation {
@@ -152,23 +156,20 @@ export interface HealthSnapshot {
   liquidationHealthFactorWad: bigint;
 }
 
-function healthFactorWad(numerator: bigint, denominator: bigint): bigint {
-  if (denominator === 0n) return U128_MAX;
-  return mulDivFloor(numerator, WAD, denominator);
+function healthFactorWad(collateralValue: bigint, debtValue: bigint): bigint {
+  if (debtValue === 0n) return U128_MAX;
+  return mulDivFloor(collateralValue, WAD, debtValue);
 }
 
-/** `math/health.rs::calculate_health`. */
+/**
+ * `math/health.rs::calculate_health`
+ * health_factor = sum(collateral_usd) / sum(debt_usd); healthy when debt == 0 or health_factor > 1.10
+ */
 export function calculateHealth(collaterals: CollateralValuation[], debts: DebtValuation[]): HealthSnapshot {
-  let totalCollateralValue = 0n;
-  for (const c of collaterals) {
-    totalCollateralValue += c.collateralValue;
-  }
-  let totalDebtValue = 0n;
-  for (const d of debts) totalDebtValue += d.debtValue;
+  const totalCollateralValue = collaterals.reduce((sum, c) => sum + c.collateralValue, 0n);
+  const totalDebtValue = debts.reduce((sum, d) => sum + d.debtValue, 0n);
 
   return {
-    // Compatibility names retained for existing CLI consumers. Vanna's canonical risk model
-    // uses the same raw collateral total for borrow and liquidation health.
     borrowPower: totalCollateralValue,
     liquidationCollateralValue: totalCollateralValue,
     totalDebtValue,

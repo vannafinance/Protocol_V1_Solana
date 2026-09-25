@@ -1,31 +1,59 @@
 use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
-use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked};
+use anchor_spl::token_interface::{
+    transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked,
+};
 
-/// Confirms `actual` is genuinely *the* Associated Token Account for `(owner, mint)` under the
-/// classic SPL Token Program — not merely some other token account that happens to share the same
-/// mint/authority. Margin collateral vaults are plain ATAs (no PDA of our own protects them), so
-/// every instruction and the `remaining_accounts` scan (`validation/positions.rs`) must pin the
-/// exact address down explicitly; otherwise a caller could substitute a different token account
-/// they also control for the same margin/mint pair and desynchronize it from the one every other
-/// instruction actually uses.
-pub fn verify_associated_token_account(actual: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Result<()> {
-    let expected = get_associated_token_address_with_program_id(owner, mint, &crate::constants::CLASSIC_SPL_TOKEN_PROGRAM);
+/// Gross transfer amount such that the recipient receives `net_amount` after `mint`'s
+/// Token-2022 `TransferFeeConfig` fee for the current epoch. Identity for classic SPL mints
+/// and Token-2022 mints without the extension.
+///
+/// Repays burn debt shares against what the vault actually received, so with a fee-bearing
+/// mint (e.g. the 1% PreStocks) transferring exactly the debt would leave part of it open.
+/// Grossing up by the inverse fee lets a full repay clear the debt.
+pub fn gross_up_for_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, net_amount: u64) -> Result<u64> {
+    use anchor_spl::token_2022::spl_token_2022::{
+        self,
+        extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    };
+    if *token_program != anchor_spl::token_2022::ID {
+        return Ok(net_amount);
+    }
+    let data = mint_ai.try_borrow_data()?;
+    let mint_state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data)
+        .map_err(|_| VannaError::InvalidMint)?;
+    match mint_state.get_extension::<TransferFeeConfig>() {
+        Ok(fee_config) => {
+            let epoch = Clock::get()?.epoch;
+            let fee = fee_config
+                .calculate_inverse_epoch_fee(epoch, net_amount)
+                .ok_or(VannaError::MathOverflow)?;
+            Ok(net_amount.checked_add(fee).ok_or(VannaError::MathOverflow)?)
+        }
+        Err(_) => Ok(net_amount),
+    }
+}
+
+/// Confirms `actual` is the Associated Token Account for `(owner, mint)` under `token_program`.
+pub fn verify_associated_token_account(
+    actual: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Result<()> {
+    let expected = get_associated_token_address_with_program_id(owner, mint, token_program);
     require_keys_eq!(*actual, expected, VannaError::InvalidVaultAuthority);
     Ok(())
 }
 
-/// Spec §6.6 `transfer_in_measured` — transfers `amount` from a user-authorized source into a
-/// protocol-owned vault, then measures the *actual* delta from a reload rather than trusting the
-/// requested amount. Under the classic SPL Token Program the delta always equals `amount`, but the
-/// measurement is still performed so this helper (and every caller) stays correct if a
-/// fee-charging token variant is ever admitted.
+/// Transfers `amount` in and returns the destination's measured balance delta, which is the
+/// amount actually received under Token-2022 transfer fees.
 pub fn transfer_in_measured<'info>(
-    token_program: &Program<'info, Token>,
-    mint: &Account<'info, Mint>,
-    from: &Account<'info, TokenAccount>,
-    to: &mut Account<'info, TokenAccount>,
+    token_program: &Interface<'info, TokenInterface>,
+    mint: &InterfaceAccount<'info, Mint>,
+    from: &InterfaceAccount<'info, TokenAccount>,
+    to: &mut InterfaceAccount<'info, TokenAccount>,
     authority: &Signer<'info>,
     amount: u64,
 ) -> Result<u64> {
@@ -51,15 +79,13 @@ pub fn transfer_in_measured<'info>(
         .ok_or_else(|| VannaError::MathUnderflow.into())
 }
 
-/// Like `transfer_out_checked`, but measures the destination's actual balance delta instead of
-/// trusting the requested `amount` — used wherever the delta itself drives protocol accounting
-/// (e.g. reducing recorded debt by exactly what a reserve vault received).
+/// PDA-signed transfer out; returns the destination's measured balance delta.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer_out_checked_measured<'info>(
-    token_program: &Program<'info, Token>,
-    mint: &Account<'info, Mint>,
-    from: &Account<'info, TokenAccount>,
-    to: &mut Account<'info, TokenAccount>,
+    token_program: &Interface<'info, TokenInterface>,
+    mint: &InterfaceAccount<'info, Mint>,
+    from: &InterfaceAccount<'info, TokenAccount>,
+    to: &mut InterfaceAccount<'info, TokenAccount>,
     authority: &AccountInfo<'info>,
     signer_seeds: &[&[&[u8]]],
     amount: u64,
@@ -86,13 +112,13 @@ pub fn transfer_out_checked_measured<'info>(
         .ok_or_else(|| VannaError::MathUnderflow.into())
 }
 
-/// Spec §6.6 `transfer_out_checked` — a PDA-signed exact-output transfer out of a protocol vault.
+/// PDA-signed transfer out without measuring the received amount.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer_out_checked<'info>(
-    token_program: &Program<'info, Token>,
-    mint: &Account<'info, Mint>,
-    from: &Account<'info, TokenAccount>,
-    to: &Account<'info, TokenAccount>,
+    token_program: &Interface<'info, TokenInterface>,
+    mint: &InterfaceAccount<'info, Mint>,
+    from: &InterfaceAccount<'info, TokenAccount>,
+    to: &InterfaceAccount<'info, TokenAccount>,
     authority: &AccountInfo<'info>,
     signer_seeds: &[&[&[u8]]],
     amount: u64,

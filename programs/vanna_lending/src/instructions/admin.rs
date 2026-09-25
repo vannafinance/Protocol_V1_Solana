@@ -1,13 +1,14 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::math::interest::accrue;
+use crate::instructions::borrowing::apply_accrual;
 use crate::state::asset_config::AssetConfig;
 use crate::state::protocol_config::{OperatingMode, ProtocolConfig};
-use crate::state::reserve::{Reserve, ReserveStatus};
+use crate::state::reserve::{RateCurve, Reserve, ReserveStatus};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token::{Mint as TokenMint, Token};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 
 // ---------------------------------------------------------------------------
 // initialize_protocol
@@ -17,8 +18,7 @@ use anchor_spl::token::{Mint, Token, TokenAccount};
 pub struct InitializeProtocol<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// Must sign — this is what makes the resulting `config.admin` authentic rather than an
-    /// unverified instruction argument any front-running payer could set to themselves.
+    /// Must sign, so a front-running payer cannot initialize the protocol with themselves as admin.
     pub admin: Signer<'info>,
     #[account(
         init,
@@ -159,7 +159,7 @@ pub struct AdminRegisterAsset<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init,
         payer = payer,
@@ -168,7 +168,7 @@ pub struct AdminRegisterAsset<'info> {
         bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -301,7 +301,7 @@ pub struct AdminInitializeReserve<'info> {
         bump = asset_config.bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init,
         payer = payer,
@@ -314,38 +314,37 @@ pub struct AdminInitializeReserve<'info> {
         init,
         payer = payer,
         associated_token::mint = underlying_mint,
-        associated_token::authority = reserve
+        associated_token::authority = reserve,
+        associated_token::token_program = token_program,
     )]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init,
         payer = payer,
         mint::decimals = underlying_mint.decimals,
         mint::authority = reserve,
+        mint::token_program = share_token_program,
         seeds = [SHARE_MINT_SEED, underlying_mint.key().as_ref()],
         bump
     )]
-    pub share_mint: Box<Account<'info, Mint>>,
-    pub token_program: Program<'info, Token>,
+    pub share_mint: Box<Account<'info, TokenMint>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    /// Share mints are always classic SPL.
+    pub share_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn admin_initialize_reserve(
     ctx: Context<AdminInitializeReserve>,
-    base_rate_bps: u16,
-    slope1_bps: u16,
-    slope2_bps: u16,
-    optimal_utilization_bps: u16,
+    rate_curve: RateCurve,
     reserve_factor_bps: u16,
     supply_cap: u64,
     borrow_cap: u64,
     status: u8,
 ) -> Result<()> {
     require_keys_eq!(ctx.accounts.asset_config.reserve, Pubkey::default(), VannaError::ReserveAlreadyExists);
-    Reserve::validate_rate_model(base_rate_bps, optimal_utilization_bps, reserve_factor_bps)?;
-    require!(slope1_bps <= 10_000 && slope2_bps <= 20_000, VannaError::InvalidRateModel);
+    Reserve::validate_rate_config(&rate_curve, reserve_factor_bps)?;
     ReserveStatus::from_u8(status).ok_or(VannaError::InvalidReserveStatus)?;
 
     let now = Clock::get()?.unix_timestamp;
@@ -362,10 +361,7 @@ pub fn admin_initialize_reserve(
     reserve.borrow_index_wad = WAD;
     reserve.accrued_protocol_fees = 0;
     reserve.last_update_timestamp = now;
-    reserve.base_rate_bps = base_rate_bps;
-    reserve.slope1_bps = slope1_bps;
-    reserve.slope2_bps = slope2_bps;
-    reserve.optimal_utilization_bps = optimal_utilization_bps;
+    reserve.rate_curve = rate_curve;
     reserve.reserve_factor_bps = reserve_factor_bps;
     reserve.status = status;
     reserve.bump = ctx.bumps.reserve;
@@ -398,7 +394,7 @@ pub struct AdminUpdateReserveConfig<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         mut,
         seeds = [RESERVE_SEED, underlying_mint.key().as_ref()],
@@ -407,34 +403,22 @@ pub struct AdminUpdateReserveConfig<'info> {
     pub reserve: Box<Account<'info, Reserve>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn admin_update_reserve_config(
     ctx: Context<AdminUpdateReserveConfig>,
-    base_rate_bps: u16,
-    slope1_bps: u16,
-    slope2_bps: u16,
-    optimal_utilization_bps: u16,
+    rate_curve: RateCurve,
     reserve_factor_bps: u16,
     supply_cap: u64,
     borrow_cap: u64,
     status: u8,
 ) -> Result<()> {
-    Reserve::validate_rate_model(base_rate_bps, optimal_utilization_bps, reserve_factor_bps)?;
-    require!(slope1_bps <= 10_000 && slope2_bps <= 20_000, VannaError::InvalidRateModel);
+    Reserve::validate_rate_config(&rate_curve, reserve_factor_bps)?;
     ReserveStatus::from_u8(status).ok_or(VannaError::InvalidReserveStatus)?;
 
     let reserve = &mut ctx.accounts.reserve;
     let now = Clock::get()?.unix_timestamp;
-    let accrual = accrue(reserve, now)?;
-    reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    reserve.last_update_timestamp = now;
+    apply_accrual(reserve, now)?;
 
-    reserve.base_rate_bps = base_rate_bps;
-    reserve.slope1_bps = slope1_bps;
-    reserve.slope2_bps = slope2_bps;
-    reserve.optimal_utilization_bps = optimal_utilization_bps;
+    reserve.rate_curve = rate_curve;
     reserve.reserve_factor_bps = reserve_factor_bps;
     reserve.supply_cap = supply_cap;
     reserve.borrow_cap = borrow_cap;
@@ -442,10 +426,7 @@ pub fn admin_update_reserve_config(
 
     emit!(ReserveConfigUpdated {
         reserve: reserve.key(),
-        base_rate_bps,
-        slope1_bps,
-        slope2_bps,
-        optimal_utilization_bps,
+        rate_curve,
         reserve_factor_bps,
         supply_cap,
         borrow_cap,
@@ -468,18 +449,18 @@ pub struct AdminCollectProtocolFees<'info> {
         has_one = admin @ VannaError::Unauthorized
     )]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         mut,
         seeds = [RESERVE_SEED, underlying_mint.key().as_ref()],
         bump = reserve.bump
     )]
     pub reserve: Box<Account<'info, Reserve>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = reserve)]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = protocol_config.treasury)]
-    pub treasury_ata: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    #[account(mut, token::mint = underlying_mint, token::authority = reserve, token::token_program = token_program)]
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = protocol_config.treasury, token::token_program = token_program)]
+    pub treasury_ata: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 pub fn admin_collect_protocol_fees(ctx: Context<AdminCollectProtocolFees>, amount: u64) -> Result<()> {
@@ -488,11 +469,7 @@ pub fn admin_collect_protocol_fees(ctx: Context<AdminCollectProtocolFees>, amoun
     let reserve_account_info = ctx.accounts.reserve.to_account_info();
     let now = Clock::get()?.unix_timestamp;
     let reserve = &mut ctx.accounts.reserve;
-    let accrual = accrue(reserve, now)?;
-    reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    reserve.last_update_timestamp = now;
+    apply_accrual(reserve, now)?;
 
     let collectible = reserve.accrued_protocol_fees.min(reserve.accounted_liquidity_assets);
     require!(amount <= collectible, VannaError::InsufficientLiquidity);

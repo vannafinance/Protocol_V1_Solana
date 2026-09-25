@@ -17,35 +17,26 @@ use crate::validation::positions::scan_and_validate_positions;
 use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // ---------------------------------------------------------------------------
 // user_deposit_and_borrow
 // ---------------------------------------------------------------------------
 //
-// Combined deposit-collateral + open-debt-position (if needed) + borrow, in one signed
-// transaction — the Solana equivalent of the Stellar/Soroban sibling contract's
-// `deposit_and_borrow_cross`. It also creates the margin account itself on first use, mirroring
-// that contract auto-creating an account on a user's first leveraged deposit.
+// Create margin + deposit + open debt position + borrow in one transaction.
 //
-// Deliberately CROSS-ASSET ONLY (`deposit_mint != borrow_mint`): with only two supported assets,
-// same-asset "loop" leverage would require the deposit-side and borrow-side account slots
-// (`asset_config`, margin vault, price update) to alias the exact same underlying account under
-// two different Anchor field names. Anchor deserializes each field into its own independent
-// in-memory copy, so writing both back at the end of the handler would have the second write
-// silently clobber the first — a real correctness bug, not just a redundant check. A same-asset
-// leveraged loop is still reachable, just as two separate transactions: `user_open_debt_position`
-// (if needed) + `user_borrow`, exactly as before this instruction existed.
+// Cross-asset only: with one mint, the deposit and borrow fields would alias the same accounts,
+// and Anchor's second write-back would silently clobber the first.
+
 #[derive(Accounts)]
 pub struct UserDepositAndBorrow<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
     #[account(seeds = [PROTOCOL_SEED], bump = protocol_config.bump)]
     pub protocol_config: Box<Account<'info, ProtocolConfig>>,
-    /// Created on first use (mirrors `user_create_margin`) — ownership of an already-existing
-    /// account is checked by hand in the handler body, since `has_one` can't be combined with
-    /// `init_if_needed` here (on the fresh-init path there is no owner yet to check against).
+    /// Created on first use. Ownership of an existing account is checked in the handler, since
+    /// `has_one` can't be combined with `init_if_needed` (a fresh account has no owner yet).
     #[account(
         init_if_needed,
         payer = authority,
@@ -58,25 +49,30 @@ pub struct UserDepositAndBorrow<'info> {
     // --- Deposit (collateral) side ---
     #[account(seeds = [ASSET_SEED, deposit_mint.key().as_ref()], bump = deposit_asset_config.bump)]
     pub deposit_asset_config: Box<Account<'info, AssetConfig>>,
-    pub deposit_mint: Box<Account<'info, Mint>>,
-    /// Pyth price update for the deposited asset.
+    pub deposit_mint: Box<InterfaceAccount<'info, Mint>>,
     pub deposit_price_update: Box<Account<'info, PriceUpdateV2>>,
-    #[account(mut, token::mint = deposit_mint, token::authority = authority)]
-    pub deposit_source_token_account: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = deposit_mint,
+        token::authority = authority,
+        token::token_program = token_program
+    )]
+    pub deposit_source_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = deposit_mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub deposit_margin_vault: Box<Account<'info, TokenAccount>>,
+    pub deposit_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // --- Borrow side ---
     #[account(seeds = [ASSET_SEED, borrow_mint.key().as_ref()], bump = borrow_asset_config.bump)]
     pub borrow_asset_config: Box<Account<'info, AssetConfig>>,
     #[account(mut, seeds = [RESERVE_SEED, borrow_mint.key().as_ref()], bump = borrow_reserve.bump)]
     pub borrow_reserve: Box<Account<'info, Reserve>>,
-    /// Opened on first borrow of this asset (mirrors `user_open_debt_position`).
+    /// Opened on first borrow of this asset.
     #[account(
         init_if_needed,
         payer = authority,
@@ -85,22 +81,27 @@ pub struct UserDepositAndBorrow<'info> {
         bump
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
-    /// Pyth price update for the borrowed asset.
     pub borrow_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub borrow_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = borrow_mint, token::authority = borrow_reserve)]
-    pub borrow_reserve_vault: Box<Account<'info, TokenAccount>>,
-    /// Borrowed funds land here as protocol-controlled collateral credit (spec §1.2), same as
-    /// plain `user_borrow`.
+    pub borrow_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        token::mint = borrow_mint,
+        token::authority = borrow_reserve,
+        token::token_program = token_program
+    )]
+    pub borrow_reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// Borrowed funds land here and count as collateral.
     #[account(
         init_if_needed,
         payer = authority,
         associated_token::mint = borrow_mint,
-        associated_token::authority = margin_account
+        associated_token::authority = margin_account,
+        associated_token::token_program = token_program,
     )]
-    pub borrow_margin_vault: Box<Account<'info, TokenAccount>>,
+    pub borrow_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_program: Program<'info, Token>,
+    /// Both legs must share a token program (classic SPL or Token-2022).
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -139,18 +140,19 @@ pub fn user_deposit_and_borrow(
         &ctx.accounts.deposit_margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.deposit_mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
     verify_associated_token_account(
         &ctx.accounts.borrow_margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.borrow_mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
 
     let clock = Clock::get()?;
 
-    // `init_if_needed` zero-initializes a fresh account before the handler runs — `authority`
-    // would be the all-zero Pubkey, which no real wallet ever holds, so this is a reliable
-    // "freshly created, not yet owned" signal (mirrors `user_create_margin`'s own construction).
+    // `init_if_needed` zero-initializes a fresh account, and no real wallet is the default
+    // Pubkey, so a default `authority` reliably means "just created, not yet owned".
     if ctx.accounts.margin_account.authority == Pubkey::default() {
         let bump = ctx.bumps.margin_account;
         ctx.accounts
@@ -160,8 +162,7 @@ pub fn user_deposit_and_borrow(
         require_keys_eq!(ctx.accounts.margin_account.authority, ctx.accounts.authority.key(), VannaError::Unauthorized);
     }
 
-    // Same freshness signal for the debt position: a real position's `reserve` is never the
-    // default Pubkey (mirrors `user_open_debt_position`'s own construction).
+    // Same freshness signal for the debt position: a real position's `reserve` is never default.
     if ctx.accounts.debt_position.reserve == Pubkey::default() {
         ctx.accounts.debt_position.margin_account = ctx.accounts.margin_account.key();
         ctx.accounts.debt_position.reserve = ctx.accounts.borrow_reserve.key();
@@ -175,7 +176,7 @@ pub fn user_deposit_and_borrow(
         });
     }
 
-    // ---- Deposit leg (mirrors user_deposit_collateral) ----
+    // ---- Deposit leg ----
     let deposit_was_zero = ctx.accounts.deposit_margin_vault.amount == 0;
     let deposit_received = transfer_in_measured(
         &ctx.accounts.token_program,
@@ -212,7 +213,7 @@ pub fn user_deposit_and_borrow(
         timestamp: clock.unix_timestamp,
     });
 
-    // ---- Borrow leg (mirrors user_borrow) ----
+    // ---- Borrow leg ----
     apply_accrual(&mut ctx.accounts.borrow_reserve, clock.unix_timestamp)?;
 
     require!(
@@ -238,10 +239,8 @@ pub fn user_deposit_and_borrow(
     )?;
     require!(new_debt_shares <= max_debt_shares, VannaError::SlippageExceeded);
 
-    // Every OTHER active collateral/debt this margin account holds — the deposit asset's own
-    // collateral slot and the borrow asset's own debt slot are excluded here because they're
-    // handled explicitly below via the named accounts, exactly like `user_borrow` excludes its
-    // single named asset from this same scan.
+    // Scan every OTHER active position; the deposit asset's collateral slot and the borrow
+    // asset's debt slot are valued explicitly below from the named accounts.
     let margin_key = ctx.accounts.margin_account.key();
     let (scanned_collaterals, other_debts) = scan_and_validate_positions(
         &margin_key,
@@ -251,12 +250,12 @@ pub fn user_deposit_and_borrow(
         &clock,
         Some(ctx.accounts.deposit_asset_config.asset_index),
         Some(ctx.accounts.borrow_asset_config.asset_index),
+        None,
     )?;
     let mut collaterals: Vec<CollateralValuation> = scanned_collaterals.into_iter().map(|c| c.valuation).collect();
     let mut debts: Vec<DebtValuation> = other_debts.into_iter().map(|d| d.valuation).collect();
 
-    // Deposit asset's own projected collateral value — `deposit_margin_vault.amount` already
-    // reflects the transfer above, so no further projection is needed on top of it.
+    // `deposit_margin_vault.amount` already reflects the transfer above.
     let deposit_price = load_validated_price(&ctx.accounts.deposit_asset_config, &ctx.accounts.deposit_price_update, &clock)?;
     let deposit_collateral_value = normalize_token_value(
         ctx.accounts.deposit_margin_vault.amount,
@@ -269,7 +268,6 @@ pub fn user_deposit_and_borrow(
         collateral_value: deposit_collateral_value,
     });
 
-    // Borrow asset's own projected debt value (existing + new shares, priced with its own feed).
     let projected_total_borrow_assets = ctx
         .accounts
         .borrow_reserve
@@ -303,9 +301,8 @@ pub fn user_deposit_and_borrow(
     )?;
     debts.push(DebtValuation { debt_value: borrow_debt_value });
 
-    // Borrowed funds also land as protocol-controlled collateral credit for the borrow asset
-    // itself (spec §1.2, same as plain `user_borrow`) — always a genuinely separate credit from
-    // the deposit-side collateral pushed above, since the two mints are required to differ.
+    // Borrowed funds also count as collateral for the borrow asset; this is always distinct from
+    // the deposit-side collateral above since the two mints differ.
     let was_zero_borrow_collateral = ctx.accounts.borrow_margin_vault.amount == 0;
     if ctx.accounts.borrow_asset_config.collateral_enabled {
         let projected_borrow_side_collateral = ctx

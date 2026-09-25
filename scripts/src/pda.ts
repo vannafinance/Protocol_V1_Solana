@@ -29,3 +29,11 @@ export function marginPda(authority: PublicKey): [PublicKey, number] {
 export function debtPositionPda(margin: PublicKey, reserve: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync([enc("debt"), margin.toBuffer(), reserve.toBuffer()], PROGRAM_ID);
 }
+
+export function liteStrategyPda(mint: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([enc("lite_strategy"), mint.toBuffer()], PROGRAM_ID);
+}
+
+export function litePositionPda(margin: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([enc("lite_position"), margin.toBuffer()], PROGRAM_ID);
+}

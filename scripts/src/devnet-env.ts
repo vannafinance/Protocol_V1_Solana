@@ -1,43 +1,78 @@
 import * as anchor from "@coral-xyz/anchor";
+import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 /**
- * Shared environment for every script in `scripts/src/devnet/`: wallet loading, the Devnet RPC
- * connection, an Anchor `Program` bound to that wallet, and the two real assets these scripts use.
- *
- * Real assets only — Circle's official Devnet USDC and the native SOL mint (wrapped as WSOL) — so
- * that real Pyth price feeds apply directly (see `devnet-pyth.ts`). There is no "create a test
- * mint" helper here: these mints already exist on Devnet and nobody but their real authorities can
- * mint them, so funding a wallet with them goes through the real faucets documented in
- * `COMMANDS.md`, not a script.
+ * Shared environment for Protocol CLI scripts. The only supported target is a local
+ * Surfpool mainnet fork (lazy-clones real mainnet accounts). Despite the historical
+ * `DEVNET_RPC_URL` env name, the default is always the local fork — never public Devnet.
  */
 
-export const DEVNET_RPC_URL = process.env.DEVNET_RPC_URL ?? "https://api.devnet.solana.com";
+/** Prefer DEVNET_RPC_URL for backward-compat with existing docs/scripts; FORK_RPC_URL also works. */
+export const DEVNET_RPC_URL =
+  process.env.DEVNET_RPC_URL ?? process.env.FORK_RPC_URL ?? "http://127.0.0.1:8899";
 
-export type AssetKey = "usdc" | "wsol";
+export type AssetKey = "usdc" | "wsol" | "tslax" | "googlx" | "aaplx" | "anthropic" | "openai";
 
-export const USDC_MINT = new PublicKey("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+/** Real mainnet USDC (cloned onto the Surfpool fork by address). */
+export const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 export const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
+export const TSLAX_MINT = new PublicKey("XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB");
+export const GOOGLX_MINT = new PublicKey("XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN");
+export const AAPLX_MINT = new PublicKey("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRLJzJp");
+/** Real mainnet PreStocks (prestocks.com) tokens — Token-2022, no real Pyth feed exists. */
+export const ANTHROPIC_MINT = new PublicKey("Pren1FvFX6J3E4kXhJuCiAD5aDmGEb7qJRncwA8Lkhw");
+export const OPENAI_MINT = new PublicKey("PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF");
 
-export const ASSET_MINTS: Record<AssetKey, PublicKey> = { usdc: USDC_MINT, wsol: WSOL_MINT };
-export const ASSET_DECIMALS: Record<AssetKey, number> = { usdc: 6, wsol: 9 };
+export const ASSET_MINTS: Record<AssetKey, PublicKey> = {
+  usdc: USDC_MINT,
+  wsol: WSOL_MINT,
+  tslax: TSLAX_MINT,
+  googlx: GOOGLX_MINT,
+  aaplx: AAPLX_MINT,
+  anthropic: ANTHROPIC_MINT,
+  openai: OPENAI_MINT,
+};
+export const ASSET_DECIMALS: Record<AssetKey, number> = {
+  usdc: 6,
+  wsol: 9,
+  tslax: 8,
+  googlx: 8,
+  aaplx: 8,
+  anthropic: 9,
+  openai: 9,
+};
+
+export const ASSET_TOKEN_PROGRAM: Record<AssetKey, PublicKey> = {
+  usdc: TOKEN_PROGRAM_ID,
+  wsol: TOKEN_PROGRAM_ID,
+  tslax: TOKEN_2022_PROGRAM_ID,
+  googlx: TOKEN_2022_PROGRAM_ID,
+  aaplx: TOKEN_2022_PROGRAM_ID,
+  anthropic: TOKEN_2022_PROGRAM_ID,
+  openai: TOKEN_2022_PROGRAM_ID,
+};
 
 /**
- * Pyth price feed IDs (verified live against Hermes's `/v2/price_feeds` endpoint — these are
- * chain-agnostic symbol identifiers, the same value on every chain Pyth publishes to).
+ * Pyth price feed IDs (chain-agnostic; same hex on every cluster). Anthropic/OpenAI have no real
+ * Pyth feed — these are synthetic sentinels (`sha256("PRESTOCKS/<SYMBOL>/USD")`) used only to
+ * derive a stable fabricated PriceUpdateV2 account address on the fork.
  */
 export const PYTH_FEED_IDS: Record<AssetKey, string> = {
   usdc: "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
   wsol: "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+  tslax: "e6da44bff5b8b06897a3739dd331b440d6662595bb862e37046892c568ae3fc0",
+  googlx: "ad519718d387de4f0d7d29ea16a3730ce42e49c59fef6fba6fc9bac477645f6f",
+  aaplx: "aaba35e6f33fb973bb2201d48a79ae24795affa6ba8bd50a93dcaf7da0030f36",
+  anthropic: "e2b7d8199aa16dfcefcb89b6614e0a95c08bc283745412d209d0b3ca099b0721",
+  openai: "1847efd0848d500cd781f05957ca787d64e80cfc7cefd734337fc9858626e634",
 };
 
-/** Shard ID for Pyth's long-lived "price feed accounts" — 0 is the default/only shard we use. */
 export const PYTH_SHARD_ID = 0;
 
-/** Converts a 64-char hex feed ID into the `[u8; 32]` array `admin_register_asset` expects. */
 export function feedIdToBytes(hex: string): number[] {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
   if (clean.length !== 64) throw new Error(`feed id must be 32 bytes (64 hex chars), got ${clean.length}`);
@@ -47,8 +82,13 @@ export function feedIdToBytes(hex: string): number[] {
 }
 
 export function assetKeyFromString(value: string): AssetKey {
-  if (value === "usdc" || value === "wsol") return value;
-  throw new Error(`unknown asset "${value}" — expected "usdc" or "wsol"`);
+  const v = value.toLowerCase();
+  if (v === "usdc" || v === "wsol" || v === "tslax" || v === "googlx" || v === "aaplx" || v === "anthropic" || v === "openai") return v;
+  throw new Error(`unknown asset "${value}" — expected usdc|wsol|tslax|googlx|aaplx|anthropic|openai`);
+}
+
+export function tokenProgramFor(asset: AssetKey): PublicKey {
+  return ASSET_TOKEN_PROGRAM[asset];
 }
 
 function loadIdl(): anchor.Idl {
@@ -58,11 +98,6 @@ function loadIdl(): anchor.Idl {
 
 export const IDL = loadIdl();
 
-/**
- * Loads the signing keypair for these scripts: `--wallet <path>` (handled by callers via
- * `devnet-cli.ts`'s `parseArgs`) takes priority, then `ANCHOR_WALLET`, then the Solana CLI's own
- * default keypair path — the same wallet `solana` and `anchor` commands use by default.
- */
 export function loadKeypair(explicitPath?: string): Keypair {
   const walletPath =
     explicitPath ?? process.env.ANCHOR_WALLET ?? path.join(os.homedir(), ".config", "solana", "id.json");
@@ -74,7 +109,6 @@ export function devnetConnection(): Connection {
   return new Connection(DEVNET_RPC_URL, "confirmed");
 }
 
-/** One `Program` instance bound to `wallet` as the fee payer / default signer. */
 export function programAs(connection: Connection, wallet: Keypair): anchor.Program {
   const anchorWallet = new anchor.Wallet(wallet);
   const provider = new anchor.AnchorProvider(connection, anchorWallet, { commitment: "confirmed" });

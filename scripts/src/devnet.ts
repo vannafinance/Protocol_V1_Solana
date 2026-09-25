@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * One CLI for every vanna_lending instruction against real Solana Devnet.
+ * One CLI for every vanna_lending instruction against a local Surfpool mainnet fork.
  *
  * Usage:
  *   npx tsx src/devnet.ts <command> [--flag value ...]
  *   npm run devnet -- <command> [--flag value ...]
  *
- * Run with no command (or an unrecognized one) to print the full command list. See
- * `Protocol_V1_Solana/COMMANDS.md` for every command's flags and example invocations.
+ * Run with no command (or an unrecognized one) to print the full command list.
  */
 import * as anchor from "@coral-xyz/anchor";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
+import { ata, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
 import {
   AssetKey,
   ASSET_DECIMALS,
@@ -23,11 +23,8 @@ import {
   log,
   programAs,
   PYTH_FEED_IDS,
+  tokenProgramFor,
 } from "./devnet-env";
-import { ata, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
-import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
-import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetIndexMap } from "./devnet-positions";
-import { fetchLivePrice, refreshPrice } from "./devnet-pyth";
 import {
   accrue,
   BALANCE_TO_BORROW_THRESHOLD_WAD,
@@ -36,16 +33,29 @@ import {
   formatHealthFactorWad,
   formatTokenAmount,
   formatUsd,
-  kinkRateBps,
+  borrowRatePerSecondWad,
   normalizeTokenValue,
-  utilizationBps,
+  RateCurve,
+  ReserveLike,
+  SECONDS_PER_YEAR,
+  utilizationWad,
+  WAD,
 } from "./devnet-math";
+import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetIndexMap } from "./devnet-positions";
+import { fetchLivePrice, refreshPrice } from "./devnet-pyth";
+import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
 
 const U128_MAX = new anchor.BN("340282366920938463463374607431768211455");
 const MODE_NAMES = ["Normal", "BorrowPaused", "WithdrawOnly", "Halted"];
+const RESERVE_STATUS_NAMES = ["Active", "SupplyOnly", "RepayOnly", "Frozen"];
 const RISK_DEFAULTS: Record<AssetKey, { ltv: number; liqThreshold: number; liqBonus: number }> = {
   usdc: { ltv: 8000, liqThreshold: 8500, liqBonus: 500 },
   wsol: { ltv: 7000, liqThreshold: 8000, liqBonus: 500 },
+  tslax: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
+  googlx: { ltv: 6000, liqThreshold: 7000, liqBonus: 700 },
+  aaplx: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
+  anthropic: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
+  openai: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
 };
 
 interface Ctx {
@@ -56,17 +66,20 @@ interface Ctx {
   program: anchor.Program;
 }
 
-/** Refreshes real Pyth prices for both registered assets — needed by any instruction that scans
+/** Refreshes real Pyth prices for every registered asset — needed by any instruction that scans
  * every active position on a margin account (borrow, withdraw-collateral, liquidate). */
-async function refreshBothPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
-  log("refreshing Pyth prices", "usdc + wsol (any active position needs a fresh price)");
+async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
+  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai (including Kamino collateral)");
   return {
     usdc: await refreshPrice(ctx.conn, ctx.anchorWallet, "usdc"),
     wsol: await refreshPrice(ctx.conn, ctx.anchorWallet, "wsol"),
+    tslax: await refreshPrice(ctx.conn, ctx.anchorWallet, "tslax"),
+    googlx: await refreshPrice(ctx.conn, ctx.anchorWallet, "googlx"),
+    aaplx: await refreshPrice(ctx.conn, ctx.anchorWallet, "aaplx"),
+    anthropic: await refreshPrice(ctx.conn, ctx.anchorWallet, "anthropic"),
+    openai: await refreshPrice(ctx.conn, ctx.anchorWallet, "openai"),
   };
 }
-
-const RESERVE_STATUS_NAMES = ["Active", "SupplyOnly", "RepayOnly", "Frozen"];
 
 /** Generic Anchor-account fetch by camelCase namespace (e.g. "protocolConfig", "reserve"). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -75,34 +88,48 @@ async function fetchAccount(program: anchor.Program, name: string, address: Publ
   return (program.account as Record<string, { fetch(a: PublicKey): Promise<any> }>)[name].fetch(address);
 }
 
-/** Projects a fetched `Reserve` account's interest accrual up to right now (see `devnet-math.ts`
- * — the on-chain fields are only true as of `last_update_timestamp`). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function liveAccrual(reserveAcc: any) {
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  return accrue(
-    {
-      accountedLiquidityAssets: toBigInt(reserveAcc.accountedLiquidityAssets),
-      totalBorrowAssets: toBigInt(reserveAcc.totalBorrowAssets),
-      accruedProtocolFees: toBigInt(reserveAcc.accruedProtocolFees),
-      borrowIndexWad: toBigInt(reserveAcc.borrowIndexWad),
-      lastUpdateTimestamp: toBigInt(reserveAcc.lastUpdateTimestamp),
-      baseRateBps: reserveAcc.baseRateBps,
-      slope1Bps: reserveAcc.slope1Bps,
-      slope2Bps: reserveAcc.slope2Bps,
-      optimalUtilizationBps: reserveAcc.optimalUtilizationBps,
-      reserveFactorBps: reserveAcc.reserveFactorBps,
-    },
-    nowSec,
-  );
+function rateCurveFromAccount(curve: any): RateCurve {
+  return {
+    linearCoeffWad: toBigInt(curve.linearCoeffWad),
+    jumpCoeffWad: toBigInt(curve.jumpCoeffWad),
+    rateMultiplierWad: toBigInt(curve.rateMultiplierWad),
+  };
 }
 
-/**
- * Everything a "my position" frontend view needs for one wallet: every active collateral/debt
- * position (live balances, live debt after interest, live Pyth USD values) and the resulting
- * health snapshot — the same shape `user_borrow`/`user_withdraw_collateral`/`public_liquidate`
- * compute on-chain, replicated read-only for display (see `devnet-math.ts`).
- */
+/** Rate-curve CLI flags as decimal coefficients (e.g. `--rate-multiplier 3.5`), converted to WAD.
+ * Defaults match the EVM deployment (`new DefaultRateModel(1e16, 3e17, 35e17, 31556952e18)`):
+ * ~1.75% APR at 50% utilization, ~2.8% at 80%, ~7.9% at 95%, 112% at 100%. */
+function rateCurveFromArgs(args: Record<string, string>) {
+  return {
+    linearCoeffWad: toBaseUnits(optionalArg(args, "linear-coeff", "0.01"), 18),
+    jumpCoeffWad: toBaseUnits(optionalArg(args, "jump-coeff", "0.3"), 18),
+    rateMultiplierWad: toBaseUnits(optionalArg(args, "rate-multiplier", "3.5"), 18),
+  };
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function reserveFromAccount(reserveAcc: any): ReserveLike {
+  return {
+    accountedLiquidityAssets: toBigInt(reserveAcc.accountedLiquidityAssets),
+    totalBorrowAssets: toBigInt(reserveAcc.totalBorrowAssets),
+    accruedProtocolFees: toBigInt(reserveAcc.accruedProtocolFees),
+    borrowIndexWad: toBigInt(reserveAcc.borrowIndexWad),
+    lastUpdateTimestamp: toBigInt(reserveAcc.lastUpdateTimestamp),
+    rateCurve: rateCurveFromAccount(reserveAcc.rateCurve),
+    reserveFactorBps: reserveAcc.reserveFactorBps,
+  };
+}
+
+/** Projects a fetched `Reserve` account's interest accrual to now; on-chain fields are only
+ * current as of `last_update_timestamp`. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function liveAccrual(reserveAcc: any) {
+  return accrue(reserveFromAccount(reserveAcc), BigInt(Math.floor(Date.now() / 1000)));
+}
+
+/** Live view of one wallet's positions (balances, debt after interest, USD values) and the
+ * health snapshot the program would compute, for display only. */
 async function computePositionHealth(program: anchor.Program, conn: anchor.web3.Connection, owner: PublicKey) {
   const [margin] = marginPda(owner);
   const marginAcc = await fetchAccount(program, "marginAccount", margin);
@@ -152,13 +179,11 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
 }
 
 const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
-  // -- one-time protocol setup ---------------------------------------------------------------
+  // -- one-time protocol setup --------------------------------------------------------------------
   "initialize-protocol": async ({ args, wallet, program }) => {
-    // `admin` must sign (VAN-SOL-001 fix) — your loaded wallet becomes admin, since that's the
-    // only keypair this CLI can actually sign with. There is no `--admin` override anymore: an
-    // unrelated pubkey can no longer be named admin without that pubkey's own signature.
+    // `admin` must sign, so the loaded wallet becomes admin — there is no `--admin` override.
     const treasury = new PublicKey(optionalArg(args, "treasury", wallet.publicKey.toBase58()));
-    const maxAssets = Number(optionalArg(args, "max-assets", "8"));
+    const maxAssets = Number(optionalArg(args, "max-assets", "24")); // matches MAX_ASSETS in constants.rs
     const [protocolConfig] = protocolConfigPda();
     const sig = await program.methods
       .initializeProtocol(treasury, maxAssets)
@@ -200,7 +225,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         protocolConfig,
         underlyingMint: mint,
         assetConfig,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
         systemProgram: SystemProgram.programId,
       })
       .rpc();
@@ -211,10 +236,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const asset = assetKeyFromString(requireArg(args, "asset"));
     const mint = ASSET_MINTS[asset];
     const decimals = ASSET_DECIMALS[asset];
-    const baseRateBps = Number(optionalArg(args, "base-rate-bps", "0"));
-    const slope1Bps = Number(optionalArg(args, "slope1-bps", "1000"));
-    const slope2Bps = Number(optionalArg(args, "slope2-bps", "6000"));
-    const optimalBps = Number(optionalArg(args, "optimal-bps", "8000"));
+    const rateCurve = rateCurveFromArgs(args);
     const reserveFactorBps = Number(optionalArg(args, "reserve-factor-bps", "1000"));
     const supplyCap = toBaseUnits(optionalArg(args, "supply-cap", "0"), decimals);
     const borrowCap = toBaseUnits(optionalArg(args, "borrow-cap", "0"), decimals);
@@ -224,7 +246,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [reserve] = reservePda(mint);
     const [shareMint] = shareMintPda(mint);
     const sig = await program.methods
-      .adminInitializeReserve(baseRateBps, slope1Bps, slope2Bps, optimalBps, reserveFactorBps, supplyCap, borrowCap, status)
+      .adminInitializeReserve(rateCurve, reserveFactorBps, supplyCap, borrowCap, status)
       .accounts({
         admin: wallet.publicKey,
         payer: wallet.publicKey,
@@ -232,9 +254,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         underlyingMint: mint,
         reserve,
-        liquidityVault: ata(reserve, mint),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
+        shareTokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -242,7 +265,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("admin_initialize_reserve", `${asset} reserve=${reserve.toBase58()} tx=${sig}`);
   },
 
-  // -- governance -----------------------------------------------------------------------------
+  // -- governance ---------------------------------------------------------------------------------
   "propose-authority": async ({ args, wallet, program }) => {
     const newAdmin = new PublicKey(requireArg(args, "new-admin"));
     const [protocolConfig] = protocolConfigPda();
@@ -290,10 +313,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const asset = assetKeyFromString(requireArg(args, "asset"));
     const mint = ASSET_MINTS[asset];
     const decimals = ASSET_DECIMALS[asset];
-    const baseRateBps = Number(optionalArg(args, "base-rate-bps", "0"));
-    const slope1Bps = Number(optionalArg(args, "slope1-bps", "1000"));
-    const slope2Bps = Number(optionalArg(args, "slope2-bps", "6000"));
-    const optimalBps = Number(optionalArg(args, "optimal-bps", "8000"));
+    const rateCurve = rateCurveFromArgs(args);
     const reserveFactorBps = Number(optionalArg(args, "reserve-factor-bps", "1000"));
     const supplyCap = toBaseUnits(optionalArg(args, "supply-cap", "0"), decimals);
     const borrowCap = toBaseUnits(optionalArg(args, "borrow-cap", "0"), decimals);
@@ -301,7 +321,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [reserve] = reservePda(mint);
     const sig = await program.methods
-      .adminUpdateReserveConfig(baseRateBps, slope1Bps, slope2Bps, optimalBps, reserveFactorBps, supplyCap, borrowCap, status)
+      .adminUpdateReserveConfig(rateCurve, reserveFactorBps, supplyCap, borrowCap, status)
       .accounts({ admin: wallet.publicKey, protocolConfig, underlyingMint: mint, reserve })
       .rpc();
     log("admin_update_reserve_config", `${asset} status=${status} tx=${sig}`);
@@ -314,9 +334,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const amount = toBaseUnits(requireArg(args, "amount"), decimals);
     const [protocolConfig] = protocolConfigPda();
     const [reserve] = reservePda(mint);
-    const protocolConfigAccount = await (
-      program.account as Record<string, { fetch(a: unknown): Promise<{ treasury: PublicKey }> }>
-    ).protocolConfig.fetch(protocolConfig);
+    const protocolConfigAccount = await fetchAccount(program, "protocolConfig", protocolConfig);
     const treasuryAta = ata(protocolConfigAccount.treasury, mint);
     const sig = await program.methods
       .adminCollectProtocolFees(amount)
@@ -333,7 +351,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("admin_collect_protocol_fees", `${asset} amount=${amount.toString()} treasuryAta=${treasuryAta.toBase58()} tx=${sig}`);
   },
 
-  // -- lender -----------------------------------------------------------------------------------
+  // -- lender -------------------------------------------------------------------------------------
   "supply-liquidity": async ({ args, wallet, program }) => {
     const asset = assetKeyFromString(requireArg(args, "asset"));
     const mint = ASSET_MINTS[asset];
@@ -352,11 +370,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         reserve,
         underlyingMint: mint,
-        lenderTokenAccount: ata(wallet.publicKey, mint),
-        liquidityVault: ata(reserve, mint),
+        lenderTokenAccount: ata(wallet.publicKey, mint, tokenProgramFor(asset)),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
         lenderShareAccount: ata(wallet.publicKey, shareMint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -381,11 +399,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         reserve,
         underlyingMint: mint,
-        lenderTokenAccount: ata(wallet.publicKey, mint),
-        liquidityVault: ata(reserve, mint),
+        lenderTokenAccount: ata(wallet.publicKey, mint, tokenProgramFor(asset)),
+        liquidityVault: ata(reserve, mint, tokenProgramFor(asset)),
         shareMint,
         lenderShareAccount: ata(wallet.publicKey, shareMint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tokenProgramFor(asset),
       })
       .rpc();
     log("lender_redeem", `${asset} shares=${shares.toString()} tx=${sig}`);
@@ -396,13 +414,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const mint = ASSET_MINTS[asset];
     const [reserve] = reservePda(mint);
     const sig = await program.methods.publicRefreshReserve().accounts({ reserve }).rpc();
-    const reserveAccount = await (
-      program.account as Record<string, { fetch(a: unknown): Promise<{ totalBorrowAssets: { toString(): string } }> }>
-    ).reserve.fetch(reserve);
+    const reserveAccount = await fetchAccount(program, "reserve", reserve);
     log("public_refresh_reserve", `${asset} total_borrow_assets=${reserveAccount.totalBorrowAssets.toString()} tx=${sig}`);
   },
 
-  // -- margin lifecycle -------------------------------------------------------------------------
+  // -- margin lifecycle ---------------------------------------------------------------------------
   "create-margin": async ({ wallet, program }) => {
     const [margin] = marginPda(wallet.publicKey);
     const sig = await program.methods
@@ -426,7 +442,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [margin] = marginPda(wallet.publicKey);
     const [assetConfig] = assetConfigPda(mint);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
     const sig = await program.methods
       .userDepositCollateral(amount)
       .accounts({
@@ -435,9 +452,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         marginAccount: margin,
         assetConfig,
         mint,
-        sourceTokenAccount: ata(wallet.publicKey, mint),
+        sourceTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -455,9 +472,10 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [margin] = marginPda(wallet.publicKey);
     const [assetConfig] = assetConfigPda(mint);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, { excludeCollateral: asset });
 
     const sig = await program.methods
@@ -469,9 +487,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         assetConfig,
         mint,
         priceUpdate: priceAccounts[asset],
-        destinationTokenAccount: ata(wallet.publicKey, mint),
+        destinationTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
       })
       .remainingAccounts(remainingAccounts)
       .rpc();
@@ -542,7 +560,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [debtPosition] = debtPositionPda(margin, reserve);
     const marginVault = ata(margin, mint);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
       excludeCollateral: asset,
       excludeDebt: asset,
@@ -628,7 +646,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     );
   },
 
-  // -- liquidation ----------------------------------------------------------------------------
+  // -- liquidation --------------------------------------------------------------------------------
   liquidate: async (ctx) => {
     const { args, wallet, program } = ctx;
     const marginOwner = new PublicKey(requireArg(args, "margin-owner"));
@@ -645,7 +663,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [debtPosition] = debtPositionPda(margin, debtReserve);
     const [collateralAssetConfig] = assetConfigPda(collateralMint);
 
-    const priceAccounts = await refreshBothPrices(ctx);
+    const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
       excludeCollateral: collateralAsset,
       excludeDebt: debtAsset,
@@ -677,7 +695,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("public_liquidate", `margin_owner=${marginOwner.toBase58()} repaid ${debtAsset} seized ${collateralAsset} tx=${sig}`);
   },
 
-  // -- read-only views (no transaction, nothing signed) -----------------------------------------
+  // -- read-only views (no transaction, nothing signed) -------------------------------------------
   "get-protocol-config": async ({ program }) => {
     const [protocolConfig] = protocolConfigPda();
     const acc = await fetchAccount(program, "protocolConfig", protocolConfig);
@@ -732,8 +750,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [reserve] = reservePda(ASSET_MINTS[asset]);
     const acc = await fetchAccount(program, "reserve", reserve);
     const live = liveAccrual(acc);
-    const util = utilizationBps(toBigInt(acc.accountedLiquidityAssets), live.newTotalBorrowAssets);
-    const apr = kinkRateBps(util, acc.baseRateBps, acc.slope1Bps, acc.slope2Bps, acc.optimalUtilizationBps);
+    const util = utilizationWad(toBigInt(acc.accountedLiquidityAssets), live.newTotalBorrowAssets);
+    const borrowAprWad = borrowRatePerSecondWad(rateCurveFromAccount(acc.rateCurve), util) * SECONDS_PER_YEAR;
+    const wadToPercent = (v: bigint) => `${(Number((v * 10_000n) / WAD) / 100).toFixed(2)}%`;
 
     console.log(
       JSON.stringify(
@@ -745,8 +764,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
           totalBorrowAssets_onChain: formatTokenAmount(toBigInt(acc.totalBorrowAssets), decimals),
           totalBorrowAssets_liveNow: formatTokenAmount(live.newTotalBorrowAssets, decimals),
           accruedProtocolFees_liveNow: formatTokenAmount(live.newAccruedProtocolFees, decimals),
-          utilization: `${(Number(util) / 100).toFixed(2)}%`,
-          borrowApr: `${(Number(apr) / 100).toFixed(2)}%`,
+          utilization: wadToPercent(util),
+          borrowApr: wadToPercent(borrowAprWad),
           supplyCap: acc.supplyCap.toString() === "0" ? "uncapped" : formatTokenAmount(toBigInt(acc.supplyCap), decimals),
           borrowCap: acc.borrowCap.toString() === "0" ? "uncapped" : formatTokenAmount(toBigInt(acc.borrowCap), decimals),
           liquidityVault: acc.liquidityVault.toBase58(),
@@ -915,7 +934,6 @@ function printUsage(): void {
   console.error("Usage: npx tsx src/devnet.ts <command> [--flag value ...]\n");
   console.error("Commands:");
   for (const name of Object.keys(COMMANDS)) console.error(`  ${name}`);
-  console.error("\nSee COMMANDS.md for each command's flags.");
 }
 
 async function main() {

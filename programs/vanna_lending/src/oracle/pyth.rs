@@ -4,20 +4,16 @@ use anchor_lang::prelude::*;
 use pyth_solana_receiver_sdk::error::GetPriceError;
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-/// Re-export so `Account<'info, PriceUpdateV2>` in instruction account structs automatically
-/// enforces "oracle account owner is the expected Pyth receiver program" (spec §8 item 1) —
-/// Anchor checks `account_info.owner == PriceUpdateV2::owner()`, which this crate ties to the
-/// Pyth Solana Receiver program ID.
-pub use pyth_solana_receiver_sdk::ID as PYTH_RECEIVER_PROGRAM_ID;
-
 pub struct ValidatedPrice {
     pub price: i64,
     pub exponent: i32,
 }
 
-/// Spec §8 `load_validated_price` — feed-ID match, freshness, sign and confidence, all fail-closed.
-/// Owner check happens implicitly through the `Account<'info, PriceUpdateV2>` type in the caller's
-/// account struct; this function only needs to apply the asset-specific business rules.
+/// Loads the asset's price, failing closed on feed-ID mismatch, staleness, non-positive price,
+/// or a confidence interval wider than `max_confidence_bps` of the price.
+///
+/// The oracle owner check is done by Anchor: `Account<PriceUpdateV2>` requires the account to be
+/// owned by the Pyth Solana Receiver program.
 pub fn load_validated_price(
     asset: &AssetConfig,
     price_update: &Account<PriceUpdateV2>,

@@ -1,23 +1,28 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
+use crate::instructions::borrowing::apply_accrual;
 use crate::math::fixed_point::{mul_div_floor, u64_from_u128};
 use crate::math::health::{
     calculate_health, normalize_token_value, value_to_token_amount, CollateralValuation, DebtValuation,
 };
-use crate::math::interest::accrue;
 use crate::math::shares::debt_shares_to_assets_up;
 use crate::oracle::pyth::load_validated_price;
 use crate::state::asset_config::AssetConfig;
 use crate::state::debt_position::DebtPosition;
 use crate::state::margin_account::MarginAccount;
 use crate::state::reserve::Reserve;
+use crate::validation::accounts::validate_asset_config;
 use crate::validation::positions::scan_and_validate_positions;
 use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{Mint, Token, TokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+// ---------------------------------------------------------------------------
+// public_liquidate
+// ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
 pub struct PublicLiquidate<'info> {
@@ -41,27 +46,44 @@ pub struct PublicLiquidate<'info> {
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
     pub debt_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub debt_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = debt_mint, token::authority = liquidator)]
-    pub liquidator_debt_source: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = debt_mint, token::authority = debt_reserve)]
-    pub debt_reserve_vault: Box<Account<'info, TokenAccount>>,
+    pub debt_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(
+        mut,
+        token::mint = debt_mint,
+        token::authority = liquidator,
+        token::token_program = token_program
+    )]
+    pub liquidator_debt_source: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = debt_mint,
+        token::authority = debt_reserve,
+        token::token_program = token_program
+    )]
+    pub debt_reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(seeds = [ASSET_SEED, collateral_mint.key().as_ref()], bump = collateral_asset_config.bump)]
     pub collateral_asset_config: Box<Account<'info, AssetConfig>>,
     pub collateral_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub collateral_mint: Box<Account<'info, Mint>>,
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(
         init_if_needed,
         payer = liquidator,
         associated_token::mint = collateral_mint,
-        associated_token::authority = liquidator
+        associated_token::authority = liquidator,
+        associated_token::token_program = token_program,
     )]
-    pub liquidator_collateral_destination: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = collateral_mint, token::authority = margin_account)]
-    pub collateral_margin_vault: Box<Account<'info, TokenAccount>>,
+    pub liquidator_collateral_destination: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        token::mint = collateral_mint,
+        token::authority = margin_account,
+        token::token_program = token_program
+    )]
+    pub collateral_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_program: Program<'info, Token>,
+    /// Debt and collateral legs must share a token program (classic SPL or Token-2022).
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -69,18 +91,25 @@ pub struct PublicLiquidate<'info> {
 pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
     require!(ctx.accounts.collateral_asset_config.collateral_enabled, VannaError::AssetNotCollateralEnabled);
     require!(max_repay_assets > 0, VannaError::ZeroAmount);
+    validate_asset_config(
+        &ctx.accounts.debt_asset_config,
+        &ctx.accounts.debt_mint.key(),
+        &ctx.accounts.token_program.key(),
+    )?;
+    validate_asset_config(
+        &ctx.accounts.collateral_asset_config,
+        &ctx.accounts.collateral_mint.key(),
+        &ctx.accounts.token_program.key(),
+    )?;
     verify_associated_token_account(
         &ctx.accounts.collateral_margin_vault.key(),
         &ctx.accounts.margin_account.key(),
         &ctx.accounts.collateral_mint.key(),
+        &ctx.accounts.token_program.key(),
     )?;
 
     let clock = Clock::get()?;
-    let accrual = accrue(&ctx.accounts.debt_reserve, clock.unix_timestamp)?;
-    ctx.accounts.debt_reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    ctx.accounts.debt_reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    ctx.accounts.debt_reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    ctx.accounts.debt_reserve.last_update_timestamp = clock.unix_timestamp;
+    apply_accrual(&mut ctx.accounts.debt_reserve, clock.unix_timestamp)?;
 
     let margin_key = ctx.accounts.margin_account.key();
     let (other_collaterals, other_debts) = scan_and_validate_positions(
@@ -91,6 +120,7 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
         &clock,
         Some(ctx.accounts.collateral_asset_config.asset_index),
         Some(ctx.accounts.debt_asset_config.asset_index),
+        None,
     )?;
     let other_collateral_valuations: Vec<CollateralValuation> = other_collaterals
         .iter()
@@ -136,8 +166,6 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     let health_before = calculate_health(&pre_collaterals, &pre_debts)?;
     require!(health_before.is_liquidatable(), VannaError::PositionHealthy);
 
-    // Spec §6.5 — bound repayment by the caller's own ceiling, the outstanding debt, and the
-    // (currently compiled, pre-audit) close factor.
     let close_factor_cap = u64_from_u128(mul_div_floor(current_debt_assets as u128, CLOSE_FACTOR_BPS as u128, 10_000)?)?;
     let repay_amount = max_repay_assets.min(current_debt_assets).min(close_factor_cap.max(1));
     require!(repay_amount > 0, VannaError::ZeroAmount);
@@ -163,8 +191,8 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     seize_amount = seize_amount.min(collateral_vault_balance_before);
     require!(seize_amount >= min_collateral_out, VannaError::SlippageExceeded);
 
-    // Actually pull the repay tokens from the liquidator before mutating any state, so a failed
-    // transfer aborts the whole transaction atomically before accounting changes are computed.
+    // Pull the repay tokens before mutating any state; burn shares against what was actually
+    // received (fee-bearing mints deliver less than `repay_amount`).
     let received_repay = transfer_in_measured(
         &ctx.accounts.token_program,
         &ctx.accounts.debt_mint,

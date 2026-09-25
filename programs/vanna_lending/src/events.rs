@@ -1,3 +1,4 @@
+use crate::state::reserve::RateCurve;
 use anchor_lang::prelude::*;
 
 #[event]
@@ -66,10 +67,7 @@ pub struct ReserveInitialized {
 #[event]
 pub struct ReserveConfigUpdated {
     pub reserve: Pubkey,
-    pub base_rate_bps: u16,
-    pub slope1_bps: u16,
-    pub slope2_bps: u16,
-    pub optimal_utilization_bps: u16,
+    pub rate_curve: RateCurve,
     pub reserve_factor_bps: u16,
     pub supply_cap: u64,
     pub borrow_cap: u64,
@@ -207,6 +205,53 @@ pub struct Liquidated {
     pub collateral_seized: u64,
     pub pre_liquidation_health_factor_wad: u128,
     pub post_liquidation_health_factor_wad: u128,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct LiteStrategyRegistered {
+    pub strategy_config: Pubkey,
+    pub underlying_mint: Pubkey,
+    pub kamino_reserve: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct LiteOpened {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub equity: u64,
+    pub borrowed: u64,
+    pub deposited: u64,
+    pub kamino_collateral: u64,
+    pub debt_shares: u128,
+    pub borrow_health_factor_wad: u128,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct LiteClosed {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub redeemed: u64,
+    pub debt_repaid: u64,
+    pub residual: u64,
+    pub debt_shares_burned: u128,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}
+
+/// Cross-asset unwind of a `lite_supply` position: redeem from Kamino, swap into a different
+/// mint, repay that mint's debt — all atomically. See `lite_reduce_and_repay`.
+#[event]
+pub struct LiteReducedAndRepaid {
+    pub margin_account: Pubkey,
+    pub strategy_config: Pubkey,
+    pub redeemed: u64,
+    pub swapped_out: u64,
+    pub debt_repaid: u64,
     pub event_sequence: u64,
     pub timestamp: i64,
 }

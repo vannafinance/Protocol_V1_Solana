@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::math::interest::accrue;
+use crate::instructions::borrowing::apply_accrual;
 use crate::math::shares::{
     assets_to_supply_shares_down, available_lender_cash, lender_total_assets, supply_shares_to_assets_down,
 };
@@ -14,16 +14,8 @@ use crate::validation::accounts::{
 use crate::validation::token::{transfer_in_measured, transfer_out_checked};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token::{burn, mint_to, Burn, Mint, MintTo, Token, TokenAccount};
-
-fn apply_accrual(reserve: &mut Account<Reserve>, now: i64) -> Result<()> {
-    let accrual = accrue(reserve, now)?;
-    reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    reserve.last_update_timestamp = now;
-    Ok(())
-}
+use anchor_spl::token::{burn, mint_to, Burn, Mint as TokenMint, MintTo, Token, TokenAccount as TokenTokenAccount};
+use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 
 // ---------------------------------------------------------------------------
 // lender_supply
@@ -39,21 +31,23 @@ pub struct LenderSupply<'info> {
     pub asset_config: Box<Account<'info, AssetConfig>>,
     #[account(mut, seeds = [RESERVE_SEED, underlying_mint.key().as_ref()], bump = reserve.bump)]
     pub reserve: Box<Account<'info, Reserve>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = lender)]
-    pub lender_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = reserve)]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = lender, token::token_program = token_program)]
+    pub lender_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = reserve, token::token_program = token_program)]
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [SHARE_MINT_SEED, underlying_mint.key().as_ref()], bump)]
-    pub share_mint: Box<Account<'info, Mint>>,
+    pub share_mint: Box<Account<'info, TokenMint>>,
     #[account(
         init_if_needed,
         payer = lender,
         associated_token::mint = share_mint,
-        associated_token::authority = lender
+        associated_token::authority = lender,
+        associated_token::token_program = share_token_program,
     )]
-    pub lender_share_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub lender_share_account: Box<Account<'info, TokenTokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub share_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -118,7 +112,7 @@ pub fn lender_supply(ctx: Context<LenderSupply>, assets: u64, min_shares_out: u6
         authority: ctx.accounts.reserve.to_account_info(),
     };
     mint_to(
-        CpiContext::new_with_signer(ctx.accounts.token_program.key(), cpi_accounts, signer_seeds),
+        CpiContext::new_with_signer(ctx.accounts.share_token_program.key(), cpi_accounts, signer_seeds),
         shares_out,
     )?;
 
@@ -147,16 +141,17 @@ pub struct LenderRedeem<'info> {
     pub asset_config: Box<Account<'info, AssetConfig>>,
     #[account(mut, seeds = [RESERVE_SEED, underlying_mint.key().as_ref()], bump = reserve.bump)]
     pub reserve: Box<Account<'info, Reserve>>,
-    pub underlying_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = lender)]
-    pub lender_token_account: Box<Account<'info, TokenAccount>>,
-    #[account(mut, token::mint = underlying_mint, token::authority = reserve)]
-    pub liquidity_vault: Box<Account<'info, TokenAccount>>,
+    pub underlying_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = lender, token::token_program = token_program)]
+    pub lender_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = underlying_mint, token::authority = reserve, token::token_program = token_program)]
+    pub liquidity_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [SHARE_MINT_SEED, underlying_mint.key().as_ref()], bump)]
-    pub share_mint: Box<Account<'info, Mint>>,
-    #[account(mut, token::mint = share_mint, token::authority = lender)]
-    pub lender_share_account: Box<Account<'info, TokenAccount>>,
-    pub token_program: Program<'info, Token>,
+    pub share_mint: Box<Account<'info, TokenMint>>,
+    #[account(mut, token::mint = share_mint, token::authority = lender, token::token_program = share_token_program)]
+    pub lender_share_account: Box<Account<'info, TokenTokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub share_token_program: Program<'info, Token>,
 }
 
 pub fn lender_redeem(ctx: Context<LenderRedeem>, shares: u64, min_assets_out: u64) -> Result<()> {
@@ -196,7 +191,7 @@ pub fn lender_redeem(ctx: Context<LenderRedeem>, shares: u64, min_assets_out: u6
         from: ctx.accounts.lender_share_account.to_account_info(),
         authority: ctx.accounts.lender.to_account_info(),
     };
-    burn(CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts), shares)?;
+    burn(CpiContext::new(ctx.accounts.share_token_program.key(), cpi_accounts), shares)?;
 
     ctx.accounts.reserve.accounted_liquidity_assets = ctx
         .accounts

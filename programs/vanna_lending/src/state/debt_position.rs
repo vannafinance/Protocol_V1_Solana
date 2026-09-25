@@ -1,8 +1,8 @@
 use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 
-/// Spec §4.7 `DebtPosition` — borrow shares for one margin/reserve pair. Token value grows as
-/// the reserve's `borrow_index_wad` accrues; the raw share count only changes on borrow/repay.
+/// Borrow shares for one margin/reserve pair. Their token value grows as the reserve's
+/// `borrow_index_wad` accrues; the share count only changes on borrow/repay.
 #[account]
 #[derive(InitSpace)]
 pub struct DebtPosition {

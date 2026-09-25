@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-/// Spec §5.1 protocol operating modes.
+/// Protocol-wide operating mode, stored as `ProtocolConfig::operating_mode`.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OperatingMode {
@@ -22,8 +22,8 @@ impl OperatingMode {
     }
 }
 
-/// Spec §4.1 `ProtocolConfig` — global administration and emergency state. Not written during
-/// normal user transactions, so it never becomes a write-lock bottleneck (spec §2.2, §10.1).
+/// Global administration and emergency state. Never written by normal user transactions, so it
+/// never becomes a write-lock bottleneck.
 #[account]
 #[derive(InitSpace)]
 pub struct ProtocolConfig {
