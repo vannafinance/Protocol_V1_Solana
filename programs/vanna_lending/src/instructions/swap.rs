@@ -29,13 +29,9 @@ use anchor_spl::{
 };
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-/// The input leg (margin vault -> escrow, just below) is a real Token-2022 transfer: for
-/// a mint with a `TransferFeeConfig` extension (e.g. a PreStocks token like ANTHROPIC/
-/// OPENAI, currently 1%), only `amount - fee` actually lands in the escrow. The client
-/// already accounts for this when sizing the Jupiter quote (see `computeInputTransferFeeRaw`
-/// on the frontend), so this just re-derives the same fee on-chain to verify the escrow
-/// received exactly what's expected — not a flat `amount_in` match, which broke every
-/// fee-bearing input mint.
+/// Token-2022 transfer fee `amount` incurs on `mint_ai` this epoch (0 for classic SPL or a mint
+/// without `TransferFeeConfig`). Used to verify the escrow received exactly `amount - fee` on the
+/// input leg; the client sizes its Jupiter quote with the same fee (`computeInputTransferFeeRaw`).
 fn expected_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, amount: u64) -> Result<u64> {
     if *token_program != anchor_spl::token_2022::ID {
         return Ok(0);
@@ -56,6 +52,10 @@ fn expected_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, amount: 
 
 pub const SWAP_SEED: &[u8] = b"margin_swap";
 pub const JUPITER: Pubkey = pubkey!("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4");
+
+// ---------------------------------------------------------------------------
+// user_margin_swap
+// ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
 pub struct UserMarginSwap<'info> {
@@ -239,13 +239,9 @@ pub fn user_margin_swap<'info>(
     )?;
     ctx.accounts.input_vault.reload()?;
     ctx.accounts.output_vault.reload()?;
-    // Only underflow-guarded, not re-checked against `min_amount_out`: this transfer is purely
-    // internal plumbing (escrow -> the margin's own vault), not a market-priced hop, so it carries
-    // no real slippage risk. Re-applying the same market-derived `min_amount_out` here double-
-    // charges any Token-2022 transfer-fee mint's fee against a threshold that was only ever sized
-    // for a single fee application (the one Jupiter's own quote/`otherAmountThreshold` accounts
-    // for, checked above at the escrow). For a fee-bearing output mint (e.g. a PreStocks token)
-    // that made every such swap spuriously trip `SlippageExceeded`, even with zero real slippage.
+    // Deliberately not re-checked against `min_amount_out`: escrow -> margin vault is internal
+    // plumbing with no market slippage. Slippage was enforced at the escrow above; re-applying it
+    // here would charge a Token-2022 transfer fee twice against a threshold sized for one fee.
     let received = ctx
         .accounts
         .output_vault

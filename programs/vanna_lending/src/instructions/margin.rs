@@ -80,12 +80,8 @@ pub fn user_close_margin(ctx: Context<UserCloseMargin>) -> Result<()> {
 // user_deposit_collateral
 // ---------------------------------------------------------------------------
 //
-// There is no separate "open collateral position" instruction: the margin vault is a plain
-// Associated Token Account, and its first deposit creates it (`init_if_needed`). Collateral is
-// not tracked in a parallel ledger — the vault's own live SPL balance *is* the credited amount.
-// This is safe specifically because this vault is private to one (margin, mint) pair; it is never
-// shared across users the way the lending `Reserve`'s pooled liquidity vault is; that one still
-// requires — and keeps — its own internal `accounted_liquidity_assets` ledger.
+// The margin vault's live balance is the collateral (no ledger); safe because the vault is
+// private to one (margin, mint) pair.
 
 #[derive(Accounts)]
 pub struct UserDepositCollateral<'info> {
@@ -258,8 +254,7 @@ pub struct UserWithdrawCollateral<'info> {
     #[account(seeds = [ASSET_SEED, mint.key().as_ref()], bump = asset_config.bump)]
     pub asset_config: Box<Account<'info, AssetConfig>>,
     pub mint: Box<InterfaceAccount<'info, Mint>>,
-    /// Pyth price update for the withdrawn asset itself (the other active positions' price
-    /// updates are supplied via `remaining_accounts`, see `scan_and_validate_positions`).
+    /// Other positions' price updates come via `remaining_accounts`.
     pub price_update: Box<Account<'info, PriceUpdateV2>>,
     #[account(
         mut,

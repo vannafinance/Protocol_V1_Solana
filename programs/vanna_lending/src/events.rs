@@ -1,3 +1,4 @@
+use crate::state::reserve::RateCurve;
 use anchor_lang::prelude::*;
 
 #[event]
@@ -66,10 +67,7 @@ pub struct ReserveInitialized {
 #[event]
 pub struct ReserveConfigUpdated {
     pub reserve: Pubkey,
-    pub base_rate_bps: u16,
-    pub slope1_bps: u16,
-    pub slope2_bps: u16,
-    pub optimal_utilization_bps: u16,
+    pub rate_curve: RateCurve,
     pub reserve_factor_bps: u16,
     pub supply_cap: u64,
     pub borrow_cap: u64,

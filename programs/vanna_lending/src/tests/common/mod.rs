@@ -3,10 +3,10 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::clock::Clock;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
-use anchor_lang::{AccountSerialize, InstructionData, ToAccountMetas};
-use anchor_spl::associated_token::{get_associated_token_address, spl_associated_token_account};
-use litesvm::LiteSVM;
+use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas};
+use anchor_spl::associated_token::spl_associated_token_account;
 use litesvm::types::TransactionResult;
+use litesvm::LiteSVM;
 use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, PriceUpdateV2, VerificationLevel};
 use solana_account::Account as SvmAccount;
 use solana_keypair::Keypair;
@@ -16,9 +16,35 @@ use solana_signer::Signer as SvmSigner;
 use solana_system_interface::instruction::create_account;
 use solana_transaction::versioned::VersionedTransaction;
 use vanna_lending::constants::*;
+use vanna_lending::state::{AssetConfig, ProtocolConfig, Reserve};
+
+pub use anchor_spl::associated_token::get_associated_token_address;
+pub use vanna_lending::state::reserve::RateCurve;
+
+// ---------------------------------------------------------------------------
+// Shared fixtures
+// ---------------------------------------------------------------------------
 
 pub const USDC_DECIMALS: u8 = 6;
 pub const WSOL_DECIMALS: u8 = 9;
+
+pub const USDC_FEED: [u8; 32] = [1u8; 32];
+pub const WSOL_FEED: [u8; 32] = [2u8; 32];
+/// $1.00 at exponent -8.
+pub const USDC_PRICE: i64 = 100_000_000;
+/// $200.00 at exponent -8.
+pub const WSOL_PRICE: i64 = 20_000_000_000;
+
+/// 0.1 / 0.3 / 3.5 — ~17.5% borrow APR at 50% utilization, rising steeply toward 175% at 100%.
+pub const DEFAULT_RATE_CURVE: RateCurve = RateCurve {
+    linear_coeff_wad: 100_000_000_000_000_000,
+    jump_coeff_wad: 300_000_000_000_000_000,
+    rate_multiplier_wad: 3_500_000_000_000_000_000,
+};
+
+// ---------------------------------------------------------------------------
+// SVM setup
+// ---------------------------------------------------------------------------
 
 pub fn program_bytes() -> &'static [u8] {
     include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/vanna_lending.so"))
@@ -37,14 +63,11 @@ pub fn funded_keypair(svm: &mut LiteSVM) -> Keypair {
 }
 
 pub fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra_signers: &[&Keypair]) -> TransactionResult {
-    // Guarantees a fresh blockhash per call, so two structurally-identical instructions sent back
-    // to back (e.g. a retried borrow after flipping the operating mode back) don't collide into
-    // the same transaction signature and get rejected as `AlreadyProcessed`.
+    // Fresh blockhash per call so identical back-to-back transactions aren't rejected as `AlreadyProcessed`.
     svm.expire_blockhash();
     let blockhash = svm.latest_blockhash();
     let msg = Message::new_with_blockhash(ixs, Some(&payer.pubkey()), &blockhash);
-    // Dedupe by pubkey: the same Keypair (e.g. an admin acting as both payer and mint
-    // authority) must only be handed to `try_new` once, even if a caller passes it twice.
+    // Dedupe signers: `try_new` rejects the same keypair (e.g. admin as payer and mint authority) twice.
     let mut signers: Vec<&Keypair> = vec![payer];
     for candidate in extra_signers {
         if !signers.iter().any(|s| s.pubkey() == candidate.pubkey()) {
@@ -55,7 +78,17 @@ pub fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra_signe
     svm.send_transaction(tx)
 }
 
-/// Creates a new SPL mint with the given decimals, mint authority = `authority`.
+/// Advances the clock's `unix_timestamp` only — enough for interest accrual without a slot warp.
+pub fn advance_time(svm: &mut LiteSVM, seconds: i64) {
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += seconds;
+    svm.set_sysvar(&clock);
+}
+
+// ---------------------------------------------------------------------------
+// Token helpers
+// ---------------------------------------------------------------------------
+
 pub fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey, decimals: u8) -> Pubkey {
     let mint_kp = Keypair::new();
     let mint_len = spl_token_interface::state::Mint::LEN;
@@ -69,7 +102,7 @@ pub fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey, decim
     mint_kp.pubkey()
 }
 
-/// Ensures `owner`'s ATA for `mint` exists and holds at least `amount` tokens (minted fresh).
+/// Creates `owner`'s ATA for `mint` if needed and mints `amount` into it (0 just creates the ATA).
 pub fn mint_to_wallet(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, mint_authority: &Keypair, owner: &Pubkey, amount: u64) -> Pubkey {
     let ata = get_associated_token_address(owner, mint);
     let create_ata_ix = spl_associated_token_account::instruction::create_associated_token_account_idempotent(
@@ -92,23 +125,17 @@ pub fn mint_to_wallet(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, mint_au
     ata
 }
 
-/// Advances the LiteSVM clock sysvar's `unix_timestamp` by `seconds`, leaving slot/epoch fields
-/// untouched — enough for exercising interest accrual without a full slot-warp.
-pub fn advance_time(svm: &mut LiteSVM, seconds: i64) {
-    let mut clock = svm.get_sysvar::<Clock>();
-    clock.unix_timestamp += seconds;
-    svm.set_sysvar(&clock);
-}
-
 pub fn token_balance(svm: &LiteSVM, ata: &Pubkey) -> u64 {
     let acc = svm.get_account(ata).expect("token account missing");
     spl_token_interface::state::Account::unpack(&acc.data).unwrap().amount
 }
 
-/// Injects a fully-formed, Pyth-receiver-owned `PriceUpdateV2` fixture account directly into the
-/// LiteSVM account store — the same account shape the real Pyth receiver program would produce,
-/// without needing that program's bytecode loaded (this protocol never CPIs into it).
-#[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------------------
+// Oracle helpers
+// ---------------------------------------------------------------------------
+
+/// Writes a Pyth-receiver-owned `PriceUpdateV2` account directly into the SVM (the protocol never
+/// CPIs into the receiver, so its program doesn't need to be loaded).
 pub fn set_price(
     svm: &mut LiteSVM,
     pubkey: &Pubkey,
@@ -150,7 +177,7 @@ pub fn set_price(
 }
 
 // ---------------------------------------------------------------------------
-// PDA helpers
+// PDAs
 // ---------------------------------------------------------------------------
 
 pub fn protocol_config_pda() -> (Pubkey, u8) {
@@ -169,13 +196,12 @@ pub fn share_mint_pda(mint: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[SHARE_MINT_SEED, mint.as_ref()], &vanna_lending::ID)
 }
 
-/// Every wallet has exactly one margin account — seeded only by its authority, no subaccount id.
+/// One margin account per wallet, seeded only by its authority.
 pub fn margin_pda(authority: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[MARGIN_SEED, authority.as_ref()], &vanna_lending::ID)
 }
 
-/// The margin vault for `(margin, mint)` is a plain Associated Token Account — there is no
-/// separate `CollateralPosition` ledger; the vault's own live SPL balance is the credited amount.
+/// The margin vault is a plain ATA; its live SPL balance is the credited collateral.
 pub fn margin_vault_ata(margin: &Pubkey, mint: &Pubkey) -> Pubkey {
     get_associated_token_address(margin, mint)
 }
@@ -184,8 +210,13 @@ pub fn debt_position_pda(margin: &Pubkey, reserve: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[DEBT_SEED, margin.as_ref(), reserve.as_ref()], &vanna_lending::ID)
 }
 
+/// The margin's base lite-position PDA, which risk-checked instructions take as a trailing account.
+pub fn lite_position_pda(margin: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[LITE_POSITION_SEED, margin.as_ref()], &vanna_lending::ID).0
+}
+
 // ---------------------------------------------------------------------------
-// Instruction builders (thin wrappers over the Anchor-generated IDL types)
+// Instruction builders
 // ---------------------------------------------------------------------------
 
 pub fn ix_initialize_protocol(admin: &Pubkey, treasury: &Pubkey, payer: &Pubkey, max_assets_per_margin: u8) -> Instruction {
@@ -256,10 +287,7 @@ pub fn ix_admin_initialize_reserve(
     admin: &Pubkey,
     payer: &Pubkey,
     mint: &Pubkey,
-    base_rate_bps: u16,
-    slope1_bps: u16,
-    slope2_bps: u16,
-    optimal_utilization_bps: u16,
+    rate_curve: RateCurve,
     reserve_factor_bps: u16,
     supply_cap: u64,
     borrow_cap: u64,
@@ -288,10 +316,7 @@ pub fn ix_admin_initialize_reserve(
         }
         .to_account_metas(None),
         data: vanna_lending::instruction::AdminInitializeReserve {
-            base_rate_bps,
-            slope1_bps,
-            slope2_bps,
-            optimal_utilization_bps,
+            rate_curve,
             reserve_factor_bps,
             supply_cap,
             borrow_cap,
@@ -366,10 +391,7 @@ pub fn ix_admin_update_asset_config(
 pub fn ix_admin_update_reserve_config(
     admin: &Pubkey,
     mint: &Pubkey,
-    base_rate_bps: u16,
-    slope1_bps: u16,
-    slope2_bps: u16,
-    optimal_utilization_bps: u16,
+    rate_curve: RateCurve,
     reserve_factor_bps: u16,
     supply_cap: u64,
     borrow_cap: u64,
@@ -387,10 +409,7 @@ pub fn ix_admin_update_reserve_config(
         }
         .to_account_metas(None),
         data: vanna_lending::instruction::AdminUpdateReserveConfig {
-            base_rate_bps,
-            slope1_bps,
-            slope2_bps,
-            optimal_utilization_bps,
+            rate_curve,
             reserve_factor_bps,
             supply_cap,
             borrow_cap,
@@ -548,8 +567,7 @@ pub fn ix_user_create_margin(authority: &Pubkey, payer: &Pubkey) -> Instruction 
     }
 }
 
-/// There is no separate "open collateral position" instruction: the margin vault is a plain ATA
-/// and `user_deposit_collateral` creates it on first use (`init_if_needed`).
+/// Creates the margin vault ATA on first use (`init_if_needed`).
 pub fn ix_user_deposit_collateral(authority: &Pubkey, margin: &Pubkey, mint: &Pubkey, amount: u64) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
     let (asset_config, _) = asset_config_pda(mint);
@@ -627,7 +645,7 @@ pub fn ix_user_borrow(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
+    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -659,30 +677,6 @@ pub fn ix_user_repay_from_margin(authority: &Pubkey, margin: &Pubkey, mint: &Pub
     }
 }
 
-pub fn ix_public_repay_from_wallet(payer: &Pubkey, margin: &Pubkey, mint: &Pubkey, max_assets: u64, repay_all: bool) -> Instruction {
-    let (asset_config, _) = asset_config_pda(mint);
-    let (reserve, _) = reserve_pda(mint);
-    let (debt_position, _) = debt_position_pda(margin, &reserve);
-    let payer_token_account = get_associated_token_address(payer, mint);
-    let reserve_vault = get_associated_token_address(&reserve, mint);
-    Instruction {
-        program_id: vanna_lending::ID,
-        accounts: vanna_lending::accounts::PublicRepayFromWallet {
-            payer: *payer,
-            margin_account: *margin,
-            asset_config,
-            reserve,
-            debt_position,
-            mint: *mint,
-            payer_token_account,
-            reserve_vault,
-            token_program: anchor_spl::token::ID,
-        }
-        .to_account_metas(None),
-        data: vanna_lending::instruction::PublicRepayFromWallet { max_assets, repay_all }.data(),
-    }
-}
-
 pub fn ix_user_withdraw_collateral(
     authority: &Pubkey,
     margin: &Pubkey,
@@ -709,7 +703,7 @@ pub fn ix_user_withdraw_collateral(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
+    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -758,7 +752,7 @@ pub fn ix_public_liquidate(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin.as_ref()], &vanna_lending::ID).0, false));
+    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -810,7 +804,7 @@ pub fn ix_user_deposit_and_borrow(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(Pubkey::find_program_address(&[b"lite_position", margin_account.as_ref()], &vanna_lending::ID).0, false));
+    accounts.push(AccountMeta::new_readonly(lite_position_pda(&margin_account), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -818,8 +812,11 @@ pub fn ix_user_deposit_and_borrow(
     }
 }
 
-/// Builds the ordered `remaining_accounts` metas for one active collateral group
-/// (`AssetConfig`, margin vault ATA, Pyth `PriceUpdateV2`), all read-only.
+// ---------------------------------------------------------------------------
+// remaining_accounts builders
+// ---------------------------------------------------------------------------
+
+/// One collateral group: `AssetConfig`, margin vault, `PriceUpdateV2` (all read-only).
 pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {
     let (asset_config, _) = asset_config_pda(mint);
     let margin_vault = margin_vault_ata(margin, mint);
@@ -830,8 +827,7 @@ pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pub
     ]
 }
 
-/// Builds the ordered `remaining_accounts` metas for one active debt group
-/// (`AssetConfig`, `Reserve`, `DebtPosition`, Pyth `PriceUpdateV2`), all read-only.
+/// One debt group: `AssetConfig`, `Reserve`, `DebtPosition`, `PriceUpdateV2` (all read-only).
 pub fn debt_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {
     let (asset_config, _) = asset_config_pda(mint);
     let (reserve, _) = reserve_pda(mint);
@@ -842,4 +838,25 @@ pub fn debt_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -
         AccountMeta::new_readonly(debt_position, false),
         AccountMeta::new_readonly(*price_update, false),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Account fetchers
+// ---------------------------------------------------------------------------
+
+fn fetch<T: AccountDeserialize>(svm: &LiteSVM, pubkey: &Pubkey) -> T {
+    let data = svm.get_account(pubkey).expect("account missing").data;
+    T::try_deserialize(&mut data.as_slice()).unwrap()
+}
+
+pub fn fetch_protocol_config(svm: &LiteSVM) -> ProtocolConfig {
+    fetch(svm, &protocol_config_pda().0)
+}
+
+pub fn fetch_asset_config(svm: &LiteSVM, mint: &Pubkey) -> AssetConfig {
+    fetch(svm, &asset_config_pda(mint).0)
+}
+
+pub fn fetch_reserve(svm: &LiteSVM, mint: &Pubkey) -> Reserve {
+    fetch(svm, &reserve_pda(mint).0)
 }

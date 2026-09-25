@@ -6,15 +6,10 @@ use anchor_lang::solana_program::instruction::AccountMeta;
 use common::*;
 use solana_signer::Signer as SvmSigner;
 
-const USDC_FEED: [u8; 32] = [1u8; 32];
-const WSOL_FEED: [u8; 32] = [2u8; 32];
-const USDC_PRICE: i64 = 100_000_000; // $1.00 @ exponent -8
-const WSOL_PRICE_HEALTHY: i64 = 20_000_000_000; // $200.00 @ exponent -8
+const WSOL_PRICE_HEALTHY: i64 = WSOL_PRICE;
 const WSOL_PRICE_CRASHED: i64 = 15_000_000_000; // $150.00 @ exponent -8 -- HF becomes 1500/1390 < 1.10
 
-/// A margin account borrows USDC against WSOL collateral while WSOL is healthy, the price then
-/// crashes, and a liquidator partially repays the debt and seizes WSOL collateral with a bonus.
-/// Verifies the account was liquidatable, the liquidator was paid a bonus, and health improved.
+/// WSOL crashes under a USDC borrow; a liquidator partially repays and seizes WSOL with a bonus.
 #[test]
 fn liquidation_after_price_crash() {
     let mut svm = setup_svm();
@@ -42,9 +37,9 @@ fn liquidation_after_price_crash() {
     )
     .expect("register WSOL");
 
-    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[])
+    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[])
         .expect("init USDC reserve");
-    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[])
+    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[])
         .expect("init WSOL reserve");
 
     let usdc_price_update = Pubkey::new_unique();
@@ -82,10 +77,8 @@ fn liquidation_after_price_crash() {
     // Borrower needs a USDC wallet ATA to receive the withdrawal into.
     mint_to_wallet(&mut svm, &admin, &usdc_mint, &admin, &borrower.pubkey(), 0);
 
-    // Move the borrowed USDC out of the margin account and into the borrower's own wallet.
-    // Spec §1.2: borrowed tokens are protocol-controlled collateral by default, so as long as
-    // they sit in the margin vault they trivially back their own debt; a genuinely liquidatable
-    // position requires the borrower to have actually used/withdrawn what they borrowed.
+    // Borrowed tokens in the margin vault back their own debt (spec §1.2), so withdraw them to
+    // make the position genuinely liquidatable.
     let mut withdraw_remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
     withdraw_remaining.extend(debt_group_metas(&usdc_mint, &margin, &usdc_price_update));
     send(
@@ -104,15 +97,14 @@ fn liquidation_after_price_crash() {
     mint_to_wallet(&mut svm, &admin, &usdc_mint, &admin, &liquidator.pubkey(), 10_000 * 10u64.pow(6));
 
     let liquidator_wsol_before = {
-        let ata = anchor_spl::associated_token::get_associated_token_address(&liquidator.pubkey(), &wsol_mint);
+        let ata = get_associated_token_address(&liquidator.pubkey(), &wsol_mint);
         svm.get_account(&ata).map(|_| token_balance(&svm, &ata)).unwrap_or(0)
     };
     let (debt_reserve, _) = reserve_pda(&usdc_mint);
-    let debt_reserve_vault = anchor_spl::associated_token::get_associated_token_address(&debt_reserve, &usdc_mint);
+    let debt_reserve_vault = get_associated_token_address(&debt_reserve, &usdc_mint);
     let reserve_vault_before = token_balance(&svm, &debt_reserve_vault);
 
-    // Both the seized collateral (WSOL) and the repaid debt (USDC) are the two *named* accounts
-    // here, and they are also the account's only active positions, so nothing else to scan.
+    // WSOL collateral and USDC debt are both named accounts and the only active positions.
     let liquidate_remaining: Vec<AccountMeta> = vec![];
     let max_repay = 500 * 10u64.pow(6); // liquidator offers to repay 500 USDC
     let res = send(
@@ -133,7 +125,7 @@ fn liquidation_after_price_crash() {
     );
     assert!(res.is_ok(), "public_liquidate failed: {res:?}");
 
-    let liquidator_wsol_ata = anchor_spl::associated_token::get_associated_token_address(&liquidator.pubkey(), &wsol_mint);
+    let liquidator_wsol_ata = get_associated_token_address(&liquidator.pubkey(), &wsol_mint);
     let liquidator_wsol_after = token_balance(&svm, &liquidator_wsol_ata);
     assert!(liquidator_wsol_after > liquidator_wsol_before, "liquidator should have received seized WSOL collateral");
 
@@ -153,8 +145,8 @@ fn healthy_position_cannot_be_liquidated() {
     let wsol_mint = create_mint(&mut svm, &admin, &admin.pubkey(), WSOL_DECIMALS);
     send(&mut svm, &admin, &[ix_admin_register_asset(&admin.pubkey(), &admin.pubkey(), &usdc_mint, USDC_FEED, 0, 8_000, 8_500, 500, 1_000, 3_600, true, true)], &[]).unwrap();
     send(&mut svm, &admin, &[ix_admin_register_asset(&admin.pubkey(), &admin.pubkey(), &wsol_mint, WSOL_FEED, 0, 7_000, 8_000, 500, 1_000, 3_600, true, true)], &[]).unwrap();
-    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]).unwrap();
-    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]).unwrap();
+    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
+    send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
 
     let usdc_price_update = Pubkey::new_unique();
     let wsol_price_update = Pubkey::new_unique();

@@ -35,5 +35,38 @@ solana-system-interface = "3.3.0"
 solana-program-pack = "3.1.0"
 spl-token-interface = "2.0.0"
 
+# All tests live under src/tests/, which Cargo doesn't auto-discover.
+[[test]]
+name = "test_admin_and_lifecycle"
+path = "src/tests/test_admin_and_lifecycle.rs"
+
+[[test]]
+name = "test_deposit_and_borrow"
+path = "src/tests/test_deposit_and_borrow.rs"
+
+[[test]]
+name = "test_full_flow"
+path = "src/tests/test_full_flow.rs"
+
+[[test]]
+name = "test_liquidation"
+path = "src/tests/test_liquidation.rs"
+
+[[test]]
+name = "test_security"
+path = "src/tests/test_security.rs"
+
+[[test]]
+name = "test_interest_rate"
+path = "src/tests/test_interest_rate.rs"
+
+[[test]]
+name = "test_math"
+path = "src/tests/test_math.rs"
+
+[[test]]
+name = "test_state"
+path = "src/tests/test_state.rs"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

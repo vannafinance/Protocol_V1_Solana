@@ -5,13 +5,15 @@
  *   npx tsx src/lite-fork.ts <command> [--flag value ...]
  */
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey, SystemProgram } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
+import { Connection, PublicKey, SystemProgram } from "@solana/web3.js";
+import { spawnSync } from "node:child_process";
+import { optionalArg, parseArgs, requireArg, toBaseUnits } from "./devnet-cli";
 import {
   ASSET_DECIMALS,
   ASSET_MINTS,
@@ -24,7 +26,6 @@ import {
   programAs,
   tokenProgramFor,
 } from "./devnet-env";
-import { optionalArg, parseArgs, requireArg, toBaseUnits } from "./devnet-cli";
 import {
   assetConfigPda,
   debtPositionPda,
@@ -108,6 +109,7 @@ function hasIx(program: anchor.Program, snake: string, camel: string): boolean {
 }
 
 function method(program: anchor.Program, snake: string, camel: string) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const methods = program.methods as Record<string, (...args: unknown[]) => any>;
   if (typeof methods[camel] === "function") return methods[camel].bind(methods);
   if (typeof methods[snake] === "function") return methods[snake].bind(methods);
@@ -125,55 +127,49 @@ async function callCheatcode(methodName: string, params: unknown[]): Promise<voi
 }
 
 function stockKey(symbol: string): "tslax" | "googlx" {
-  const v = symbol.toLowerCase().replace(/x$/, "x");
+  const v = symbol.toLowerCase();
   if (v === "tslax" || v === "tsla") return "tslax";
   if (v === "googlx" || v === "googl") return "googlx";
   throw new Error(`unsupported stock "${symbol}" — use TSLAX or GOOGLX`);
 }
 
+/** Runs a `devnet.ts` subcommand in a child process, streaming its output. */
+function runDevnet(...devnetArgs: string[]) {
+  return spawnSync("npx", ["tsx", "src/devnet.ts", ...devnetArgs], {
+    cwd: __dirname + "/..",
+    stdio: "inherit",
+    env: process.env,
+  });
+}
+
+function assetFromSymbolArg(args: Record<string, string>): AssetKey {
+  return assetKeyFromString((args.symbol ?? "TSLAX").toLowerCase());
+}
+
 const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
+  // -- delegates to devnet.ts ---------------------------------------------------------------------
   "register-asset": async ({ args }) => {
-    const symbol = (args.symbol ?? "TSLAX").toUpperCase();
-    const asset = assetKeyFromString(symbol === "TSLAX" ? "tslax" : symbol === "GOOGLX" ? "googlx" : symbol.toLowerCase());
+    const asset = assetFromSymbolArg(args);
     log("delegating", `devnet.ts register-asset --asset ${asset}`);
-    const { spawnSync } = await import("node:child_process");
-    const r = spawnSync("npx", ["tsx", "src/devnet.ts", "register-asset", "--asset", asset], {
-      cwd: __dirname + "/..",
-      stdio: "inherit",
-      env: process.env,
-    });
+    const r = runDevnet("register-asset", "--asset", asset);
     if (r.status !== 0) process.exit(r.status ?? 1);
   },
 
   "init-reserve": async ({ args }) => {
-    const symbol = (args.symbol ?? "TSLAX").toUpperCase();
-    const asset = assetKeyFromString(symbol === "TSLAX" ? "tslax" : symbol === "GOOGLX" ? "googlx" : symbol.toLowerCase());
-    const { spawnSync } = await import("node:child_process");
-    const r = spawnSync("npx", ["tsx", "src/devnet.ts", "initialize-reserve", "--asset", asset], {
-      cwd: __dirname + "/..",
-      stdio: "inherit",
-      env: process.env,
-    });
+    const asset = assetFromSymbolArg(args);
+    const r = runDevnet("initialize-reserve", "--asset", asset);
     if (r.status !== 0) process.exit(r.status ?? 1);
   },
 
   "register-xstocks": async () => {
-    const { spawnSync } = await import("node:child_process");
     for (const asset of ["tslax", "googlx", "aaplx"] as AssetKey[]) {
-      spawnSync("npx", ["tsx", "src/devnet.ts", "register-asset", "--asset", asset], {
-        cwd: __dirname + "/..",
-        stdio: "inherit",
-        env: process.env,
-      });
-      spawnSync("npx", ["tsx", "src/devnet.ts", "initialize-reserve", "--asset", asset], {
-        cwd: __dirname + "/..",
-        stdio: "inherit",
-        env: process.env,
-      });
+      runDevnet("register-asset", "--asset", asset);
+      runDevnet("initialize-reserve", "--asset", asset);
     }
     log("register-xstocks", "TSLAx + GOOGLx + AAPLx registered (or already present)");
   },
 
+  // -- admin --------------------------------------------------------------------------------------
   "register-lite-strategy": async ({ args, wallet, program }) => {
     if (!hasIx(program, "admin_register_lite_strategy", "adminRegisterLiteStrategy")) {
       log("skip", "adminRegisterLiteStrategy not in IDL");
@@ -207,6 +203,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("admin_register_lite_strategy", `${key} strategy=${strategyConfig.toBase58()} tx=${sig}`);
   },
 
+  // -- fork funding (Surfpool cheatcodes / airdrop) -----------------------------------------------
   "fund-sol": async ({ args, conn }) => {
     const to = new PublicKey(requireArg(args, "to"));
     const amount = Number(optionalArg(args, "amount", "10"));
@@ -255,6 +252,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("fund-xstock", `+${amount} ${key} → ${to.toBase58()}`);
   },
 
+  // -- lender / margin ----------------------------------------------------------------------------
   "supply-tslax": async ({ args, wallet, program }) => {
     const amount = optionalArg(args, "amount", "10");
     const mint = ASSET_MINTS.tslax;
@@ -334,6 +332,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("create-margin", `${marginAccount.toBase58()} tx=${sig}`);
   },
 
+  // -- Kamino lite --------------------------------------------------------------------------------
   "lite-open": async ({ args, wallet, program, conn }) => {
     if (!hasIx(program, "lite_open", "liteOpen")) {
       log("skip", "liteOpen not in IDL");
@@ -447,11 +446,13 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("lite-supply", `${key} amount=${args.amount} attribute=${attributeSharesDelta.toString()} tx=${sig}`);
   },
 
+  // -- read-only ----------------------------------------------------------------------------------
   status: async ({ args, program }) => {
     const owner = new PublicKey(requireArg(args, "owner"));
     const [margin] = marginPda(owner);
     const [litePosition] = litePositionPda(margin);
     try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pos = await (program.account as any).litePosition.fetch(litePosition);
       console.log(JSON.stringify({
         margin: margin.toBase58(),

@@ -7,11 +7,6 @@ use litesvm::LiteSVM;
 use solana_keypair::Keypair;
 use solana_signer::Signer as SvmSigner;
 
-const USDC_FEED: [u8; 32] = [1u8; 32];
-const WSOL_FEED: [u8; 32] = [2u8; 32];
-const USDC_PRICE: i64 = 100_000_000; // $1.00 @ exponent -8
-const WSOL_PRICE: i64 = 20_000_000_000; // $200.00 @ exponent -8
-
 struct Fixture {
     admin: Keypair,
     usdc_mint: Pubkey,
@@ -46,10 +41,10 @@ fn setup(svm: &mut LiteSVM) -> Fixture {
     );
     assert!(res.is_ok(), "register WSOL failed: {res:?}");
 
-    let res = send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]);
+    let res = send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]);
     assert!(res.is_ok(), "init USDC reserve failed: {res:?}");
 
-    let res = send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]);
+    let res = send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]);
     assert!(res.is_ok(), "init WSOL reserve failed: {res:?}");
 
     let usdc_price_update = Pubkey::new_unique();
@@ -67,8 +62,7 @@ fn setup(svm: &mut LiteSVM) -> Fixture {
     Fixture { admin, usdc_mint, wsol_mint, usdc_price_update, wsol_price_update }
 }
 
-/// One signed transaction: no margin account yet, no debt position yet — both get created
-/// in-flight, collateral lands, and the borrow executes, atomically.
+/// One transaction creates the margin account and debt position, deposits, and borrows atomically.
 #[test]
 fn deposit_and_borrow_creates_margin_and_debt_position_in_one_tx() {
     let mut svm = setup_svm();
@@ -99,17 +93,16 @@ fn deposit_and_borrow_creates_margin_and_debt_position_in_one_tx() {
     );
     assert!(res.is_ok(), "user_deposit_and_borrow failed: {res:?}");
 
-    let margin_wsol_vault = anchor_spl::associated_token::get_associated_token_address(&margin, &f.wsol_mint);
-    let margin_usdc_vault = anchor_spl::associated_token::get_associated_token_address(&margin, &f.usdc_mint);
+    let margin_wsol_vault = get_associated_token_address(&margin, &f.wsol_mint);
+    let margin_usdc_vault = get_associated_token_address(&margin, &f.usdc_mint);
     assert_eq!(token_balance(&svm, &margin_wsol_vault), deposit_amount);
     assert_eq!(token_balance(&svm, &margin_usdc_vault), borrow_amount);
 
-    let borrower_wsol_wallet = anchor_spl::associated_token::get_associated_token_address(&borrower.pubkey(), &f.wsol_mint);
+    let borrower_wsol_wallet = get_associated_token_address(&borrower.pubkey(), &f.wsol_mint);
     assert_eq!(token_balance(&svm, &borrower_wsol_wallet), 90 * 10u64.pow(9));
 }
 
-/// A second deposit_and_borrow for the same wallet reuses the now-existing margin account and
-/// debt position (the `init_if_needed` "already exists" branch) instead of erroring.
+/// A second deposit_and_borrow reuses the existing margin account and debt position (`init_if_needed`).
 #[test]
 fn second_deposit_and_borrow_reuses_existing_margin_and_debt_position() {
     let mut svm = setup_svm();
@@ -129,12 +122,9 @@ fn second_deposit_and_borrow_reuses_existing_margin_and_debt_position() {
     );
     assert!(res.is_ok(), "first deposit_and_borrow failed: {res:?}");
 
-    // Second call: deposit + borrow more of the exact same pair. WSOL (the named deposit asset)
-    // and USDC's debt slot (the named borrow asset) are excluded from the scan automatically —
-    // but the first call's borrowed USDC also became an active COLLATERAL credit (spec §1.2,
-    // same as plain `user_borrow`), and that collateral slot is NOT the named one here (only
-    // WSOL is), so it must be supplied via `remaining_accounts`, exactly like
-    // `test_full_flow.rs`'s withdraw step scans the USDC-as-collateral credit alongside its debt.
+    // The named WSOL deposit and USDC debt are excluded from the scan, but the first call's
+    // borrowed USDC is now an active collateral credit (spec §1.2) and must be passed in
+    // `remaining_accounts`.
     let remaining = collateral_group_metas(&f.usdc_mint, &margin, &f.usdc_price_update);
     let second_deposit = 5 * 10u64.pow(9);
     let second_borrow = 100 * 10u64.pow(6);
@@ -146,15 +136,13 @@ fn second_deposit_and_borrow_reuses_existing_margin_and_debt_position() {
     );
     assert!(res.is_ok(), "second deposit_and_borrow failed: {res:?}");
 
-    let margin_wsol_vault = anchor_spl::associated_token::get_associated_token_address(&margin, &f.wsol_mint);
-    let margin_usdc_vault = anchor_spl::associated_token::get_associated_token_address(&margin, &f.usdc_mint);
+    let margin_wsol_vault = get_associated_token_address(&margin, &f.wsol_mint);
+    let margin_usdc_vault = get_associated_token_address(&margin, &f.usdc_mint);
     assert_eq!(token_balance(&svm, &margin_wsol_vault), first_deposit + second_deposit);
     assert_eq!(token_balance(&svm, &margin_usdc_vault), first_borrow + second_borrow);
 }
 
-/// Borrowing far more than the deposited collateral supports must fail closed with the same
-/// health-factor gate `user_borrow` enforces — the atomic instruction can't be used to sneak
-/// past the RiskEngine.
+/// The atomic instruction enforces the same health-factor gate as `user_borrow`.
 #[test]
 fn deposit_and_borrow_rejects_unhealthy_borrow() {
     let mut svm = setup_svm();
@@ -176,8 +164,7 @@ fn deposit_and_borrow_rejects_unhealthy_borrow() {
     assert!(res.is_err(), "unhealthy deposit_and_borrow unexpectedly succeeded");
 }
 
-/// The instruction is cross-asset only — depositing and borrowing the SAME mint must be rejected
-/// rather than silently aliasing the deposit-side and borrow-side accounts.
+/// Depositing and borrowing the same mint is rejected rather than aliasing the two sides' accounts.
 #[test]
 fn deposit_and_borrow_rejects_same_asset_on_both_sides() {
     let mut svm = setup_svm();

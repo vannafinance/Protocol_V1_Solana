@@ -1,7 +1,7 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::math::interest::accrue;
+use crate::instructions::borrowing::apply_accrual;
 use crate::math::shares::{
     assets_to_supply_shares_down, available_lender_cash, lender_total_assets, supply_shares_to_assets_down,
 };
@@ -16,15 +16,6 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{burn, mint_to, Burn, Mint as TokenMint, MintTo, Token, TokenAccount as TokenTokenAccount};
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
-
-fn apply_accrual(reserve: &mut Account<Reserve>, now: i64) -> Result<()> {
-    let accrual = accrue(reserve, now)?;
-    reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    reserve.last_update_timestamp = now;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // lender_supply

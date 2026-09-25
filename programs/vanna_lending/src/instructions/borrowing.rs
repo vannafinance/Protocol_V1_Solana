@@ -15,14 +15,16 @@ use crate::validation::accounts::{
     assert_protocol_action_allowed, assert_reserve_action_allowed, validate_asset_config, ProtocolAction,
 };
 use crate::validation::positions::scan_and_validate_positions;
-use crate::validation::token::{gross_up_for_transfer_fee, transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
+use crate::validation::token::{
+    gross_up_for_transfer_fee, transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account,
+};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-// `pub(crate)` (not private) so `instructions::composite::user_deposit_and_borrow` can reuse the
-// exact same accrual step instead of duplicating it.
+/// Accrues interest on `reserve` up to `now` and persists the result. Every instruction that
+/// reads or mutates reserve debt must call this first.
 pub(crate) fn apply_accrual(reserve: &mut Account<Reserve>, now: i64) -> Result<()> {
     let accrual = accrue(reserve, now)?;
     reserve.total_borrow_assets = accrual.new_total_borrow_assets;
@@ -157,13 +159,11 @@ pub struct UserBorrow<'info> {
         bump = debt_position.bump
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
-    /// Pyth price update for the borrowed asset itself.
     pub price_update: Box<Account<'info, PriceUpdateV2>>,
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, token::mint = mint, token::authority = reserve, token::token_program = token_program)]
     pub reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// Borrowed funds land here as protocol-controlled collateral credit (spec §1.2). Created on
-    /// first use if this margin account has never held this asset before.
+    /// Borrowed funds land here and count as collateral.
     #[account(
         init_if_needed,
         payer = authority,
@@ -399,8 +399,7 @@ pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64
     require!(current_debt_assets > 0, VannaError::ZeroAmount);
 
     let requested = if repay_all { current_debt_assets } else { max_assets.min(current_debt_assets) };
-    // Gross up so the reserve RECEIVES `requested` on a fee-bearing mint (see
-    // `gross_up_for_transfer_fee`), still capped at what the margin vault actually holds.
+    // Gross up so the reserve receives `requested` on a fee-bearing mint, capped at the vault balance.
     let requested_gross = gross_up_for_transfer_fee(
         &ctx.accounts.mint.to_account_info(),
         &ctx.accounts.token_program.key(),
@@ -446,9 +445,7 @@ pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64
         ctx.accounts.reserve.total_borrow_shares.saturating_sub(shares_to_burn);
     ctx.accounts.debt_position.debit_shares(shares_to_burn)?;
 
-    // Read the vault's real post-transfer balance: on a fee-bearing mint the vault loses
-    // `received + fee`, so `vault_balance_before - received` overstated what's left and a
-    // fully drained vault never had its collateral slot released.
+    // Reload: on a fee-bearing mint the vault loses `received + fee`, not just `received`.
     ctx.accounts.margin_vault.reload()?;
     let new_vault_balance = ctx.accounts.margin_vault.amount;
     if new_vault_balance == 0
@@ -527,8 +524,7 @@ pub fn public_repay_from_wallet(ctx: Context<PublicRepayFromWallet>, max_assets:
 
     let target_repay = if repay_all { current_debt_assets } else { max_assets.min(current_debt_assets) };
     require!(target_repay > 0, VannaError::ZeroAmount);
-    // Same fee gross-up as `user_repay_from_margin`: the payer sends enough that the
-    // reserve receives `target_repay` on a fee-bearing mint.
+    // Gross up so the reserve receives `target_repay` on a fee-bearing mint.
     let target_repay = gross_up_for_transfer_fee(
         &ctx.accounts.mint.to_account_info(),
         &ctx.accounts.token_program.key(),

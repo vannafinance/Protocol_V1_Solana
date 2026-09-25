@@ -1,17 +1,16 @@
-//! Hand-rolled CPIs into Kamino klend.
+//! Hand-rolled CPIs into Kamino klend (no SDK: Anchor discriminators + explicit account metas).
 //!
-//! Account order differs between deposit and redeem (see KAMINO_INTEGRATION_REFERENCE.md §6).
-//! No Kamino SDK — Anchor discriminators + explicit account metas.
+//! klend's deposit and redeem instructions take their accounts in different orders.
 
 use crate::constants::kamino_discriminators;
 use crate::errors::VannaError;
+use crate::math::fixed_point::mul_div_floor;
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
 };
 
-/// CPI accounts for Kamino deposit/redeem. Unused legs may point at the same infos.
 #[derive(Clone, Copy)]
 pub struct KaminoCpiAccounts<'a, 'info> {
     pub klend_program: &'a AccountInfo<'info>,
@@ -29,12 +28,8 @@ pub struct KaminoCpiAccounts<'a, 'info> {
     pub instruction_sysvar: &'a AccountInfo<'info>,
 }
 
-// BPF gives each stack frame a fixed 4KB budget. If this gets inlined into a caller that
-// already has a large frame of its own (e.g. `lite_reduce`, with its own several locals),
-// the combined frame can exceed that budget and crash with "Access violation in stack
-// frame N" — a real, live failure seen on `lite_reduce` (confirmed via a genuine on-chain
-// simulation, not a test). `#[inline(never)]` forces this into its own frame instead of
-// being folded into the caller's, which is the standard fix for this BPF failure class.
+// `#[inline(never)]`: BPF frames are capped at 4KB. Inlining this 13-element array into an
+// already-large caller frame overflowed it on-chain ("Access violation in stack frame N").
 #[inline(never)]
 fn account_infos<'a, 'info>(accounts: &KaminoCpiAccounts<'a, 'info>) -> [AccountInfo<'info>; 13] {
     [
@@ -54,9 +49,8 @@ fn account_infos<'a, 'info>(accounts: &KaminoCpiAccounts<'a, 'info>) -> [Account
     ]
 }
 
-/// `deposit_reserve_liquidity` — §6 left column. `owner` must sign — either a real wallet
-/// (pass an empty `signer_seeds`) or a PDA like the margin account (pass its `signer_seeds`,
-/// mirroring `redeem_reserve_collateral` below).
+/// klend `deposit_reserve_liquidity`. `owner` signs either as a wallet (empty `signer_seeds`)
+/// or as a PDA such as the margin account (its `signer_seeds`).
 #[inline(never)]
 pub fn deposit_reserve_liquidity<'info>(
     accounts: &KaminoCpiAccounts<'_, 'info>,
@@ -93,7 +87,7 @@ pub fn deposit_reserve_liquidity<'info>(
     Ok(())
 }
 
-/// `redeem_reserve_collateral` — §6 right column. `owner` may be a PDA (`signer_seeds`).
+/// klend `redeem_reserve_collateral`. `owner` may be a PDA (`signer_seeds`).
 #[inline(never)]
 pub fn redeem_reserve_collateral<'info>(
     accounts: &KaminoCpiAccounts<'_, 'info>,
@@ -130,9 +124,10 @@ pub fn redeem_reserve_collateral<'info>(
     Ok(())
 }
 
-/// Current underlying claim from klend's zero-copy Reserve layout. Values use
-/// Fraction (60 fractional bits). Validate the layout's mint identities as well
-/// as the account owner before reading financial fields. Round against collateral.
+/// Underlying value of `receipts` cTokens, read from klend's zero-copy `Reserve` layout.
+///
+/// Owner, discriminator and both mint identities are validated before any financial field is
+/// read. `_sf` fields are Fractions with 60 fractional bits. Rounds down (against collateral).
 pub fn receipt_value(
     reserve: &AccountInfo,
     program: &Pubkey,
@@ -143,6 +138,7 @@ pub fn receipt_value(
     require_keys_eq!(*reserve.owner, *program, VannaError::InvalidKaminoAccounts);
     let data = reserve.try_borrow_data()?;
     require!(data.len() >= 2600, VannaError::InvalidKaminoAccounts);
+    // Anchor account discriminator of klend `Reserve`.
     require!(
         data[..8] == [43, 242, 204, 202, 26, 247, 59, 127],
         VannaError::InvalidKaminoAccounts
@@ -162,6 +158,7 @@ pub fn receipt_value(
         return Ok(0);
     }
     require!(supply > 0, VannaError::InvalidKaminoAccounts);
+    // total supply = available + borrowed_sf - protocol fees - referrer fees - pending referrer fees
     let total_sf = ((u64_at(224) as u128) << 60)
         .checked_add(u128_at(232))
         .ok_or(VannaError::MathOverflow)?
@@ -171,7 +168,6 @@ pub fn receipt_value(
         .ok_or(VannaError::MathUnderflow)?
         .checked_sub(u128_at(376))
         .ok_or(VannaError::MathUnderflow)?;
-    let value =
-        crate::math::fixed_point::mul_div_floor(receipts as u128, total_sf >> 60, supply as u128)?;
+    let value = mul_div_floor(receipts as u128, total_sf >> 60, supply as u128)?;
     u64::try_from(value).map_err(|_| VannaError::MathOverflow.into())
 }

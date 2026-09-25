@@ -1,57 +1,64 @@
 use super::fixed_point::{mul_div_ceil, mul_div_floor, u64_from_u128};
 use crate::constants::{BASIS_POINTS, SECONDS_PER_YEAR, WAD};
 use crate::errors::VannaError;
-use crate::state::reserve::Reserve;
+use crate::state::reserve::{RateCurve, Reserve};
 use anchor_lang::prelude::*;
 
-/// Spec §7.4 utilization, in basis points. Zero when the pool is empty.
-pub fn utilization_bps(accounted_liquidity_assets: u64, total_borrow_assets: u64) -> Result<u64> {
+/// Utilization rate: the share of the pool's assets currently lent out, as a WAD fraction.
+///
+/// utilization = total_borrows / (liquidity + total_borrows)        (0 when the pool is empty)
+pub fn utilization_wad(accounted_liquidity_assets: u64, total_borrow_assets: u64) -> Result<u128> {
     let gross = (accounted_liquidity_assets as u128)
         .checked_add(total_borrow_assets as u128)
         .ok_or(VannaError::MathOverflow)?;
     if gross == 0 {
         return Ok(0);
     }
-    u64_from_u128(mul_div_floor(
-        total_borrow_assets as u128,
-        BASIS_POINTS as u128,
-        gross,
-    )?)
+    mul_div_floor(total_borrow_assets as u128, WAD, gross)
 }
 
-/// Spec §7.4 kink interest-rate model, in basis points (annualized).
-pub fn kink_rate_bps(
-    utilization_bps: u64,
-    base_rate_bps: u16,
-    slope1_bps: u16,
-    slope2_bps: u16,
-    optimal_utilization_bps: u16,
-) -> Result<u64> {
-    let optimal = optimal_utilization_bps as u64;
-    let base = base_rate_bps as u128;
-    if utilization_bps <= optimal {
-        if optimal == 0 {
-            return u64_from_u128(base);
-        }
-        let slope_component = mul_div_floor(slope1_bps as u128, utilization_bps as u128, optimal as u128)?;
-        u64_from_u128(base.checked_add(slope_component).ok_or(VannaError::MathOverflow)?)
-    } else {
-        let excess_room = (BASIS_POINTS as u64)
-            .checked_sub(optimal)
-            .ok_or(VannaError::MathUnderflow)?;
-        require!(excess_room > 0, VannaError::InvalidRateModel);
-        let excess_utilization = utilization_bps.checked_sub(optimal).ok_or(VannaError::MathUnderflow)?;
-        let slope2_component = mul_div_floor(
-            slope2_bps as u128,
-            excess_utilization as u128,
-            excess_room as u128,
-        )?;
-        let total = base
-            .checked_add(slope1_bps as u128)
-            .and_then(|v| v.checked_add(slope2_component))
-            .ok_or(VannaError::MathOverflow)?;
-        u64_from_u128(total)
+/// `base^exp` for a WAD-scaled `base`, by square-and-multiply with each step rounded half-up.
+fn wad_pow(mut base: u128, mut exp: u32) -> Result<u128> {
+    const HALF_WAD: u128 = WAD / 2;
+    let wad_mul_round = |a: u128, b: u128| -> Result<u128> {
+        let product = a.checked_mul(b).ok_or(VannaError::MathOverflow)?;
+        Ok(product.checked_add(HALF_WAD).ok_or(VannaError::MathOverflow)? / WAD)
+    };
+
+    if base == 0 {
+        return Ok(if exp == 0 { WAD } else { 0 });
     }
+    let mut result = if exp % 2 == 1 { base } else { WAD };
+    exp /= 2;
+    while exp > 0 {
+        base = wad_mul_round(base, base)?;
+        if exp % 2 == 1 {
+            result = wad_mul_round(result, base)?;
+        }
+        exp /= 2;
+    }
+    Ok(result)
+}
+
+/// Borrow interest rate per second (WAD) at utilization `u`.
+///
+/// borrow_rate = rate_multiplier * (u * linear_coeff + u^32 * linear_coeff + u^64 * jump_coeff) / SECONDS_PER_YEAR
+pub fn borrow_rate_per_second_wad(curve: &RateCurve, util_wad: u128) -> Result<u128> {
+    let linear = curve.linear_coeff_wad as u128;
+    let jump = curve.jump_coeff_wad as u128;
+
+    let linear_term = mul_div_floor(util_wad, linear, WAD)?;
+    let steep_term = mul_div_floor(wad_pow(util_wad, 32)?, linear, WAD)?;
+    let jump_term = mul_div_floor(wad_pow(util_wad, 64)?, jump, WAD)?;
+    let polynomial = linear_term
+        .checked_add(steep_term)
+        .and_then(|v| v.checked_add(jump_term))
+        .ok_or(VannaError::MathOverflow)?;
+
+    let year_wad = (SECONDS_PER_YEAR as u128)
+        .checked_mul(WAD)
+        .ok_or(VannaError::MathOverflow)?;
+    mul_div_floor(curve.rate_multiplier_wad as u128, polynomial, year_wad)
 }
 
 pub struct AccrualResult {
@@ -61,9 +68,15 @@ pub struct AccrualResult {
     pub interest_accrued: u64,
 }
 
-/// Spec §7.4 accrual: elapsed interest, protocol fee split, and borrow-index growth.
-/// Callers must reject a `now` earlier than `reserve.last_update_timestamp` (`TimestampRegression`)
-/// before calling this — it assumes `elapsed >= 0`.
+/// Brings a reserve's debt current to `now`. Returns the new state; the caller writes it back.
+///
+/// growth         = borrow_rate * elapsed_seconds
+/// interest       = ceil(total_borrows * growth)                  (rounded in lenders' favor)
+/// protocol_fee   = floor(interest * reserve_factor_bps / 10_000)
+/// total_borrows' = total_borrows + interest
+/// borrow_index'  = borrow_index * total_borrows' / total_borrows
+///
+/// Growth is simple, not compounded, within one window; compounding comes from frequent accrual.
 pub fn accrue(reserve: &Reserve, now: i64) -> Result<AccrualResult> {
     let elapsed = now
         .checked_sub(reserve.last_update_timestamp)
@@ -79,24 +92,13 @@ pub fn accrue(reserve: &Reserve, now: i64) -> Result<AccrualResult> {
         });
     }
 
-    let util = utilization_bps(reserve.accounted_liquidity_assets, reserve.total_borrow_assets)?;
-    let rate_bps = kink_rate_bps(
-        util,
-        reserve.base_rate_bps,
-        reserve.slope1_bps,
-        reserve.slope2_bps,
-        reserve.optimal_utilization_bps,
-    )?;
+    let util = utilization_wad(reserve.accounted_liquidity_assets, reserve.total_borrow_assets)?;
+    let rate_per_second = borrow_rate_per_second_wad(&reserve.rate_curve, util)?;
 
-    // interest = ceil(total_borrow_assets * rate_bps * elapsed / (10_000 * seconds_per_year))
-    let numerator = (reserve.total_borrow_assets as u128)
-        .checked_mul(rate_bps as u128)
-        .and_then(|v| v.checked_mul(elapsed as u128))
+    let growth_wad = rate_per_second
+        .checked_mul(elapsed as u128)
         .ok_or(VannaError::MathOverflow)?;
-    let denominator = (BASIS_POINTS as u128)
-        .checked_mul(SECONDS_PER_YEAR as u128)
-        .ok_or(VannaError::MathOverflow)?;
-    let interest = u64_from_u128(mul_div_ceil(numerator, 1, denominator)?)?;
+    let interest = u64_from_u128(mul_div_ceil(reserve.total_borrow_assets as u128, growth_wad, WAD)?)?;
 
     let protocol_fee = u64_from_u128(mul_div_floor(
         interest as u128,
@@ -129,38 +131,3 @@ pub fn accrue(reserve: &Reserve, now: i64) -> Result<AccrualResult> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn utilization_is_zero_for_empty_pool() {
-        assert_eq!(utilization_bps(0, 0).unwrap(), 0);
-    }
-
-    #[test]
-    fn utilization_full_when_all_borrowed() {
-        assert_eq!(utilization_bps(0, 100).unwrap(), 10_000);
-    }
-
-    #[test]
-    fn kink_rate_at_zero_utilization_is_base_rate() {
-        assert_eq!(kink_rate_bps(0, 200, 400, 6_000, 8_000).unwrap(), 200);
-    }
-
-    #[test]
-    fn kink_rate_at_optimal_utilization_is_base_plus_slope1() {
-        assert_eq!(kink_rate_bps(8_000, 200, 400, 6_000, 8_000).unwrap(), 600);
-    }
-
-    #[test]
-    fn kink_rate_at_full_utilization_is_base_plus_slope1_plus_slope2() {
-        assert_eq!(kink_rate_bps(10_000, 200, 400, 6_000, 8_000).unwrap(), 6_600);
-    }
-
-    #[test]
-    fn kink_rate_mid_second_slope() {
-        // Halfway between optimal (8000) and 10000 -> half of slope2 added.
-        assert_eq!(kink_rate_bps(9_000, 200, 400, 6_000, 8_000).unwrap(), 3_600);
-    }
-}

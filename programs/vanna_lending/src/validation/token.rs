@@ -9,11 +9,9 @@ use anchor_spl::token_interface::{
 /// Token-2022 `TransferFeeConfig` fee for the current epoch. Identity for classic SPL mints
 /// and Token-2022 mints without the extension.
 ///
-/// Repays measure what the reserve vault actually RECEIVED and burn debt shares off that.
-/// For a fee-bearing mint (ANTHROPIC/OPENAI PreStocks, 1%), transferring exactly the debt
-/// meant the reserve received ~99% of it, so even `repay_all` left ~1% of the debt open —
-/// no full close of a PreStock Short could ever clear its debt (live-reproduced on the
-/// fork). Grossing the transfer up by the inverse fee makes the reserve receive the debt.
+/// Repays burn debt shares against what the vault actually received, so with a fee-bearing
+/// mint (e.g. the 1% PreStocks) transferring exactly the debt would leave part of it open.
+/// Grossing up by the inverse fee lets a full repay clear the debt.
 pub fn gross_up_for_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, net_amount: u64) -> Result<u64> {
     use anchor_spl::token_2022::spl_token_2022::{
         self,
@@ -49,8 +47,8 @@ pub fn verify_associated_token_account(
     Ok(())
 }
 
-/// Spec §6.6 `transfer_in_measured` — transfers then measures the vault delta
-/// (correct under Token-2022 transfer-fee extensions).
+/// Transfers `amount` in and returns the destination's measured balance delta, which is the
+/// amount actually received under Token-2022 transfer fees.
 pub fn transfer_in_measured<'info>(
     token_program: &Interface<'info, TokenInterface>,
     mint: &InterfaceAccount<'info, Mint>,
@@ -81,6 +79,7 @@ pub fn transfer_in_measured<'info>(
         .ok_or_else(|| VannaError::MathUnderflow.into())
 }
 
+/// PDA-signed transfer out; returns the destination's measured balance delta.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer_out_checked_measured<'info>(
     token_program: &Interface<'info, TokenInterface>,
@@ -113,6 +112,7 @@ pub fn transfer_out_checked_measured<'info>(
         .ok_or_else(|| VannaError::MathUnderflow.into())
 }
 
+/// PDA-signed transfer out without measuring the received amount.
 #[allow(clippy::too_many_arguments)]
 pub fn transfer_out_checked<'info>(
     token_program: &Interface<'info, TokenInterface>,

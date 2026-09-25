@@ -5,6 +5,7 @@ pub mod lending;
 pub mod lite;
 pub mod liquidation;
 pub mod margin;
+pub mod swap;
 
 pub use admin::*;
 pub use borrowing::*;
@@ -13,6 +14,4 @@ pub use lending::*;
 pub use lite::*;
 pub use liquidation::*;
 pub use margin::*;
-
-pub mod swap;
 pub use swap::*;

@@ -1,11 +1,11 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
+use crate::instructions::borrowing::apply_accrual;
 use crate::math::fixed_point::{mul_div_floor, u64_from_u128};
 use crate::math::health::{
     calculate_health, normalize_token_value, value_to_token_amount, CollateralValuation, DebtValuation,
 };
-use crate::math::interest::accrue;
 use crate::math::shares::debt_shares_to_assets_up;
 use crate::oracle::pyth::load_validated_price;
 use crate::state::asset_config::AssetConfig;
@@ -19,6 +19,10 @@ use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+// ---------------------------------------------------------------------------
+// public_liquidate
+// ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
 pub struct PublicLiquidate<'info> {
@@ -105,11 +109,7 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     )?;
 
     let clock = Clock::get()?;
-    let accrual = accrue(&ctx.accounts.debt_reserve, clock.unix_timestamp)?;
-    ctx.accounts.debt_reserve.total_borrow_assets = accrual.new_total_borrow_assets;
-    ctx.accounts.debt_reserve.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
-    ctx.accounts.debt_reserve.borrow_index_wad = accrual.new_borrow_index_wad;
-    ctx.accounts.debt_reserve.last_update_timestamp = clock.unix_timestamp;
+    apply_accrual(&mut ctx.accounts.debt_reserve, clock.unix_timestamp)?;
 
     let margin_key = ctx.accounts.margin_account.key();
     let (other_collaterals, other_debts) = scan_and_validate_positions(
@@ -166,8 +166,6 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     let health_before = calculate_health(&pre_collaterals, &pre_debts)?;
     require!(health_before.is_liquidatable(), VannaError::PositionHealthy);
 
-    // Spec §6.5 — bound repayment by the caller's own ceiling, the outstanding debt, and the
-    // (currently compiled, pre-audit) close factor.
     let close_factor_cap = u64_from_u128(mul_div_floor(current_debt_assets as u128, CLOSE_FACTOR_BPS as u128, 10_000)?)?;
     let repay_amount = max_repay_assets.min(current_debt_assets).min(close_factor_cap.max(1));
     require!(repay_amount > 0, VannaError::ZeroAmount);
@@ -193,8 +191,8 @@ pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, mi
     seize_amount = seize_amount.min(collateral_vault_balance_before);
     require!(seize_amount >= min_collateral_out, VannaError::SlippageExceeded);
 
-    // Actually pull the repay tokens from the liquidator before mutating any state, so a failed
-    // transfer aborts the whole transaction atomically before accounting changes are computed.
+    // Pull the repay tokens before mutating any state; burn shares against what was actually
+    // received (fee-bearing mints deliver less than `repay_amount`).
     let received_repay = transfer_in_measured(
         &ctx.accounts.token_program,
         &ctx.accounts.debt_mint,

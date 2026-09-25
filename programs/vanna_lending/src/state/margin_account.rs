@@ -7,8 +7,8 @@ pub const EMPTY_ASSET_INDEX: u16 = u16::MAX;
 
 pub const MARGIN_STATUS_ACTIVE: u8 = 0;
 
-/// One isolated borrowing portfolio, owned by exactly one wallet — every wallet gets exactly one
-/// `MarginAccount` (seeded only by its authority), so there is no subaccount concept to manage.
+/// One isolated borrowing portfolio. Seeded only by its authority, so each wallet has exactly one
+/// (no subaccounts).
 #[account]
 #[derive(InitSpace)]
 pub struct MarginAccount {
@@ -106,8 +106,9 @@ impl MarginAccount {
         self.debt_asset_indexes.iter().copied().filter(|v| *v != EMPTY_ASSET_INDEX)
     }
 
-    /// Reserved bytes: count followed by up to MAX_ASSETS little-endian u16 indexes.
-    /// All-zero legacy accounts have no indexed positions; their legacy PDA is always scanned.
+    /// Lite-position registry packed into `reserved`: a count byte followed by up to `MAX_ASSETS`
+    /// little-endian u16 indexes. All-zero legacy accounts have none indexed; their legacy PDA is
+    /// always scanned.
     pub fn lite_indexes(&self) -> Result<Vec<u16>> {
         let count = self.reserved[0] as usize;
         require!(count <= MAX_ASSETS, VannaError::IncompletePositionAccounts);
@@ -123,7 +124,9 @@ impl MarginAccount {
 
     pub fn register_lite(&mut self, index: u16) -> Result<()> {
         let indexes = self.lite_indexes()?;
-        if indexes.contains(&index) { return Ok(()); }
+        if indexes.contains(&index) {
+            return Ok(());
+        }
         require!(indexes.len() < MAX_ASSETS, VannaError::TooManyAssets);
         let offset = 1 + 2 * indexes.len();
         self.reserved[offset..offset + 2].copy_from_slice(&index.to_le_bytes());
@@ -150,65 +153,5 @@ impl MarginAccount {
     pub fn next_event_sequence(&mut self) -> Result<u64> {
         self.event_sequence = self.event_sequence.checked_add(1).ok_or(VannaError::MathOverflow)?;
         Ok(self.event_sequence)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lite_registry_preserves_layout_and_removes_only_target() {
-        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
-        assert!(m.lite_indexes().unwrap().is_empty());
-        m.register_lite(3).unwrap();
-        m.register_lite(2).unwrap();
-        m.register_lite(3).unwrap();
-        assert_eq!(m.lite_indexes().unwrap(), vec![3, 2]);
-        assert!(!m.is_empty());
-        m.unregister_lite(3).unwrap();
-        assert_eq!(m.lite_indexes().unwrap(), vec![2]);
-        m.unregister_lite(2).unwrap();
-        assert!(m.is_empty());
-        assert_eq!(m.reserved, [0u8; 96]);
-    }
-
-    #[test]
-    fn lite_registry_rejects_overflow_and_corruption() {
-        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
-        for i in 0..MAX_ASSETS as u16 { m.register_lite(i).unwrap(); }
-        assert!(m.register_lite(MAX_ASSETS as u16).is_err());
-        m.reserved[0] = (MAX_ASSETS + 1) as u8;
-        assert!(m.lite_indexes().is_err());
-        m.reserved[0] = 2;
-        m.reserved[3] = m.reserved[1];
-        assert!(m.lite_indexes().is_err());
-    }
-
-    #[test]
-    fn add_and_remove_collateral_roundtrips() {
-        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
-        m.add_active_collateral(3).unwrap();
-        assert!(m.is_collateral_active(3));
-        assert_eq!(m.collateral_count, 1);
-        m.remove_active_collateral(3).unwrap();
-        assert!(!m.is_collateral_active(3));
-        assert_eq!(m.collateral_count, 0);
-    }
-
-    #[test]
-    fn rejects_duplicate_active_index() {
-        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
-        m.add_active_debt(1).unwrap();
-        assert!(m.add_active_debt(1).is_err());
-    }
-
-    #[test]
-    fn rejects_beyond_max_assets() {
-        let mut m = MarginAccount::new_empty(Pubkey::new_unique(), 255);
-        for i in 0..MAX_ASSETS as u16 {
-            m.add_active_collateral(i).unwrap();
-        }
-        assert!(m.add_active_collateral(MAX_ASSETS as u16).is_err());
     }
 }

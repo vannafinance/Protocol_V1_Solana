@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

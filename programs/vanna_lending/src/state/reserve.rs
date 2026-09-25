@@ -1,7 +1,8 @@
+use crate::constants::{BASIS_POINTS, MAX_RATE_COEFF_WAD};
 use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 
-/// Spec §5.2 reserve status matrix.
+/// Per-reserve status, stored as `Reserve::status`; gates which actions the reserve allows.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReserveStatus {
@@ -39,7 +40,28 @@ impl ReserveStatus {
     }
 }
 
-/// Spec §4.3 `Reserve` — accounting and authority for one lending pool.
+/// Borrow-rate curve coefficients (WAD). See `math::interest::borrow_rate_per_second_wad`.
+/// annual_rate = rate_multiplier * (linear_coeff * (u + u^32) + jump_coeff * u^64)
+#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateCurve {
+    /// Weight of the `u` and `u^32` terms.
+    pub linear_coeff_wad: u64,
+    /// Weight of the `u^64` term, which dominates only near full utilization.
+    pub jump_coeff_wad: u64,
+    /// Overall scale applied to the whole polynomial.
+    pub rate_multiplier_wad: u64,
+}
+
+impl RateCurve {
+    pub fn validate(&self) -> Result<()> {
+        for coeff in [self.linear_coeff_wad, self.jump_coeff_wad, self.rate_multiplier_wad] {
+            require!(coeff > 0 && coeff <= MAX_RATE_COEFF_WAD, VannaError::InvalidRateModel);
+        }
+        Ok(())
+    }
+}
+
+/// Accounting and authority for one lending pool.
 #[account]
 #[derive(InitSpace)]
 pub struct Reserve {
@@ -57,10 +79,7 @@ pub struct Reserve {
     pub accrued_protocol_fees: u64,
     pub last_update_timestamp: i64,
 
-    pub base_rate_bps: u16,
-    pub slope1_bps: u16,
-    pub slope2_bps: u16,
-    pub optimal_utilization_bps: u16,
+    pub rate_curve: RateCurve,
     pub reserve_factor_bps: u16,
     pub status: u8,
     pub bump: u8,
@@ -68,19 +87,14 @@ pub struct Reserve {
 }
 
 impl Reserve {
-    pub fn validate_rate_model(
-        base_rate_bps: u16,
-        optimal_utilization_bps: u16,
-        reserve_factor_bps: u16,
-    ) -> Result<()> {
-        require!(optimal_utilization_bps > 0 && optimal_utilization_bps < 10_000, VannaError::InvalidRateModel);
-        require!(reserve_factor_bps <= 10_000, VannaError::InvalidRateModel);
-        require!(base_rate_bps <= 10_000, VannaError::InvalidRateModel);
+    pub fn validate_rate_config(rate_curve: &RateCurve, reserve_factor_bps: u16) -> Result<()> {
+        rate_curve.validate()?;
+        require!(reserve_factor_bps as u64 <= BASIS_POINTS, VannaError::InvalidRateModel);
         Ok(())
     }
 
-    /// Spec §4.3 invariant: the raw vault balance must never be less than the accounted amount —
-    /// donations can only ever create slack, never a shortfall.
+    /// The raw vault balance must never be below the accounted amount: donations can only create
+    /// slack, never a shortfall.
     pub fn assert_invariants(&self, raw_vault_amount: u64, share_mint_supply: u64) -> Result<()> {
         require!(
             raw_vault_amount >= self.accounted_liquidity_assets,

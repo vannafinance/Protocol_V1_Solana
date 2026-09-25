@@ -10,6 +10,7 @@ pub mod validation;
 
 use anchor_lang::prelude::*;
 use instructions::*;
+use state::reserve::RateCurve;
 
 declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
 
@@ -17,11 +18,13 @@ declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
 pub mod vanna_lending {
     use super::*;
 
+    // -- Margin swap ----------------------------------------------------------------
+
     pub fn user_margin_swap<'info>(ctx: Context<'info, UserMarginSwap<'info>>, amount_in: u64, min_amount_out: u64, route_account_count: u16, route_data: Vec<u8>) -> Result<()> {
         instructions::swap::user_margin_swap(ctx, amount_in, min_amount_out, route_account_count, route_data)
     }
 
-    // -- Governance -----------------------------------------------------
+    // -- Governance -----------------------------------------------------------------
 
     pub fn initialize_protocol(ctx: Context<InitializeProtocol>, treasury: Pubkey, max_assets_per_margin: u8) -> Result<()> {
         instructions::admin::initialize_protocol(ctx, treasury, max_assets_per_margin)
@@ -91,13 +94,9 @@ pub mod vanna_lending {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn admin_initialize_reserve(
         ctx: Context<AdminInitializeReserve>,
-        base_rate_bps: u16,
-        slope1_bps: u16,
-        slope2_bps: u16,
-        optimal_utilization_bps: u16,
+        rate_curve: RateCurve,
         reserve_factor_bps: u16,
         supply_cap: u64,
         borrow_cap: u64,
@@ -105,10 +104,7 @@ pub mod vanna_lending {
     ) -> Result<()> {
         instructions::admin::admin_initialize_reserve(
             ctx,
-            base_rate_bps,
-            slope1_bps,
-            slope2_bps,
-            optimal_utilization_bps,
+            rate_curve,
             reserve_factor_bps,
             supply_cap,
             borrow_cap,
@@ -116,13 +112,9 @@ pub mod vanna_lending {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn admin_update_reserve_config(
         ctx: Context<AdminUpdateReserveConfig>,
-        base_rate_bps: u16,
-        slope1_bps: u16,
-        slope2_bps: u16,
-        optimal_utilization_bps: u16,
+        rate_curve: RateCurve,
         reserve_factor_bps: u16,
         supply_cap: u64,
         borrow_cap: u64,
@@ -130,10 +122,7 @@ pub mod vanna_lending {
     ) -> Result<()> {
         instructions::admin::admin_update_reserve_config(
             ctx,
-            base_rate_bps,
-            slope1_bps,
-            slope2_bps,
-            optimal_utilization_bps,
+            rate_curve,
             reserve_factor_bps,
             supply_cap,
             borrow_cap,
@@ -149,7 +138,7 @@ pub mod vanna_lending {
         instructions::lite::admin_register_lite_strategy(ctx)
     }
 
-    // -- Margin lifecycle -------------------------------------------------
+    // -- Margin lifecycle -----------------------------------------------------------
 
     pub fn user_create_margin(ctx: Context<UserCreateMargin>) -> Result<()> {
         instructions::margin::user_create_margin(ctx)
@@ -175,7 +164,7 @@ pub mod vanna_lending {
         instructions::margin::user_withdraw_collateral(ctx, amount, min_health_factor_wad)
     }
 
-    // -- Lender operations -------------------------------------------------
+    // -- Lender operations ----------------------------------------------------------
 
     pub fn lender_supply(ctx: Context<LenderSupply>, assets: u64, min_shares_out: u64) -> Result<()> {
         instructions::lending::lender_supply(ctx, assets, min_shares_out)
@@ -189,7 +178,7 @@ pub mod vanna_lending {
         instructions::lending::public_refresh_reserve(ctx)
     }
 
-    // -- Borrow and repay -------------------------------------------------
+    // -- Borrow and repay -----------------------------------------------------------
 
     pub fn user_open_debt_position(ctx: Context<UserOpenDebtPosition>) -> Result<()> {
         instructions::borrowing::user_open_debt_position(ctx)
@@ -215,13 +204,13 @@ pub mod vanna_lending {
         instructions::borrowing::public_repay_from_wallet(ctx, max_assets, repay_all)
     }
 
-    // -- Liquidation -------------------------------------------------------
+    // -- Liquidation ----------------------------------------------------------------
 
     pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
         instructions::liquidation::public_liquidate(ctx, max_repay_assets, min_collateral_out)
     }
 
-    // -- Composite -----------------------------------------------------------
+    // -- Composite ------------------------------------------------------------------
 
     pub fn user_deposit_and_borrow(
         ctx: Context<UserDepositAndBorrow>,
@@ -232,7 +221,7 @@ pub mod vanna_lending {
         instructions::composite::user_deposit_and_borrow(ctx, deposit_amount, borrow_amount, max_debt_shares)
     }
 
-    // -- Lite / Stocks (Kamino) ----------------------------------------------
+    // -- Lite / Stocks (Kamino) -----------------------------------------------------
 
     pub fn lite_open(ctx: Context<LiteOpen>, equity: u64, leverage_bps: u64) -> Result<()> {
         instructions::lite::lite_open(ctx, equity, leverage_bps)

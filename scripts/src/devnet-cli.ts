@@ -1,6 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Connection, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 /**
  * Minimal `--flag value` / `--flag` (boolean) parser — no external CLI framework needed.

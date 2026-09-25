@@ -48,7 +48,7 @@ function priceFeedAccountAddress(feedId: string): PublicKey {
 }
 
 /** Builds a fresh PriceUpdateV2 account buffer from a template (any existing PriceUpdateV2 —
- * layout is identical across feeds), rewriting the feed ID/price/timestamps for `asset`. */
+ * layout is identical across feeds), rewriting the feed ID/price/timestamps. */
 function buildForkPriceAccountData(template: Buffer, feedId: string, usdPrice: number): Buffer {
   const data = Buffer.from(template);
   if (data.length < MIN_PRICE_ACCOUNT_SIZE) {

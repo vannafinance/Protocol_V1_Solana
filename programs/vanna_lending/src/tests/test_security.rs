@@ -6,11 +6,6 @@ use common::*;
 use solana_keypair::Keypair;
 use solana_signer::Signer as SvmSigner;
 
-const USDC_FEED: [u8; 32] = [1u8; 32];
-const WSOL_FEED: [u8; 32] = [2u8; 32];
-const USDC_PRICE: i64 = 100_000_000;
-const WSOL_PRICE: i64 = 20_000_000_000;
-
 struct Env {
     admin: Keypair,
     usdc_mint: Pubkey,
@@ -28,8 +23,8 @@ fn setup_protocol_with_two_assets(svm: &mut litesvm::LiteSVM) -> Env {
     let wsol_mint = create_mint(svm, &admin, &admin.pubkey(), WSOL_DECIMALS);
     send(svm, &admin, &[ix_admin_register_asset(&admin.pubkey(), &admin.pubkey(), &usdc_mint, USDC_FEED, 0, 8_000, 8_500, 500, 1_000, 3_600, true, true)], &[]).unwrap();
     send(svm, &admin, &[ix_admin_register_asset(&admin.pubkey(), &admin.pubkey(), &wsol_mint, WSOL_FEED, 0, 7_000, 8_000, 500, 1_000, 3_600, true, true)], &[]).unwrap();
-    send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]).unwrap();
-    send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, 0, 1_000, 6_000, 8_000, 1_000, 0, 0, 0)], &[]).unwrap();
+    send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
+    send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
 
     let usdc_price_update = Pubkey::new_unique();
     let wsol_price_update = Pubkey::new_unique();
@@ -40,12 +35,8 @@ fn setup_protocol_with_two_assets(svm: &mut litesvm::LiteSVM) -> Env {
     Env { admin, usdc_mint, wsol_mint, usdc_price_update, wsol_price_update }
 }
 
-/// The margin vault is a plain Associated Token Account with no separate internal ledger — its
-/// live SPL balance *is* the credited collateral (see `instructions/margin.rs`). This is
-/// deliberately different from the lending `Reserve`'s pooled vault, which still keeps its own
-/// `accounted_liquidity_assets` ledger because it is shared across every lender. Here, a raw
-/// donation straight into a margin vault is simply extra collateral for that vault's own owner —
-/// it counts immediately, and it is fully withdrawable, exactly like a real deposit.
+/// The margin vault's live SPL balance is the credited collateral (unlike the pooled `Reserve`
+/// vault's ledger), so a raw donation counts immediately and is fully withdrawable.
 #[test]
 fn donation_into_margin_vault_becomes_live_collateral() {
     let mut svm = setup_svm();
@@ -60,12 +51,11 @@ fn donation_into_margin_vault_becomes_live_collateral() {
     send(&mut svm, &borrower, &[ix_user_deposit_collateral(&borrower.pubkey(), &margin, &env.wsol_mint, deposit_amount)], &[])
         .expect("deposit_collateral");
 
-    // A donor sends tokens directly into the margin vault ATA, with no protocol instruction
-    // involved at all.
+    // Raw SPL transfer into the margin vault, bypassing the protocol.
     let donor = funded_keypair(&mut svm);
     let donation_amount = 5 * 10u64.pow(9);
     mint_to_wallet(&mut svm, &env.admin, &env.wsol_mint, &env.admin, &donor.pubkey(), donation_amount);
-    let donor_ata = anchor_spl::associated_token::get_associated_token_address(&donor.pubkey(), &env.wsol_mint);
+    let donor_ata = get_associated_token_address(&donor.pubkey(), &env.wsol_mint);
     let margin_vault = margin_vault_ata(&margin, &env.wsol_mint);
     let donation_ix = spl_token_interface::instruction::transfer(
         &spl_token_interface::ID,
@@ -79,12 +69,9 @@ fn donation_into_margin_vault_becomes_live_collateral() {
     let res = send(&mut svm, &donor, &[donation_ix], &[]);
     assert!(res.is_ok(), "raw donation transfer failed: {res:?}");
 
-    // The donation is immediately reflected — there is no separate ledger to fall behind it.
     let total = deposit_amount + donation_amount;
     assert_eq!(token_balance(&svm, &margin_vault), total);
 
-    // And it is fully withdrawable, exactly like a real deposit, since the vault balance is the
-    // sole source of truth for this borrower's own credited collateral.
     let res = send(
         &mut svm,
         &borrower,
@@ -139,10 +126,8 @@ fn wrong_signer_cannot_deposit_for_someone_elses_margin() {
     let (margin, _) = margin_pda(&owner.pubkey());
     send(&mut svm, &owner, &[ix_user_create_margin(&owner.pubkey(), &owner.pubkey())], &[]).unwrap();
 
-    // `attacker` signs a deposit instruction whose `authority` field names `owner`'s margin, but
-    // `attacker` is the transaction signer — the `has_one = authority` constraint must reject it.
+    // Build the owner's deposit, then swap the signer to the attacker: `has_one = authority` must reject it.
     let mut ix = ix_user_deposit_collateral(&owner.pubkey(), &margin, &env.wsol_mint, 1_000_000_000);
-    // Swap the signer flag onto the attacker's own key instead of the legitimate owner's.
     for meta in ix.accounts.iter_mut() {
         if meta.pubkey == owner.pubkey() && meta.is_signer {
             meta.pubkey = attacker.pubkey();
@@ -152,8 +137,7 @@ fn wrong_signer_cannot_deposit_for_someone_elses_margin() {
     assert!(res.is_err(), "a non-owner must not be able to deposit into someone else's margin account");
 }
 
-/// The very first supply into a reserve must meet the minimum-initial-shares floor, guarding
-/// against a first-depositor share-inflation attack on a freshly initialized pool (spec §6.3).
+/// The first supply must meet the minimum-initial-shares floor (first-depositor inflation guard, spec §6.3).
 #[test]
 fn first_deposit_below_minimum_shares_is_rejected() {
     let mut svm = setup_svm();
@@ -171,9 +155,7 @@ fn first_deposit_below_minimum_shares_is_rejected() {
     assert!(res.is_ok(), "a first supply above the minimum-initial-shares floor should succeed: {res:?}");
 }
 
-/// SECURITY_AUDIT_REPORT.md VAN-SOL-001 (Critical): `admin` must be a real `Signer`, not an
-/// unverified instruction argument — otherwise any payer could front-run a fresh deployment and
-/// name themselves (or anyone else) as the permanent protocol admin.
+/// VAN-SOL-001 (Critical): `admin` must sign, or anyone could front-run deployment and pick the admin.
 #[test]
 fn initialization_cannot_be_front_run_without_admins_signature() {
     let mut svm = setup_svm();
@@ -181,9 +163,7 @@ fn initialization_cannot_be_front_run_without_admins_signature() {
     let victim_admin = Pubkey::new_unique(); // a pubkey the attacker does not control
     let treasury = Pubkey::new_unique();
 
-    // The attacker submits initialize_protocol naming `victim_admin` as admin, but only the
-    // attacker's own keypair actually signs — strip the signer flag Anchor's IDL sets for `admin`
-    // to simulate exactly that (same technique as `wrong_signer_cannot_deposit_for_someone_elses_margin`).
+    // Name `victim_admin` as admin but strip its signer flag, so only the attacker signs.
     let mut ix = ix_initialize_protocol(&victim_admin, &treasury, &attacker.pubkey(), 8);
     for meta in ix.accounts.iter_mut() {
         if meta.pubkey == victim_admin {
@@ -194,8 +174,7 @@ fn initialization_cannot_be_front_run_without_admins_signature() {
     assert!(res.is_err(), "initialize_protocol must require the named admin's own signature, not just its pubkey as data");
 }
 
-/// The legitimate case the fix must not break: an admin who actually signs for themselves can
-/// still initialize the protocol.
+/// Counterpart to the front-run test: an admin who signs for themselves can initialize.
 #[test]
 fn legitimate_admin_signing_for_themselves_can_initialize() {
     let mut svm = setup_svm();
@@ -205,8 +184,7 @@ fn legitimate_admin_signing_for_themselves_can_initialize() {
     assert!(res.is_ok(), "an admin signing for themselves should be able to initialize: {res:?}");
 }
 
-/// SECURITY_AUDIT_REPORT.md VAN-SOL-001: a zero-address treasury would make fee collection
-/// permanently unusable, so it must be rejected at initialization.
+/// VAN-SOL-001: a zero-address treasury would brick fee collection, so initialization rejects it.
 #[test]
 fn zero_treasury_is_rejected() {
     let mut svm = setup_svm();
@@ -215,8 +193,7 @@ fn zero_treasury_is_rejected() {
     assert!(res.is_err(), "a zero-address treasury must be rejected");
 }
 
-/// The singleton `ProtocolConfig` PDA can only ever be `init`'d once — a second attempt (even by
-/// the legitimate admin) must fail, so a front-runner also cannot "re-initialize" after the fact.
+/// The singleton `ProtocolConfig` can only be initialized once, even by the legitimate admin.
 #[test]
 fn initialization_cannot_execute_twice() {
     let mut svm = setup_svm();

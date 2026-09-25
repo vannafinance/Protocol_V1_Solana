@@ -6,7 +6,7 @@ use crate::events::*;
 use crate::external::kamino::{self, KaminoCpiAccounts};
 use crate::instructions::borrowing::apply_accrual;
 use crate::instructions::swap::{JUPITER, SWAP_SEED};
-use crate::math::fixed_point::mul_div_floor;
+use crate::math::fixed_point::{mul_div_ceil, mul_div_floor};
 use crate::math::health::{
     calculate_health, normalize_token_value, CollateralValuation, DebtValuation,
 };
@@ -36,10 +36,10 @@ use anchor_spl::token::{Token, TokenAccount as SplTokenAccount};
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-/// Instructions sysvar — Kamino introspects this during deposit/redeem.
+/// Kamino introspects the instructions sysvar during deposit/redeem.
 const INSTRUCTIONS_SYSVAR_ID: Pubkey = pubkey!("Sysvar1nstructions1111111111111111111111111");
 
-/// Max leverage 5x (50_000 bps). Min is 1x (10_000) which is equity-only deposit.
+/// Leverage bounds: 1x (equity-only, no borrow) to 5x.
 const MIN_LEVERAGE_BPS: u64 = 10_000;
 const MAX_LEVERAGE_BPS: u64 = 50_000;
 
@@ -135,19 +135,8 @@ pub fn admin_register_lite_strategy(ctx: Context<AdminRegisterLiteStrategy>) -> 
 // lite_open
 // ---------------------------------------------------------------------------
 
-/// Empty final seed preserves the original PDA and its bump. Additional stocks use
-/// the immutable asset index. Constraints still enforce the complete canonical PDA.
-///
-/// `#[inline(never)]`: this runs INSIDE a `seeds = [...]` constraint on several structs'
-/// `lite_position` account (`LiteOpen`, `LiteSupply`, `LiteReduceRedeem`,
-/// `LiteReduceRepay`, `LiteReduceAndRepay`), i.e. as part of Anchor's macro-generated
-/// `try_accounts` —
-/// already documented (via a real compiler warning on the sibling `LiteReduceAndRepay`
-/// struct) as a large, stack-pressured function. `find_program_address`'s own bump-search
-/// loop is exactly the kind of per-call local state that's cheap on its own but expensive
-/// once folded into an already-large caller frame; keeping this un-inlined is a low-risk
-/// way to rule it out as a contributor to the live "Access violation in stack frame N"
-/// crash traced to this same instruction family.
+/// Final `lite_position` seed: empty for the legacy (first) PDA, the asset index for others.
+/// `#[inline(never)]` keeps `find_program_address` out of the stack-heavy `try_accounts` frame.
 #[inline(never)]
 pub fn position_seed(position: &Pubkey, margin: &Pubkey, asset_index: u16) -> Vec<u8> {
     let legacy = Pubkey::find_program_address(&[LITE_POSITION_SEED, margin.as_ref()], &crate::ID).0;
@@ -403,7 +392,6 @@ pub fn lite_open(ctx: Context<LiteOpen>, equity: u64, leverage_bps: u64) -> Resu
         }
     }
 
-    // Ensure user still holds enough equity+borrow to deposit.
     require!(
         ctx.accounts.user_token_account.amount >= deposit_amount,
         VannaError::InsufficientCollateral
@@ -540,14 +528,10 @@ pub fn lite_open(ctx: Context<LiteOpen>, equity: u64, leverage_bps: u64) -> Resu
 }
 
 // ---------------------------------------------------------------------------
-// lite_supply — like `lite_open` but with no borrow leg, sourcing the funds
-// already sitting in the margin account's own vault (e.g. left there by a
-// prior `user_deposit_and_borrow` + `user_margin_swap`) instead of the user's
-// wallet. Used for the cross-asset "swap stock into USDC/SOL, then supply
-// into Kamino's main market" flow — the collateral/debt mints don't need to
-// match here since the debt lives in a separate reserve entirely; this
-// instruction only ever adds collateral value, so it needs no health check
-// (mirrors `user_deposit_collateral`, which is likewise unconditional).
+// lite_supply
+//
+// Supplies funds already in the margin vault into Kamino (cross-asset flow: the debt lives in
+// another reserve). Only adds collateral value, so no health check is needed.
 // ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
@@ -566,9 +550,7 @@ pub struct LiteSupply<'info> {
         constraint = margin_account.authority == owner.key() @ VannaError::Unauthorized
     )]
     pub margin_account: Box<Account<'info, MarginAccount>>,
-    /// Margin's own vault for `underlying_mint` — the source. Unlike `lite_open`'s
-    /// `user_token_account` (owner-authorized), this account is margin-PDA-owned;
-    /// the Kamino CPI below signs for it via the margin's own seeds.
+    /// Source funds; margin-PDA-owned, so the Kamino CPI signs with the margin seeds.
     #[account(
         mut,
         token::mint = underlying_mint,
@@ -576,14 +558,10 @@ pub struct LiteSupply<'info> {
         token::token_program = token_program
     )]
     pub margin_source_account: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// Vanna's own reserve for `underlying_mint` — needed only to attribute a same-transaction
-    /// borrow to this Kamino position (see `attribute_shares_delta` below); read-only, not the
-    /// Kamino reserve.
+    /// Vanna reserve (not Kamino's), read only to attribute a same-transaction borrow.
     #[account(seeds = [RESERVE_SEED, underlying_mint.key().as_ref()], bump = reserve.bump)]
     pub reserve: Box<Account<'info, Reserve>>,
-    /// Vanna's own debt position for `underlying_mint` on this margin account — `init_if_needed`
-    /// so plain (non-leveraged) supply callers that never borrowed this asset still work; in that
-    /// case `attribute_shares_delta` is 0 and this stays untouched at its freshly-initialized zero.
+    /// `init_if_needed` so unleveraged supply works without a prior borrow of this asset.
     #[account(
         init_if_needed,
         payer = owner,
@@ -715,13 +693,8 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta
         .ok_or(VannaError::MathUnderflow)?;
     require!(ctoken_received > 0, VannaError::SlippageExceeded);
 
-    // `underlying_mint` may have been credited as ordinary active collateral by whatever put it
-    // in `margin_source_account` (e.g. `user_borrow` crediting a fresh borrow — spec §1.2). This
-    // deposit CPI can fully drain that vault into Kamino, where the value continues to be
-    // tracked, just via the separate lite-position mechanism instead — clear the stale ordinary-
-    // collateral flag when that happens, the same way `swap`/`borrowing`/`margin` already do
-    // whenever a vault they touch empties out. Without this, a later plain deposit of the same
-    // asset fails `add_active_collateral`'s `DuplicateAssetIndex` guard.
+    // A drained source vault must release its collateral slot, or a later deposit of this asset
+    // fails with `DuplicateAssetIndex`.
     ctx.accounts.margin_source_account.reload()?;
     if ctx.accounts.margin_source_account.amount == 0
         && ctx.accounts.margin_account.is_collateral_active(ctx.accounts.asset_config.asset_index)
@@ -756,10 +729,7 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta
         .checked_add(amount)
         .ok_or(VannaError::MathOverflow)?;
 
-    // Attribute a same-transaction borrow of `underlying_mint` to this Kamino position, so a
-    // later `lite_reduce`/`lite_close` knows to repay `debt_position` from the redemption instead
-    // of forwarding the whole amount to the wallet. 0 for the plain (non-leveraged) supply path —
-    // `debt_shares()`'s own `.min(outstanding)` on read caps this defensively either way.
+    // Attribute a same-transaction borrow so a later exit repays it from the redemption.
     if attribute_shares_delta > 0 {
         let current_attributed = position.debt_shares(ctx.accounts.debt_position.borrow_shares);
         position.set_debt_shares(
@@ -786,27 +756,11 @@ pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta
 }
 
 // ---------------------------------------------------------------------------
-// lite_close
-// ---------------------------------------------------------------------------
-
-// `lite_close`/`lite_reduce` used to be ONE instruction doing redeem + repay + health-check
-// all in a single Rust function — a live BPF simulation on the real deployed program
-// crashed with "Access violation in stack frame N" (a genuine stack overflow, confirmed
-// with a rich multi-position account AND with a minimal single-position one — this is not
-// about account/remaining-accounts complexity at all, the monolithic function itself is
-// simply too large for BPF's fixed per-frame budget). `#[inline(never)]` hints and a sub-
-// function extraction both failed to fix this on re-test against the real program.
+// lite_reduce_redeem / lite_reduce_repay
 //
-// Split into two separate instructions instead — `lite_reduce_redeem` then
-// `lite_reduce_repay`, bundled into ONE transaction by the client (same "build it all
-// first, simulate before ever broadcasting" pattern this app already uses for Perps open/
-// close) — because Solana gives every TOP-LEVEL instruction call its own fresh stack from
-// the runtime's own entrypoint dispatch, this structurally rules out the failure mode
-// regardless of exactly which internal call was overflowing. The real (CPI-measured)
-// redeemed amount is carried from the first instruction to the second via
-// `LitePosition::set_pending_redeem`/`take_pending_redeem` (see that doc comment) since a
-// margin's underlying vault can hold unrelated pre-existing balance the second instruction
-// can't otherwise tell apart from this redeem's own proceeds.
+// A same-asset exit is two instructions sent in one transaction: as one instruction it overflowed
+// the BPF stack. The redeemed amount is carried via `LitePosition::{set,take}_pending_redeem`.
+// ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
 pub struct LiteReduceRedeem<'info> {
@@ -910,14 +864,11 @@ fn do_redeem_reserve_collateral<'info>(
     kamino::redeem_reserve_collateral(&cpi, collateral_amount, margin_signer_seeds)
 }
 
-/// First half of a same-asset Kamino exit: redeems `exit_bps`% of the position's Kamino
-/// receipt, updates the position's own collateral-amount/cost-basis bookkeeping (safe to
-/// finalize here — doesn't depend on the repay step at all), and stashes the real
-/// redeemed amount for `lite_reduce_repay` to pick up. Must be followed by
-/// `lite_reduce_repay` in the SAME transaction — the debt isn't repaid and the health
-/// check hasn't run yet, so a margin account with a pending redeem is transiently
-/// understated on the collateral side if inspected mid-transaction (never observable
-/// on-chain outside of it, since Solana transactions are all-or-nothing).
+/// Exit step 1: redeems `exit_bps` of the Kamino receipts, scales the position's cost basis,
+/// and stashes the redeemed amount for `lite_reduce_repay`.
+///
+/// Must be followed by `lite_reduce_repay` in the same transaction: debt repayment and the
+/// health check happen there.
 pub fn lite_reduce_redeem(
     ctx: Context<LiteReduceRedeem>,
     exit_bps: u16,
@@ -951,9 +902,7 @@ pub fn lite_reduce_redeem(
         ctx.accounts.lite_position.kamino_collateral_amount > 0,
         VannaError::NoLitePosition
     );
-    // A previous redeem in this same position must be repaid (via `lite_reduce_repay`)
-    // before another one starts — otherwise its pending amount would be silently
-    // overwritten below.
+    // An unconsumed pending redeem would otherwise be silently overwritten below.
     require!(
         ctx.accounts.lite_position.reserved[25] == 0,
         VannaError::PendingLiteRedeem
@@ -1073,12 +1022,10 @@ pub struct LiteReduceRepay<'info> {
         bump = lite_position.bump
     )]
     pub lite_position: Box<Account<'info, LitePosition>>,
-    /// CHECK: must match strategy — needed here (not just the redeem leg) purely to read
-    /// Kamino's reserve exchange rate for valuing the position's REMAINING receipts in
-    /// this instruction's own health check, not for any CPI.
+    /// CHECK: must match strategy; used only to value the remaining receipts for the health check.
     #[account(constraint = kamino_program.key() == lite_strategy.kamino_program @ VannaError::InvalidKaminoProgram)]
     pub kamino_program: UncheckedAccount<'info>,
-    /// CHECK: kamino reserve (read-only valuation, see above).
+    /// CHECK: kamino reserve (read-only valuation).
     #[account(constraint = kamino_reserve.key() == lite_strategy.kamino_reserve @ VannaError::InvalidKaminoAccounts)]
     pub kamino_reserve: UncheckedAccount<'info>,
     #[account(
@@ -1089,13 +1036,11 @@ pub struct LiteReduceRepay<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Second half of a same-asset Kamino exit — see `lite_reduce_redeem`'s doc comment for why
-/// this is split out at all. Repays the debt this position's share of the redeem covers,
-/// sends any leftover straight to the wallet, runs the same health check the old combined
-/// `lite_reduce` did, and (on a full 100% exit) closes the position. `exit_bps` must be the
-/// SAME value passed to the preceding `lite_reduce_redeem` in this transaction — nothing
-/// else can have touched `attributed_shares`'s inputs in between (same transaction, atomic),
-/// so this recomputes `target_shares` fresh rather than trusting a client-supplied one.
+/// Exit step 2: repays this position's attributed debt from the pending redeem, sends the
+/// residual to the wallet, runs the health check, and closes the position on a full exit.
+///
+/// `exit_bps` must match the preceding `lite_reduce_redeem`. Nothing in between can change the
+/// attribution inputs, so `target_shares` is recomputed here rather than taken from the client.
 pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result<()> {
     require!(
         exit_bps > 0 && exit_bps <= 10_000,
@@ -1135,7 +1080,7 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
         .lite_position
         .debt_shares(ctx.accounts.debt_position.borrow_shares);
     let target_shares =
-        crate::math::fixed_point::mul_div_ceil(attributed_shares, exit_bps as u128, 10_000)?;
+        mul_div_ceil(attributed_shares, exit_bps as u128, 10_000)?;
 
     let authority_key = ctx.accounts.margin_account.authority;
     let margin_bump = ctx.accounts.margin_account.bump;
@@ -1147,12 +1092,8 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
         ctx.accounts.reserve.total_borrow_shares,
         ctx.accounts.reserve.total_borrow_assets,
     )?;
-    // Cap at what was actually redeemed rather than hard-failing the whole exit: `current_debt_
-    // assets` is ceil-rounded and keeps accruing interest independently of Kamino's own yield, so
-    // by the time of a real-world close (days/weeks after open, not the seconds-apart timing of a
-    // quick test) it can end up a few raw units above `redeemed` even on a full-percentage exit.
-    // Same "repay what you can from what came back" pattern `lite_reduce_and_repay`'s leg3 already
-    // uses for its cross-asset repay.
+    // Cap at what was redeemed instead of failing: debt is ceil-rounded and accrues independently
+    // of Kamino yield, so it can exceed `redeemed` by a few units even on a full exit.
     let repay_amount = current_debt_assets.min(redeemed);
     let mut shares_burned = 0u128;
     if repay_amount > 0 {
@@ -1169,26 +1110,9 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
             received == repay_amount,
             VannaError::VaultAccountingInvariantFailed
         );
-        // Never burn more than `target_shares` — this LitePosition's OWN attributed slice of
-        // `debt_position.borrow_shares`, not the whole shared account. Vanna has ONE
-        // `debt_position` per (margin, reserve), shared by Farm AND ordinary Perps borrowing
-        // in the same asset — a margin account can easily have a Perps Long borrowing USDC
-        // from the exact same `debt_position` a Farm USDC position is also attributed against.
-        // A prior version special-cased `exit_bps == 10_000` to burn
-        // `debt_position.borrow_shares` directly (meant as a dust-forgiveness sweep for a few
-        // shares this LitePosition's own stored attribution could understate after earlier
-        // partial-exit rounding) — but `target_shares` already equals `attributed_shares`
-        // EXACTLY at exit_bps == 10_000 (`mul_div_ceil(attributed_shares, 10_000, 10_000)` has
-        // no rounding loss), so that sweep was never actually needed to fully clear this
-        // position's own share, and it was capable of silently erasing a completely unrelated
-        // Perps position's real debt without repaying it (live-reproduced bug: closing a Farm
-        // position on a shared reserve zeroed out a simultaneously-open Perps Long's debt too).
-        // If `repay_amount` ever falls slightly short of `current_debt_assets` even at 100%
-        // (e.g. Kamino-side redemption rounding), the existing floor-rounded branch below
-        // already leaves a small genuine residual attributed here rather than forgiving it —
-        // that residual just stays ordinary, correctly-tracked `debt_position` debt once this
-        // LitePosition itself closes a few lines down (still gated on `exit_bps == 10_000`
-        // alone, unaffected by this change), rather than vanishing.
+        // Never burn more than `target_shares`: the debt position is shared with ordinary margin
+        // borrowing, so burning all `borrow_shares` would erase unrelated debt. A short repay
+        // leaves the remainder as tracked debt instead of forgiving it.
         shares_burned = if repay_amount >= current_debt_assets {
             target_shares
         } else {
@@ -1320,38 +1244,21 @@ pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// lite_reduce_and_repay — atomic cross-asset unwind of a `lite_supply`
-// position: redeem `exit_bps`% of the Kamino receipt (yield_mint, e.g. USDC),
-// swap it via Jupiter into a DIFFERENT mint (stock_mint, e.g. TSLAx), and
-// repay that mint's Vanna debt — all in ONE instruction, so the single health
-// check at the end sees the POST-repay state.
+// lite_reduce_and_repay
 //
-// This can't be split into separate transactions: `lite_reduce`'s own health
-// check runs immediately on redeem, before a later instruction could repay
-// anything, so it rejects removing Kamino collateral that (at that instant)
-// leaves the other mint's debt unbacked. Composing it as one instruction
-// reuses three already-audited patterns verbatim: the Kamino redeem CPI from
-// `lite_reduce`, the Jupiter escrow-swap CPI from `user_margin_swap` (same
-// `swap_authority` PDA, never the margin PDA signer), and the inline repay
-// bookkeeping from `user_repay_from_margin`.
+// Atomic cross-asset unwind of a `lite_supply` position: redeem the Kamino receipt (e.g. USDC),
+// swap it via Jupiter into the stock (e.g. TSLAx), and repay the stock debt. One instruction so
+// the health check sees the post-repay state. Only for positions with no same-mint debt.
 //
-// Scoped to `lite_supply`-only positions (`deposited_underlying ==
-// equity_underlying`, i.e. no same-mint debt) — so there's no same-mint
-// repay step and no need for the yield asset's own Vanna Reserve/DebtPosition
-// accounts, a real reduction in account count.
+// Several PDA/constraint checks live in the handler, and each leg is its own `#[inline(never)]`
+// function: in `try_accounts` or one handler they overflowed the 4KB BPF stack frame.
 // ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
 pub struct LiteReduceAndRepay<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
-    // Plain UncheckedAccount, not seeds/bump-checked here: this struct's `try_accounts` was
-    // overflowing the BPF stack at runtime (`Access violation in stack frame`, confirmed live)
-    // once enough PDA-seeded Anchor accounts were declared together. `protocol_config`,
-    // `stock_asset_config`, and `lite_strategy` below are read-only and get their PDA verified
-    // (and, where their fields are read, deserialized) manually at the top of the handler
-    // instead, moving that work into the function body's own, later-allocated stack frame.
-    /// CHECK: manually verified against `[PROTOCOL_SEED]` + deserialized in the handler.
+    /// CHECK: verified against `[PROTOCOL_SEED]` and deserialized in the handler.
     pub protocol_config: UncheckedAccount<'info>,
     #[account(
         mut,
@@ -1366,10 +1273,7 @@ pub struct LiteReduceAndRepay<'info> {
     pub yield_asset_config: Box<Account<'info, AssetConfig>>,
     pub yield_mint: Box<InterfaceAccount<'info, Mint>>,
     pub yield_price_update: Box<Account<'info, PriceUpdateV2>>,
-    // Not init_if_needed (unlike lite_open/lite_supply) — that macro's generated code is
-    // expensive per-account, and this struct already has many accounts; stacking several
-    // init_if_needed ATAs here overflowed the BPF stack at runtime. The client creates these
-    // idempotently beforehand instead (same accounts `lite_supply`/deposit+borrow already use).
+    // Not `init_if_needed` (stack cost); the client creates these ATAs idempotently beforehand.
     #[account(
         mut,
         token::mint = yield_mint,
@@ -1377,15 +1281,10 @@ pub struct LiteReduceAndRepay<'info> {
         token::token_program = yield_token_program
     )]
     pub margin_yield_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: manually verified against `[LITE_STRATEGY_SEED, yield_mint]` and deserialized in
-    /// the handler (its fields gate the Kamino accounts below, also checked there instead of via
-    /// declarative `constraint = ...` — see the stack-overflow note on `protocol_config` above).
+    /// CHECK: verified against `[LITE_STRATEGY_SEED, yield_mint]` and deserialized in the handler.
     pub lite_strategy: UncheckedAccount<'info>,
-    #[account(
-        mut,
-        seeds = [LITE_POSITION_SEED, margin_account.key().as_ref(), &position_seed(&lite_position.key(), &margin_account.key(), yield_asset_config.asset_index)],
-        bump = lite_position.bump
-    )]
+    // PDA checked in the handler: `position_seed` here pushed `try_accounts` to 4192/4096 bytes.
+    #[account(mut)]
     pub lite_position: Box<Account<'info, LitePosition>>,
     /// CHECK: matched against `lite_strategy.kamino_program` in the handler.
     pub kamino_program: UncheckedAccount<'info>,
@@ -1414,17 +1313,14 @@ pub struct LiteReduceAndRepay<'info> {
     pub instruction_sysvar_account: UncheckedAccount<'info>,
 
     // --- Stock / debt leg (e.g. TSLAx) ---
-    /// CHECK: manually verified against `[ASSET_SEED, stock_mint]` + deserialized in the handler.
+    /// CHECK: verified against `[ASSET_SEED, stock_mint]` and deserialized in the handler.
     pub stock_asset_config: UncheckedAccount<'info>,
     pub stock_mint: Box<InterfaceAccount<'info, Mint>>,
     pub stock_price_update: Box<Account<'info, PriceUpdateV2>>,
-    #[account(mut, seeds = [RESERVE_SEED, stock_mint.key().as_ref()], bump = stock_reserve.bump)]
+    // PDAs checked in the handler; keeping them here left `try_accounts` 8 bytes over 4096.
+    #[account(mut)]
     pub stock_reserve: Box<Account<'info, Reserve>>,
-    #[account(
-        mut,
-        seeds = [DEBT_SEED, margin_account.key().as_ref(), stock_reserve.key().as_ref()],
-        bump = stock_debt_position.bump
-    )]
+    #[account(mut)]
     pub stock_debt_position: Box<Account<'info, DebtPosition>>,
     #[account(
         mut,
@@ -1442,10 +1338,8 @@ pub struct LiteReduceAndRepay<'info> {
     pub stock_reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // --- Swap escrow leg (Jupiter) ---
-    /// CHECK: isolated escrow signer for the Jupiter CPI only — controls no margin vaults. Same
-    /// PDA `user_margin_swap` already uses (seeds are mint-agnostic, so it's shared verbatim).
-    /// Manually verified against `[SWAP_SEED, margin_account]` in the handler (not declared with
-    /// seeds/bump here — see the stack-overflow note on `protocol_config` above).
+    /// CHECK: Jupiter-only escrow signer (same PDA as `user_margin_swap`), controls no margin
+    /// vaults; verified against `[SWAP_SEED, margin_account]` in the handler.
     pub swap_authority: UncheckedAccount<'info>,
     #[account(
         mut,
@@ -1486,10 +1380,6 @@ pub fn lite_reduce_and_repay<'info>(
     let program_id = ctx.program_id;
     let remaining_accounts = ctx.remaining_accounts;
 
-    // Each leg below is its own `#[inline(never)]` function so its locals live in a fresh,
-    // later-allocated BPF stack frame rather than accumulating into one giant frame for this
-    // whole instruction — confirmed live that a single monolithic function here overflows the
-    // 4KB per-frame stack limit (`Access violation in stack frame`, `ProgramFailedToComplete`).
     let (protocol_config, stock_asset_config, swap_authority_bump) =
         lra_validate_and_load(ctx.accounts, program_id)?;
 
@@ -1537,12 +1427,11 @@ pub fn lite_reduce_and_repay<'info>(
     )
 }
 
+/// Deserializes an owned `T` after checking the account owner.
+///
+/// Avoids `Account<'info, T>`, whose lifetime would borrow the whole accounts struct for `'info`
+/// and conflict with the mutable borrows the later legs need.
 #[inline(never)]
-/// Deserializes an owned `T` from a plain `AccountInfo` without going through `Account<'info,
-/// T>` — that wrapper ties its lifetime to the info's own `'info`, which forces any function
-/// taking one to also take `accounts: &'info LiteReduceAndRepay<'info>`, and passing that at the
-/// call site is treated as an immutable borrow of the whole accounts struct for all of `'info`,
-/// conflicting with the mutable borrows the later legs need. An owned value has no such lifetime.
 fn load_checked<T: AccountSerialize + AccountDeserialize + Owner>(info: &AccountInfo) -> Result<T> {
     require_keys_eq!(*info.owner, T::owner(), VannaError::InvalidPda);
     let data = info.try_borrow_data()?;
@@ -1554,9 +1443,7 @@ fn lra_validate_and_load<'info>(
     accounts: &LiteReduceAndRepay<'info>,
     program_id: &Pubkey,
 ) -> Result<(ProtocolConfig, AssetConfig, u8)> {
-    // ---- Manual PDA verification + deserialization for accounts declared as plain
-    // UncheckedAccount above (moved out of the derive macro's `try_accounts` to avoid a BPF
-    // stack overflow there — confirmed live as `Access violation in stack frame`) ----
+    // ---- PDA checks + deserialization ----
     let (protocol_config_pda, _) = Pubkey::find_program_address(&[PROTOCOL_SEED], program_id);
     require_keys_eq!(protocol_config_pda, accounts.protocol_config.key(), VannaError::InvalidPda);
     let protocol_config: ProtocolConfig = load_checked(accounts.protocol_config.as_ref())?;
@@ -1630,6 +1517,19 @@ fn lra_validate_and_load<'info>(
         accounts.stock_mint.key(),
         VannaError::InvalidSwapRoute
     );
+    assert_lite_position_pda(
+        &accounts.lite_position.key(),
+        &accounts.margin_account.key(),
+        accounts.yield_asset_config.asset_index,
+        program_id,
+    )?;
+    assert_stock_debt_pdas(
+        &accounts.stock_reserve.key(),
+        &accounts.stock_debt_position.key(),
+        &accounts.stock_mint.key(),
+        &accounts.margin_account.key(),
+        program_id,
+    )?;
     require_keys_eq!(
         accounts.lite_position.margin_account,
         accounts.margin_account.key(),
@@ -1649,8 +1549,7 @@ fn lra_validate_and_load<'info>(
         accounts.lite_position.kamino_collateral_amount > 0,
         VannaError::NoLitePosition
     );
-    // Only a pure-supply Kamino leg (see `lite_supply`) is supported here — one with same-mint
-    // debt of its own needs `lite_reduce` instead (same-mint repay, no swap needed).
+    // Only pure-supply positions; one with same-mint debt exits via `lite_reduce_redeem`/`_repay`.
     require!(
         accounts.lite_position.deposited_underlying == accounts.lite_position.equity_underlying,
         VannaError::InvalidLeverage
@@ -1663,6 +1562,41 @@ fn lra_validate_and_load<'info>(
     )?;
 
     Ok((protocol_config, stock_asset_config, swap_authority_bump))
+}
+
+#[inline(never)]
+fn assert_lite_position_pda(
+    position: &Pubkey,
+    margin: &Pubkey,
+    asset_index: u16,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let seed = position_seed(position, margin, asset_index);
+    let (pda, _) = Pubkey::find_program_address(
+        &[LITE_POSITION_SEED, margin.as_ref(), seed.as_slice()],
+        program_id,
+    );
+    require_keys_eq!(pda, *position, VannaError::InvalidPda);
+    Ok(())
+}
+
+#[inline(never)]
+fn assert_stock_debt_pdas(
+    reserve: &Pubkey,
+    debt: &Pubkey,
+    mint: &Pubkey,
+    margin: &Pubkey,
+    program_id: &Pubkey,
+) -> Result<()> {
+    let (reserve_pda, _) =
+        Pubkey::find_program_address(&[RESERVE_SEED, mint.as_ref()], program_id);
+    require_keys_eq!(reserve_pda, *reserve, VannaError::InvalidPda);
+    let (debt_pda, _) = Pubkey::find_program_address(
+        &[DEBT_SEED, margin.as_ref(), reserve.as_ref()],
+        program_id,
+    );
+    require_keys_eq!(debt_pda, *debt, VannaError::InvalidPda);
+    Ok(())
 }
 
 #[inline(never)]
@@ -1748,8 +1682,8 @@ fn lra_leg2_swap<'info>(
         VannaError::InvalidSwapRoute
     );
     let (route_accounts, _health_accounts) = remaining_accounts.split_at(route_count);
-    // No Vanna state/vault or wallet signer can be passed to the route — same guard as
-    // `user_margin_swap`, so a route can't re-enter Vanna with privileged accounts.
+    // Same guard as `user_margin_swap`: no Vanna-owned account, program id, wallet signer or
+    // margin vault may be passed to the route.
     for account in route_accounts {
         require!(
             *account.owner != crate::ID && account.key() != crate::ID,
@@ -1781,11 +1715,8 @@ fn lra_leg2_swap<'info>(
     invoke_signed(&route, &infos, swap_signer_seeds)?;
     accounts.yield_escrow.reload()?;
     accounts.stock_escrow.reload()?;
-    // The route's input amount is built from a CLIENT-SIDE estimate of `redeemed` (the actual
-    // on-chain Kamino redemption only happens earlier in this same instruction, so the exact
-    // figure isn't known until then) — a small drift from interest accrual between the estimate
-    // and execution is expected, so allow (never require) a full drain of what was funded here.
-    // Jupiter can only ever consume from the escrow, never add to it beyond that funded amount.
+    // The route amount comes from a client-side estimate of `redeemed`, so it may not drain the
+    // escrow exactly; only require that the route never added to it.
     require!(
         accounts.yield_escrow.amount <= yield_escrow_funded,
         VannaError::InvalidSwapRoute
@@ -1818,20 +1749,15 @@ fn lra_leg2_swap<'info>(
         swapped_out,
     )?;
     accounts.margin_stock_vault.reload()?;
-    // Underflow-guarded only, not an exact-equality check against `swapped_out`: this transfer is
-    // purely internal (escrow -> the margin's own vault), and if `stock_mint` carries a Token-2022
-    // transfer-fee extension (e.g. a PreStocks token), the vault receives strictly less than
-    // `swapped_out` by design — an exact-equality check here would always fail for such a mint.
-    // See the identical fix in `user_margin_swap` (swap.rs) for the same root cause.
+    // Underflow check only, not equality with `swapped_out`: a Token-2022 transfer-fee mint
+    // delivers strictly less (same as `user_margin_swap`).
     accounts
         .margin_stock_vault
         .amount
         .checked_sub(stock_vault_before)
         .ok_or(VannaError::VaultAccountingInvariantFailed)?;
 
-    // Any yield asset the route didn't consume (estimate > actual route amount) isn't stranded —
-    // sweep it back into the margin's own vault; the caller folds it into the final health check
-    // as ordinary collateral, same treatment as leftover stock after the repay leg.
+    // Sweep unconsumed yield asset back to the margin vault; `lra_finalize` counts it as collateral.
     let yield_leftover = accounts.yield_escrow.amount;
     if yield_leftover > 0 {
         transfer_out_checked(
@@ -1918,9 +1844,8 @@ fn lra_finalize<'info>(
     swapped_out: u64,
     debt_repaid: u64,
 ) -> Result<()> {
-    // ---- Update Kamino Lite position bookkeeping (mirrors lite_reduce) ----
-    // deposited_underlying == equity_underlying held before (checked above); scaling both by the
-    // same fraction preserves that, so debt_shares() correctly stays at 0 — no extra bookkeeping.
+    // ---- Position bookkeeping ----
+    // deposited == equity held before; scaling both by the same fraction keeps debt_shares() at 0.
     accounts.lite_position.kamino_collateral_amount = recorded - collateral_amount;
     accounts.lite_position.deposited_underlying -= mul_div_floor(
         accounts.lite_position.deposited_underlying as u128,
@@ -1991,8 +1916,7 @@ fn lra_finalize<'info>(
         )?,
     });
 
-    // Any stock left over after repay is ordinary margin collateral now — fold it in and
-    // (re)activate the index if needed, mirroring `user_margin_swap`'s own-leg handling.
+    // Leftover stock after repay is ordinary margin collateral; activate its index if needed.
     let stock_leftover = accounts.margin_stock_vault.amount;
     let stock_active = accounts
         .margin_account
@@ -2019,9 +1943,7 @@ fn lra_finalize<'info>(
         }
     }
 
-    // Any yield asset the swap route didn't consume (client-side redeem estimate vs. the actual
-    // on-chain amount) was already swept back into `margin_yield_vault` by `lra_leg2_swap` —
-    // fold it in the same way as leftover stock above, rather than leaving it unaccounted for.
+    // Same for the yield vault, which includes anything `lra_leg2_swap` swept back.
     let yield_leftover = accounts.margin_yield_vault.amount;
     let yield_active = accounts
         .margin_account

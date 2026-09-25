@@ -1,6 +1,4 @@
-use crate::constants::{
-    ASSET_SEED, DEBT_SEED, LITE_POSITION_SEED, LITE_STRATEGY_SEED, RESERVE_SEED,
-};
+use crate::constants::{ASSET_SEED, DEBT_SEED, LITE_POSITION_SEED, LITE_STRATEGY_SEED, RESERVE_SEED};
 use crate::errors::VannaError;
 use crate::external::kamino;
 use crate::math::health::{normalize_token_value, CollateralValuation, DebtValuation};
@@ -17,17 +15,14 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_interface::TokenAccount;
 use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
-/// One scanned-and-validated collateral position, ready to feed `calculate_health`. Its value
-/// comes straight from the margin vault's live SPL balance — there is no separate ledger for
-/// collateral (see `instructions/margin.rs` for why that's safe: each vault is private to one
-/// `(margin, mint)` pair, unlike the lending `Reserve`'s pooled liquidity vault).
+/// Collateral valued from the margin vault's live balance; safe without a ledger because each
+/// vault is private to one `(margin, mint)` pair.
 pub struct ScannedCollateral {
     pub asset_index: u16,
     pub mint: Pubkey,
     pub valuation: CollateralValuation,
 }
 
-/// One scanned-and-validated debt position, ready to feed `calculate_health`.
 pub struct ScannedDebt {
     pub asset_index: u16,
     pub reserve: Pubkey,
@@ -45,21 +40,11 @@ fn verify_pda(actual: &Pubkey, seeds: &[&[u8]], bump: u8, program_id: &Pubkey) -
     Ok(())
 }
 
-/// Spec §6.6 `validate_complete_positions` + the price/valuation loading it depends on, folded
-/// into one scan. Walks `margin`'s canonical active-asset arrays and consumes exactly the matching
-/// accounts from `remaining_accounts`, in that same order, skipping only the position the caller
-/// already holds as a named (Anchor-validated, mutable) account — identified by
-/// `named_collateral_index` / `named_debt_index`. Any missing, substituted, reordered, or extra
-/// account fails closed.
-///
-/// Reserves encountered here are accrued in-memory (fresh values feed the health check) but not
-/// persisted — only the caller's own named reserve, if any, is written back. This keeps the scan
-/// read-only and avoids taking unnecessary write locks on reserves the instruction isn't touching.
-// Defensive: this loops over every remaining account doing per-position health-check math,
-// with several locals of its own — inlined into an already-large caller frame (several
-// `lite_*`/margin instructions have many locals of their own), it's a plausible contributor
-// to the same class of BPF stack-frame overflow fixed at `do_redeem_reserve_collateral`'s
-// call site. `#[inline(never)]` keeps it in its own frame regardless of caller size.
+/// Validates and values every open position of `margin` from `remaining_accounts`, in the order
+/// collateral, debt, lite (skipping the `named_*` ones the caller already holds). Any missing,
+/// substituted, reordered or extra account fails closed, so no position can be hidden.
+/// Reserves are accrued in memory only, so the scan takes no write locks.
+// `#[inline(never)]`: own BPF stack frame.
 #[inline(never)]
 pub fn scan_and_validate_positions<'info>(
     margin_key: &Pubkey,
@@ -223,15 +208,31 @@ pub fn scan_and_validate_positions<'info>(
         });
     }
 
-    let mut positions = vec![(Pubkey::find_program_address(&[LITE_POSITION_SEED, margin_key.as_ref()], program_id).0, None)];
+    // The legacy (unindexed) lite PDA is always scanned, followed by each indexed one.
+    let mut positions = vec![(
+        Pubkey::find_program_address(&[LITE_POSITION_SEED, margin_key.as_ref()], program_id).0,
+        None,
+    )];
     for index in margin.lite_indexes()? {
-        positions.push((Pubkey::find_program_address(&[LITE_POSITION_SEED, margin_key.as_ref(), &index.to_le_bytes()], program_id).0, Some(index)));
+        let seeds: &[&[u8]] = &[LITE_POSITION_SEED, margin_key.as_ref(), &index.to_le_bytes()];
+        positions.push((Pubkey::find_program_address(seeds, program_id).0, Some(index)));
     }
     let mut seen_mints = Vec::new();
-    if let Some((_, mint)) = named_lite { seen_mints.push(mint); }
+    if let Some((_, mint)) = named_lite {
+        seen_mints.push(mint);
+    }
     for (expected, index) in positions {
-        if named_lite.map(|p| p.0) == Some(expected) { continue; }
-        let (receipt, consumed) = scan_lite_collateral(margin_key, &remaining_accounts[cursor..], program_id, clock, &expected, index)?;
+        if named_lite.map(|p| p.0) == Some(expected) {
+            continue;
+        }
+        let (receipt, consumed) = scan_lite_collateral(
+            margin_key,
+            &remaining_accounts[cursor..],
+            program_id,
+            clock,
+            &expected,
+            index,
+        )?;
         cursor += consumed;
         if let Some(receipt) = receipt {
             // A stock has exactly one strategy position, including legacy accounts.
@@ -248,8 +249,11 @@ pub fn scan_and_validate_positions<'info>(
     Ok((collaterals, debts))
 }
 
-/// Mandatory canonical proof (including an empty PDA for accounts without Lite)
-/// prevents external collateral omission during liquidation. Separate SBF frame.
+/// Validates one expected lite-position PDA and, if it exists, values its Kamino receipt.
+///
+/// The PDA must always be passed, even when empty (system-owned, no data), so a caller cannot
+/// hide lite collateral, e.g. during liquidation. Returns the valuation and accounts consumed.
+// `#[inline(never)]`: separate SBF stack frame.
 #[inline(never)]
 fn scan_lite_collateral<'info>(
     margin_key: &Pubkey,
