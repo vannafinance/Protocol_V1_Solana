@@ -15,7 +15,7 @@ use crate::validation::accounts::{
     assert_protocol_action_allowed, assert_reserve_action_allowed, validate_asset_config, ProtocolAction,
 };
 use crate::validation::positions::scan_and_validate_positions;
-use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
+use crate::validation::token::{gross_up_for_transfer_fee, transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
@@ -399,9 +399,15 @@ pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64
     require!(current_debt_assets > 0, VannaError::ZeroAmount);
 
     let requested = if repay_all { current_debt_assets } else { max_assets.min(current_debt_assets) };
-    let target_repay = requested.min(ctx.accounts.margin_vault.amount);
+    // Gross up so the reserve RECEIVES `requested` on a fee-bearing mint (see
+    // `gross_up_for_transfer_fee`), still capped at what the margin vault actually holds.
+    let requested_gross = gross_up_for_transfer_fee(
+        &ctx.accounts.mint.to_account_info(),
+        &ctx.accounts.token_program.key(),
+        requested,
+    )?;
+    let target_repay = requested_gross.min(ctx.accounts.margin_vault.amount);
     require!(target_repay > 0, VannaError::ZeroAmount);
-    let vault_balance_before = ctx.accounts.margin_vault.amount;
 
     let authority_key = ctx.accounts.margin_account.authority;
     let margin_bump = ctx.accounts.margin_account.bump;
@@ -435,12 +441,16 @@ pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64
         .checked_add(received)
         .ok_or(VannaError::MathOverflow)?;
     ctx.accounts.reserve.total_borrow_assets =
-        ctx.accounts.reserve.total_borrow_assets.saturating_sub(received);
+        ctx.accounts.reserve.total_borrow_assets.saturating_sub(received.min(current_debt_assets));
     ctx.accounts.reserve.total_borrow_shares =
         ctx.accounts.reserve.total_borrow_shares.saturating_sub(shares_to_burn);
     ctx.accounts.debt_position.debit_shares(shares_to_burn)?;
 
-    let new_vault_balance = vault_balance_before.checked_sub(received).ok_or(VannaError::MathUnderflow)?;
+    // Read the vault's real post-transfer balance: on a fee-bearing mint the vault loses
+    // `received + fee`, so `vault_balance_before - received` overstated what's left and a
+    // fully drained vault never had its collateral slot released.
+    ctx.accounts.margin_vault.reload()?;
+    let new_vault_balance = ctx.accounts.margin_vault.amount;
     if new_vault_balance == 0
         && ctx
             .accounts
@@ -517,6 +527,13 @@ pub fn public_repay_from_wallet(ctx: Context<PublicRepayFromWallet>, max_assets:
 
     let target_repay = if repay_all { current_debt_assets } else { max_assets.min(current_debt_assets) };
     require!(target_repay > 0, VannaError::ZeroAmount);
+    // Same fee gross-up as `user_repay_from_margin`: the payer sends enough that the
+    // reserve receives `target_repay` on a fee-bearing mint.
+    let target_repay = gross_up_for_transfer_fee(
+        &ctx.accounts.mint.to_account_info(),
+        &ctx.accounts.token_program.key(),
+        target_repay,
+    )?;
 
     let received = transfer_in_measured(
         &ctx.accounts.token_program,
@@ -545,7 +562,7 @@ pub fn public_repay_from_wallet(ctx: Context<PublicRepayFromWallet>, max_assets:
         .checked_add(received)
         .ok_or(VannaError::MathOverflow)?;
     ctx.accounts.reserve.total_borrow_assets =
-        ctx.accounts.reserve.total_borrow_assets.saturating_sub(received);
+        ctx.accounts.reserve.total_borrow_assets.saturating_sub(received.min(current_debt_assets));
     ctx.accounts.reserve.total_borrow_shares =
         ctx.accounts.reserve.total_borrow_shares.saturating_sub(shares_to_burn);
     ctx.accounts.debt_position.debit_shares(shares_to_burn)?;

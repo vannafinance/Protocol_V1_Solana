@@ -5,6 +5,38 @@ use anchor_spl::token_interface::{
     transfer_checked, Mint, TokenAccount, TokenInterface, TransferChecked,
 };
 
+/// Gross transfer amount such that the recipient receives `net_amount` after `mint`'s
+/// Token-2022 `TransferFeeConfig` fee for the current epoch. Identity for classic SPL mints
+/// and Token-2022 mints without the extension.
+///
+/// Repays measure what the reserve vault actually RECEIVED and burn debt shares off that.
+/// For a fee-bearing mint (ANTHROPIC/OPENAI PreStocks, 1%), transferring exactly the debt
+/// meant the reserve received ~99% of it, so even `repay_all` left ~1% of the debt open —
+/// no full close of a PreStock Short could ever clear its debt (live-reproduced on the
+/// fork). Grossing the transfer up by the inverse fee makes the reserve receive the debt.
+pub fn gross_up_for_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, net_amount: u64) -> Result<u64> {
+    use anchor_spl::token_2022::spl_token_2022::{
+        self,
+        extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    };
+    if *token_program != anchor_spl::token_2022::ID {
+        return Ok(net_amount);
+    }
+    let data = mint_ai.try_borrow_data()?;
+    let mint_state = StateWithExtensions::<spl_token_2022::state::Mint>::unpack(&data)
+        .map_err(|_| VannaError::InvalidMint)?;
+    match mint_state.get_extension::<TransferFeeConfig>() {
+        Ok(fee_config) => {
+            let epoch = Clock::get()?.epoch;
+            let fee = fee_config
+                .calculate_inverse_epoch_fee(epoch, net_amount)
+                .ok_or(VannaError::MathOverflow)?;
+            Ok(net_amount.checked_add(fee).ok_or(VannaError::MathOverflow)?)
+        }
+        Err(_) => Ok(net_amount),
+    }
+}
+
 /// Confirms `actual` is the Associated Token Account for `(owner, mint)` under `token_program`.
 pub fn verify_associated_token_account(
     actual: &Pubkey,
