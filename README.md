@@ -11,8 +11,8 @@ This repository contains the on-chain program, written with Anchor.
 |---|---|
 | **Live app** | <a href="https://devnet.solana.vanna.finance/portfolio" target="_blank" rel="noopener noreferrer">devnet.solana.vanna.finance/portfolio</a> |
 | **Documentation** | <a href="https://docs.solana.vanna.finance" target="_blank" rel="noopener noreferrer">docs.solana.vanna.finance</a> |
-| **Product walkthrough** | _Link coming soon_ |
-| **Tech walkthrough** | <a href="https://www.youtube.com/watch?v=bF8RSiVm2JU" target="_blank" rel="noopener noreferrer">YouTube: Vanna Solana walkthrough</a> |
+| **Product walkthrough** | <a href="https://www.youtube.com/watch?v=RjFdNyfky1s" target="_blank" rel="noopener noreferrer">YouTube: Vanna Solana product walkthrough</a> |
+| **Tech walkthrough** | <a href="https://www.youtube.com/watch?v=bF8RSiVm2JU" target="_blank" rel="noopener noreferrer">YouTube: Vanna Solana tech walkthrough</a> |
 
 
 ## What the program does
