@@ -30,10 +30,7 @@ export function debtPositionPda(margin: PublicKey, reserve: PublicKey): [PublicK
   return PublicKey.findProgramAddressSync([enc("debt"), margin.toBuffer(), reserve.toBuffer()], PROGRAM_ID);
 }
 
-export function liteStrategyPda(mint: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([enc("lite_strategy"), mint.toBuffer()], PROGRAM_ID);
-}
-
-export function litePositionPda(margin: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync([enc("lite_position"), margin.toBuffer()], PROGRAM_ID);
+/** Whitelist entry for an external program `margin_execute` may call. */
+export function integrationPda(programId: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([enc("integration"), programId.toBuffer()], PROGRAM_ID);
 }

@@ -1,15 +1,18 @@
+pub mod adapters;
 pub mod constants;
 pub mod errors;
 pub mod events;
-pub mod external;
 pub mod instructions;
 pub mod math;
 pub mod oracle;
+pub mod risk_engine;
 pub mod state;
 pub mod validation;
 
 use anchor_lang::prelude::*;
+use adapters::AdapterKind;
 use instructions::*;
+use state::asset_config::PriceSource;
 use state::reserve::RateCurve;
 
 declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
@@ -18,13 +21,7 @@ declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
 pub mod vanna_lending {
     use super::*;
 
-    // -- Margin swap ----------------------------------------------------------------
-
-    pub fn user_margin_swap<'info>(ctx: Context<'info, UserMarginSwap<'info>>, amount_in: u64, min_amount_out: u64, route_account_count: u16, route_data: Vec<u8>) -> Result<()> {
-        instructions::swap::user_margin_swap(ctx, amount_in, min_amount_out, route_account_count, route_data)
-    }
-
-    // -- Governance -----------------------------------------------------------------
+    // -- Admin: protocol -------------------------------------------------------------------------
 
     pub fn initialize_protocol(ctx: Context<InitializeProtocol>, treasury: Pubkey, max_assets_per_margin: u8) -> Result<()> {
         instructions::admin::initialize_protocol(ctx, treasury, max_assets_per_margin)
@@ -41,6 +38,8 @@ pub mod vanna_lending {
     pub fn admin_set_operating_mode(ctx: Context<AdminSetOperatingMode>, new_mode: u8) -> Result<()> {
         instructions::admin::admin_set_operating_mode(ctx, new_mode)
     }
+
+    // -- Admin: assets ---------------------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
     pub fn admin_register_asset(
@@ -94,6 +93,16 @@ pub mod vanna_lending {
         )
     }
 
+    pub fn admin_set_asset_price_source(
+        ctx: Context<AdminSetAssetPriceSource>,
+        price_source: PriceSource,
+        source_program: Pubkey,
+    ) -> Result<()> {
+        instructions::admin::admin_set_asset_price_source(ctx, price_source, source_program)
+    }
+
+    // -- Admin: lending pools --------------------------------------------------------------------
+
     pub fn admin_initialize_reserve(
         ctx: Context<AdminInitializeReserve>,
         rate_curve: RateCurve,
@@ -134,26 +143,44 @@ pub mod vanna_lending {
         instructions::admin::admin_collect_protocol_fees(ctx, amount)
     }
 
-    pub fn admin_register_lite_strategy(ctx: Context<AdminRegisterLiteStrategy>) -> Result<()> {
-        instructions::lite::admin_register_lite_strategy(ctx)
+    // -- Admin: external integrations ------------------------------------------------------------
+
+    pub fn admin_register_integration(ctx: Context<AdminRegisterIntegration>, adapter: AdapterKind) -> Result<()> {
+        instructions::admin::admin_register_integration(ctx, adapter)
     }
 
-    // -- Margin lifecycle -----------------------------------------------------------
+    pub fn admin_set_integration_enabled(ctx: Context<AdminSetIntegrationEnabled>, enabled: bool) -> Result<()> {
+        instructions::admin::admin_set_integration_enabled(ctx, enabled)
+    }
+
+    // -- Lending pool ----------------------------------------------------------------------------
+
+    pub fn lender_supply(ctx: Context<LenderSupply>, assets: u64, min_shares_out: u64) -> Result<()> {
+        instructions::lending_pool::lender_supply(ctx, assets, min_shares_out)
+    }
+
+    pub fn lender_redeem(ctx: Context<LenderRedeem>, shares: u64, min_assets_out: u64) -> Result<()> {
+        instructions::lending_pool::lender_redeem(ctx, shares, min_assets_out)
+    }
+
+    pub fn public_refresh_reserve(ctx: Context<PublicRefreshReserve>) -> Result<()> {
+        instructions::lending_pool::public_refresh_reserve(ctx)
+    }
+
+    // -- Account manager: account ----------------------------------------------------------------
 
     pub fn user_create_margin(ctx: Context<UserCreateMargin>) -> Result<()> {
-        instructions::margin::user_create_margin(ctx)
+        instructions::account_manager::user_create_margin(ctx)
     }
 
     pub fn user_close_margin(ctx: Context<UserCloseMargin>) -> Result<()> {
-        instructions::margin::user_close_margin(ctx)
+        instructions::account_manager::user_close_margin(ctx)
     }
 
-    pub fn user_close_collateral_position(ctx: Context<UserCloseCollateralPosition>) -> Result<()> {
-        instructions::margin::user_close_collateral_position(ctx)
-    }
+    // -- Account manager: collateral -------------------------------------------------------------
 
     pub fn user_deposit_collateral(ctx: Context<UserDepositCollateral>, amount: u64) -> Result<()> {
-        instructions::margin::user_deposit_collateral(ctx, amount)
+        instructions::account_manager::user_deposit_collateral(ctx, amount)
     }
 
     pub fn user_withdraw_collateral(
@@ -161,39 +188,29 @@ pub mod vanna_lending {
         amount: u64,
         min_health_factor_wad: u128,
     ) -> Result<()> {
-        instructions::margin::user_withdraw_collateral(ctx, amount, min_health_factor_wad)
+        instructions::account_manager::user_withdraw_collateral(ctx, amount, min_health_factor_wad)
     }
 
-    // -- Lender operations ----------------------------------------------------------
-
-    pub fn lender_supply(ctx: Context<LenderSupply>, assets: u64, min_shares_out: u64) -> Result<()> {
-        instructions::lending::lender_supply(ctx, assets, min_shares_out)
+    pub fn user_close_collateral_position(ctx: Context<UserCloseCollateralPosition>) -> Result<()> {
+        instructions::account_manager::user_close_collateral_position(ctx)
     }
 
-    pub fn lender_redeem(ctx: Context<LenderRedeem>, shares: u64, min_assets_out: u64) -> Result<()> {
-        instructions::lending::lender_redeem(ctx, shares, min_assets_out)
-    }
-
-    pub fn public_refresh_reserve(ctx: Context<PublicRefreshReserve>) -> Result<()> {
-        instructions::lending::public_refresh_reserve(ctx)
-    }
-
-    // -- Borrow and repay -----------------------------------------------------------
+    // -- Account manager: borrow and repay -------------------------------------------------------
 
     pub fn user_open_debt_position(ctx: Context<UserOpenDebtPosition>) -> Result<()> {
-        instructions::borrowing::user_open_debt_position(ctx)
+        instructions::account_manager::user_open_debt_position(ctx)
     }
 
     pub fn user_close_debt_position(ctx: Context<UserCloseDebtPosition>) -> Result<()> {
-        instructions::borrowing::user_close_debt_position(ctx)
+        instructions::account_manager::user_close_debt_position(ctx)
     }
 
     pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128) -> Result<()> {
-        instructions::borrowing::user_borrow(ctx, assets, max_debt_shares)
+        instructions::account_manager::user_borrow(ctx, assets, max_debt_shares)
     }
 
     pub fn user_repay_from_margin(ctx: Context<UserRepayFromMargin>, max_assets: u64, repay_all: bool) -> Result<()> {
-        instructions::borrowing::user_repay_from_margin(ctx, max_assets, repay_all)
+        instructions::account_manager::user_repay_from_margin(ctx, max_assets, repay_all)
     }
 
     pub fn public_repay_from_wallet(
@@ -201,59 +218,23 @@ pub mod vanna_lending {
         max_assets: u64,
         repay_all: bool,
     ) -> Result<()> {
-        instructions::borrowing::public_repay_from_wallet(ctx, max_assets, repay_all)
+        instructions::account_manager::public_repay_from_wallet(ctx, max_assets, repay_all)
     }
 
-    // -- Liquidation ----------------------------------------------------------------
+    // -- Account manager: external calls ---------------------------------------------------------
+
+    pub fn margin_execute<'info>(
+        ctx: Context<'info, MarginExecute<'info>>,
+        data: Vec<u8>,
+        cpi_account_count: u16,
+        min_received: u64,
+    ) -> Result<()> {
+        instructions::account_manager::margin_execute(ctx, data, cpi_account_count, min_received)
+    }
+
+    // -- Account manager: liquidation ------------------------------------------------------------
 
     pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
-        instructions::liquidation::public_liquidate(ctx, max_repay_assets, min_collateral_out)
-    }
-
-    // -- Composite ------------------------------------------------------------------
-
-    pub fn user_deposit_and_borrow(
-        ctx: Context<UserDepositAndBorrow>,
-        deposit_amount: u64,
-        borrow_amount: u64,
-        max_debt_shares: u128,
-    ) -> Result<()> {
-        instructions::composite::user_deposit_and_borrow(ctx, deposit_amount, borrow_amount, max_debt_shares)
-    }
-
-    // -- Lite / Stocks (Kamino) -----------------------------------------------------
-
-    pub fn lite_open(ctx: Context<LiteOpen>, equity: u64, leverage_bps: u64) -> Result<()> {
-        instructions::lite::lite_open(ctx, equity, leverage_bps)
-    }
-
-    pub fn lite_supply(ctx: Context<LiteSupply>, amount: u64, attribute_shares_delta: u128) -> Result<()> {
-        instructions::lite::lite_supply(ctx, amount, attribute_shares_delta)
-    }
-
-    pub fn lite_reduce_redeem(ctx: Context<LiteReduceRedeem>, exit_bps: u16, min_underlying_out: u64) -> Result<()> {
-        instructions::lite::lite_reduce_redeem(ctx, exit_bps, min_underlying_out)
-    }
-
-    pub fn lite_reduce_repay(ctx: Context<LiteReduceRepay>, exit_bps: u16) -> Result<()> {
-        instructions::lite::lite_reduce_repay(ctx, exit_bps)
-    }
-
-    pub fn lite_reduce_and_repay<'info>(
-        ctx: Context<'info, LiteReduceAndRepay<'info>>,
-        exit_bps: u16,
-        min_yield_out: u64,
-        min_stock_out: u64,
-        route_account_count: u16,
-        route_data: Vec<u8>,
-    ) -> Result<()> {
-        instructions::lite::lite_reduce_and_repay(
-            ctx,
-            exit_bps,
-            min_yield_out,
-            min_stock_out,
-            route_account_count,
-            route_data,
-        )
+        instructions::account_manager::public_liquidate(ctx, max_repay_assets, min_collateral_out)
     }
 }

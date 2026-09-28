@@ -1,5 +1,6 @@
 use crate::constants::{BASIS_POINTS, MAX_RATE_COEFF_WAD};
 use crate::errors::VannaError;
+use crate::math::interest::accrue;
 use anchor_lang::prelude::*;
 
 /// Per-reserve status, stored as `Reserve::status`; gates which actions the reserve allows.
@@ -87,6 +88,18 @@ pub struct Reserve {
 }
 
 impl Reserve {
+    /// Brings the pool's debt current to `now`: accrues interest into `total_borrow_assets`, the
+    /// protocol's cut into `accrued_protocol_fees`, and grows `borrow_index_wad`. Every
+    /// instruction that reads or changes pool balances or debt calls this first.
+    pub fn accrue_interest(&mut self, now: i64) -> Result<()> {
+        let accrual = accrue(self, now)?;
+        self.total_borrow_assets = accrual.new_total_borrow_assets;
+        self.accrued_protocol_fees = accrual.new_accrued_protocol_fees;
+        self.borrow_index_wad = accrual.new_borrow_index_wad;
+        self.last_update_timestamp = now;
+        Ok(())
+    }
+
     pub fn validate_rate_config(rate_curve: &RateCurve, reserve_factor_bps: u16) -> Result<()> {
         rate_curve.validate()?;
         require!(reserve_factor_bps as u64 <= BASIS_POINTS, VannaError::InvalidRateModel);

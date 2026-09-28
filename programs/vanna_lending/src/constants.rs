@@ -12,8 +12,8 @@ pub const SHARE_MINT_SEED: &[u8] = b"share_mint";
 pub const MARGIN_SEED: &[u8] = b"margin";
 #[constant]
 pub const DEBT_SEED: &[u8] = b"debt";
-pub const LITE_STRATEGY_SEED: &[u8] = b"lite_strategy";
-pub const LITE_POSITION_SEED: &[u8] = b"lite_position";
+#[constant]
+pub const INTEGRATION_SEED: &[u8] = b"integration";
 
 /// Max active collateral (or debt) assets per margin account; bounds health-check cost.
 /// Changing it changes `MarginAccount`'s layout and requires fresh margin accounts.
@@ -60,7 +60,7 @@ pub mod known_mints {
     pub const OPENAI: &str = "PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF";
 }
 
-/// Kamino xStocks market addresses — reference only; live source of truth is LiteStrategyConfig.
+/// Kamino xStocks market addresses — reference only; the live whitelist is the `Integration` registry.
 pub mod kamino_reference {
     pub const KLEND_PROGRAM: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD";
     pub const XSTOCKS_MARKET: &str = "5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua";
@@ -79,7 +79,7 @@ pub mod kamino_reference {
     }
 }
 
-/// Kamino main market addresses — reference only; the frontend calls these directly.
+/// Kamino main market addresses — reference only.
 /// The USDC reserve is the only one of the four listed by Kamino's API with real liquidity.
 pub mod kamino_main_market {
     pub const MARKET: &str = "7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF";
@@ -96,12 +96,4 @@ pub mod kamino_main_market {
         pub const LIQUIDITY_VAULT: &str = "Bgq7trRgVMeq33yt235zM2onQ4bRDBsY5EWiTetF4qw6";
         pub const COLLATERAL_MINT: &str = "B8V6WVjPxW1UGwVDfxH2d2r8SyT4cqn7dQRK6XneVa7D";
     }
-}
-
-/// Anchor sighash discriminators for hand-rolled Kamino CPIs.
-pub mod kamino_discriminators {
-    /// sha256("global:deposit_reserve_liquidity")[0..8]
-    pub const DEPOSIT_RESERVE_LIQUIDITY: [u8; 8] = [169, 201, 30, 126, 6, 205, 102, 68];
-    /// sha256("global:redeem_reserve_collateral")[0..8]
-    pub const REDEEM_RESERVE_COLLATERAL: [u8; 8] = [234, 117, 181, 125, 185, 142, 220, 29];
 }

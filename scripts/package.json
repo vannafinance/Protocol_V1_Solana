@@ -7,7 +7,7 @@
   "scripts": {
     "postinstall": "patch-package",
     "devnet": "tsx src/devnet.ts",
-    "lite-fork": "tsx src/lite-fork.ts"
+    "integrations-fork": "tsx src/integrations-fork.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

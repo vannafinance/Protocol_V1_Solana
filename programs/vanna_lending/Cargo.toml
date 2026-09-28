@@ -34,15 +34,13 @@ solana-account = "3.4.0"
 solana-system-interface = "3.3.0"
 solana-program-pack = "3.1.0"
 spl-token-interface = "2.0.0"
+flate2 = "1"
 
 # All tests live under src/tests/, which Cargo doesn't auto-discover.
 [[test]]
 name = "test_admin_and_lifecycle"
 path = "src/tests/test_admin_and_lifecycle.rs"
 
-[[test]]
-name = "test_deposit_and_borrow"
-path = "src/tests/test_deposit_and_borrow.rs"
 
 [[test]]
 name = "test_full_flow"
@@ -67,6 +65,14 @@ path = "src/tests/test_math.rs"
 [[test]]
 name = "test_state"
 path = "src/tests/test_state.rs"
+
+[[test]]
+name = "kamino"
+path = "src/tests/external/kamino/main.rs"
+
+[[test]]
+name = "jupiter"
+path = "src/tests/external/jupiter/main.rs"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

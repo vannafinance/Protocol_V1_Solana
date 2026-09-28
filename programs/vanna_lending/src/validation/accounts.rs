@@ -15,6 +15,8 @@ pub enum ProtocolAction {
     Borrow,
     Repay,
     Liquidate,
+    /// A whitelisted external call through `margin_execute`.
+    ExternalCall,
 }
 
 pub fn assert_protocol_action_allowed(mode_byte: u8, action: ProtocolAction) -> Result<()> {
@@ -24,7 +26,10 @@ pub fn assert_protocol_action_allowed(mode_byte: u8, action: ProtocolAction) -> 
     let allowed = match mode {
         Normal => true,
         BorrowPaused => action != Borrow,
-        WithdrawOnly => matches!(action, Repay | Redeem | CollateralWithdraw | Liquidate | CollateralDeposit),
+        WithdrawOnly => matches!(
+            action,
+            Repay | Redeem | CollateralWithdraw | Liquidate | CollateralDeposit | ExternalCall
+        ),
         Halted => matches!(action, Repay | CollateralDeposit),
     };
     require!(allowed, VannaError::ProtocolActionPaused);

@@ -11,3 +11,8 @@ test-ledger
 *.md
 *.lock
 
+
+# Local reference material, not part of this repo
+vanna_soldity/
+programs.zip
+scripts.zip

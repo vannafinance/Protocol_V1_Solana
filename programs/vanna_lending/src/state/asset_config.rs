@@ -1,6 +1,16 @@
 use crate::errors::VannaError;
 use anchor_lang::prelude::*;
 
+/// How an asset's USD value is derived.
+#[derive(AnchorSerialize, AnchorDeserialize, InitSpace, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriceSource {
+    /// value = amount × Pyth price of `price_feed_id`.
+    Pyth,
+    /// Kamino cToken. value = amount × (reserve liquidity / cToken supply) × Pyth price of the
+    /// underlying (`price_feed_id` is the underlying's feed).
+    KaminoReceipt,
+}
+
 /// Token identity, oracle identity, and risk limits for one mint.
 ///
 /// `ltv_bps` and `liquidation_threshold_bps` stay in the layout for compatibility only: V1 health
@@ -23,10 +33,19 @@ pub struct AssetConfig {
     pub collateral_enabled: bool,
     pub borrow_enabled: bool,
     pub bump: u8,
-    pub reserved: [u8; 96],
+    pub price_source: PriceSource,
+    /// The account a non-Pyth source reads (the Kamino reserve); default for `Pyth`.
+    pub price_source_account: Pubkey,
+    /// Program that must own `price_source_account`; default for `Pyth`.
+    pub price_source_program: Pubkey,
+    pub reserved: [u8; 31],
 }
 
 impl AssetConfig {
+    pub fn is_pyth_priced(&self) -> bool {
+        self.price_source == PriceSource::Pyth
+    }
+
     /// Validates the stored risk parameters. LTV and liquidation threshold are not used by V1
     /// health, but are still checked so the stored config stays self-consistent.
     pub fn validate_risk_parameters(

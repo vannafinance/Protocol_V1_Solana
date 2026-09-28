@@ -100,22 +100,18 @@ pub enum VannaError {
     NonEmptyDebtPosition,
     #[msg("Collateral vault still holds a raw token balance")]
     NonEmptyVault,
-    #[msg("Kamino program id is invalid")]
-    InvalidKaminoProgram,
-    #[msg("Kamino market/reserve accounts do not match the registered strategy")]
+    #[msg("Kamino reserve account does not match the registered receipt asset")]
     InvalidKaminoAccounts,
-    #[msg("Lite strategy is disabled")]
-    LiteStrategyDisabled,
-    #[msg("A lite position already exists for this margin account")]
-    LitePositionExists,
-    #[msg("No lite position found for this margin account")]
-    NoLitePosition,
-    #[msg("Leverage is outside the allowed range")]
-    InvalidLeverage,
-    #[msg("Jupiter margin swap route or balance delta is invalid")]
-    InvalidSwapRoute,
-    #[msg("A previous lite_reduce_redeem hasn't been repaid yet by lite_reduce_repay")]
-    PendingLiteRedeem,
-    #[msg("No pending redeem to repay — call lite_reduce_redeem first")]
-    NoPendingLiteRedeem,
+    #[msg("External program integration is disabled")]
+    IntegrationDisabled,
+    #[msg("Adapter does not allow this external instruction")]
+    CallNotAllowed,
+    #[msg("External call accounts do not match the roles the adapter requires")]
+    InvalidCallAccounts,
+    #[msg("External call left a margin vault in an invalid state")]
+    InvalidCallResult,
+    #[msg("Price source account is missing or does not match the asset's registered source")]
+    InvalidPriceSource,
+    #[msg("Asset's price source does not support this action")]
+    UnsupportedPriceSource,
 }

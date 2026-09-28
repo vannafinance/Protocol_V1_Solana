@@ -1,17 +1,10 @@
-pub mod admin;
-pub mod borrowing;
-pub mod composite;
-pub mod lending;
-pub mod lite;
-pub mod liquidation;
-pub mod margin;
-pub mod swap;
+//! Instruction handlers, grouped like the protocol's contracts: `admin` (configuration),
+//! `lending_pool` (supply and redeem), `account_manager` (margin accounts).
 
+pub mod account_manager;
+pub mod admin;
+pub mod lending_pool;
+
+pub use account_manager::*;
 pub use admin::*;
-pub use borrowing::*;
-pub use composite::*;
-pub use lending::*;
-pub use lite::*;
-pub use liquidation::*;
-pub use margin::*;
-pub use swap::*;
+pub use lending_pool::*;

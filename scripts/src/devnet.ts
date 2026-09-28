@@ -11,7 +11,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { PublicKey, SystemProgram } from "@solana/web3.js";
-import { ata, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
+import { ata, OMITTED_ACCOUNT, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
 import {
   AssetKey,
   ASSET_DECIMALS,
@@ -41,8 +41,9 @@ import {
   utilizationWad,
   WAD,
 } from "./devnet-math";
-import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetIndexMap } from "./devnet-positions";
+import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetIndexMap, PositionKey } from "./devnet-positions";
 import { fetchLivePrice, refreshPrice } from "./devnet-pyth";
+import { receiptUnderlying } from "./kamino";
 import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
 
 const U128_MAX = new anchor.BN("340282366920938463463374607431768211455");
@@ -69,7 +70,7 @@ interface Ctx {
 /** Refreshes real Pyth prices for every registered asset — needed by any instruction that scans
  * every active position on a margin account (borrow, withdraw-collateral, liquidate). */
 async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
-  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai (including Kamino collateral)");
+  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai (Kamino cTokens use their underlying's)");
   return {
     usdc: await refreshPrice(ctx.conn, ctx.anchorWallet, "usdc"),
     wsol: await refreshPrice(ctx.conn, ctx.anchorWallet, "wsol"),
@@ -137,17 +138,21 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
   const byIndex = new Map<number, AssetIndexInfo>();
   for (const info of Object.values(indexMap)) byIndex.set(info.index, info);
 
-  const collateralBreakdown: Array<{ asset: AssetKey; amountRaw: bigint; valueUsd: bigint; ltvBps: number; liquidationThresholdBps: number }> = [];
+  const collateralBreakdown: Array<{ asset: PositionKey; decimals: number; amountRaw: bigint; valueUsd: bigint; ltvBps: number; liquidationThresholdBps: number }> = [];
   for (const idx of marginAcc.collateralAssetIndexes as number[]) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = byIndex.get(idx);
     if (!info) continue;
-    const vaultBalance: bigint = await tokenBalance(conn, ata(margin, info.mint)).catch(() => 0n);
-    const livePrice = await fetchLivePrice(info.key);
+    const vaultBalance: bigint = await tokenBalance(conn, ata(margin, info.mint, info.tokenProgram)).catch(() => 0n);
+    const livePrice = await fetchLivePrice(info.priceKey);
     const assetConfigAcc = await fetchAccount(program, "assetConfig", info.assetConfig);
-    const valueUsd = normalizeTokenValue(vaultBalance, livePrice.price, livePrice.exponent, ASSET_DECIMALS[info.key], false);
+    // A Kamino cToken is valued as the underlying it redeems for, at the underlying's decimals.
+    const pricedAmount = info.receipt ? await receiptUnderlying(conn, info.receipt, vaultBalance) : vaultBalance;
+    const pricedDecimals = info.receipt ? ASSET_DECIMALS[info.priceKey] : info.decimals;
+    const valueUsd = normalizeTokenValue(pricedAmount, livePrice.price, livePrice.exponent, pricedDecimals, false);
     collateralBreakdown.push({
       asset: info.key,
+      decimals: info.decimals,
       amountRaw: vaultBalance,
       valueUsd,
       ltvBps: assetConfigAcc.ltvBps,
@@ -155,7 +160,7 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
     });
   }
 
-  const debtBreakdown: Array<{ asset: AssetKey; amountRaw: bigint; valueUsd: bigint }> = [];
+  const debtBreakdown: Array<{ asset: PositionKey; decimals: number; amountRaw: bigint; valueUsd: bigint }> = [];
   for (const idx of marginAcc.debtAssetIndexes as number[]) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = byIndex.get(idx);
@@ -166,9 +171,9 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
     const debtAcc = await fetchAccount(program, "debtPosition", debtPosition);
     const live = liveAccrual(reserveAcc);
     const currentDebtRaw = debtSharesToAssetsUp(toBigInt(debtAcc.borrowShares), toBigInt(reserveAcc.totalBorrowShares), live.newTotalBorrowAssets);
-    const livePrice = await fetchLivePrice(info.key);
-    const valueUsd = normalizeTokenValue(currentDebtRaw, livePrice.price, livePrice.exponent, ASSET_DECIMALS[info.key], true);
-    debtBreakdown.push({ asset: info.key, amountRaw: currentDebtRaw, valueUsd });
+    const livePrice = await fetchLivePrice(info.priceKey);
+    const valueUsd = normalizeTokenValue(currentDebtRaw, livePrice.price, livePrice.exponent, info.decimals, true);
+    debtBreakdown.push({ asset: info.key, decimals: info.decimals, amountRaw: currentDebtRaw, valueUsd });
   }
 
   const collaterals = collateralBreakdown.map((c) => ({ collateralValue: c.valueUsd }));
@@ -489,6 +494,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         priceUpdate: priceAccounts[asset],
         destinationTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
+        priceSourceAccount: OMITTED_ACCOUNT, // plain assets are Pyth-priced
         tokenProgram: tp,
       })
       .remainingAccounts(remainingAccounts)
@@ -686,6 +692,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         collateralMint,
         liquidatorCollateralDestination: ata(wallet.publicKey, collateralMint),
         collateralMarginVault: ata(margin, collateralMint),
+        collateralPriceSource: OMITTED_ACCOUNT, // plain assets are Pyth-priced
         tokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
@@ -908,12 +915,12 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
           owner: owner.toBase58(),
           collateral: collateralBreakdown.map((c) => ({
             asset: c.asset,
-            amount: formatTokenAmount(c.amountRaw, ASSET_DECIMALS[c.asset]),
+            amount: formatTokenAmount(c.amountRaw, c.decimals),
             valueUsd: formatUsd(c.valueUsd),
           })),
           debt: debtBreakdown.map((d) => ({
             asset: d.asset,
-            amount: formatTokenAmount(d.amountRaw, ASSET_DECIMALS[d.asset]),
+            amount: formatTokenAmount(d.amountRaw, d.decimals),
             valueUsd: formatUsd(d.valueUsd),
           })),
           borrowPower: formatUsd(health.borrowPower),

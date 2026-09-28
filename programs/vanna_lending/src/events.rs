@@ -1,3 +1,5 @@
+use crate::adapters::AdapterKind;
+use crate::state::asset_config::PriceSource;
 use crate::state::reserve::RateCurve;
 use anchor_lang::prelude::*;
 
@@ -210,48 +212,39 @@ pub struct Liquidated {
 }
 
 #[event]
-pub struct LiteStrategyRegistered {
-    pub strategy_config: Pubkey,
-    pub underlying_mint: Pubkey,
-    pub kamino_reserve: Pubkey,
+pub struct IntegrationRegistered {
+    pub integration: Pubkey,
+    pub program_id: Pubkey,
+    pub adapter: AdapterKind,
     pub timestamp: i64,
 }
 
 #[event]
-pub struct LiteOpened {
+pub struct IntegrationStatusUpdated {
+    pub integration: Pubkey,
+    pub enabled: bool,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct AssetPriceSourceUpdated {
+    pub asset_config: Pubkey,
+    pub price_source: PriceSource,
+    pub source_account: Pubkey,
+    pub source_program: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct MarginExecuted {
     pub margin_account: Pubkey,
-    pub strategy_config: Pubkey,
-    pub equity: u64,
-    pub borrowed: u64,
-    pub deposited: u64,
-    pub kamino_collateral: u64,
-    pub debt_shares: u128,
+    pub program_id: Pubkey,
+    pub adapter: AdapterKind,
+    pub spent_mint: Pubkey,
+    pub received_mint: Pubkey,
+    pub amount_spent: u64,
+    pub amount_received: u64,
     pub borrow_health_factor_wad: u128,
-    pub event_sequence: u64,
-    pub timestamp: i64,
-}
-
-#[event]
-pub struct LiteClosed {
-    pub margin_account: Pubkey,
-    pub strategy_config: Pubkey,
-    pub redeemed: u64,
-    pub debt_repaid: u64,
-    pub residual: u64,
-    pub debt_shares_burned: u128,
-    pub event_sequence: u64,
-    pub timestamp: i64,
-}
-
-/// Cross-asset unwind of a `lite_supply` position: redeem from Kamino, swap into a different
-/// mint, repay that mint's debt — all atomically. See `lite_reduce_and_repay`.
-#[event]
-pub struct LiteReducedAndRepaid {
-    pub margin_account: Pubkey,
-    pub strategy_config: Pubkey,
-    pub redeemed: u64,
-    pub swapped_out: u64,
-    pub debt_repaid: u64,
     pub event_sequence: u64,
     pub timestamp: i64,
 }

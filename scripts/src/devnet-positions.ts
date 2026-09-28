@@ -1,59 +1,89 @@
 import * as anchor from "@coral-xyz/anchor";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { AccountMeta, PublicKey } from "@solana/web3.js";
 import { ata } from "./devnet-cli";
-import { AssetKey, ASSET_MINTS, tokenProgramFor } from "./devnet-env";
+import { AssetKey, ASSET_DECIMALS, ASSET_MINTS, tokenProgramFor } from "./devnet-env";
+import { CTOKEN_DECIMALS, KAMINO_RECEIPTS, KaminoReceipt, ReceiptKey } from "./kamino";
 import { assetConfigPda, debtPositionPda, reservePda } from "./pda";
 
 /** Sentinel for an empty slot in `MarginAccount.collateral_asset_indexes`/`debt_asset_indexes`. */
 export const EMPTY_ASSET_INDEX = 65535;
 
+/** A plain asset or a Kamino cToken. */
+export type PositionKey = AssetKey | ReceiptKey;
+
 export interface AssetIndexInfo {
-  key: AssetKey;
+  key: PositionKey;
+  /** Asset whose Pyth price values this position (a cToken's underlying). */
+  priceKey: AssetKey;
   index: number;
   mint: PublicKey;
   assetConfig: PublicKey;
+  tokenProgram: PublicKey;
+  /** Decimals of `mint` itself (6 for every klend cToken). */
+  decimals: number;
+  /** Set for a Kamino cToken: its reserve is the asset's price-source account. */
+  receipt: KaminoReceipt | null;
+}
+
+function positionAssets(): Omit<AssetIndexInfo, "index" | "assetConfig">[] {
+  const plain = (Object.keys(ASSET_MINTS) as AssetKey[]).map((key) => ({
+    key,
+    priceKey: key,
+    mint: ASSET_MINTS[key],
+    tokenProgram: tokenProgramFor(key),
+    decimals: ASSET_DECIMALS[key],
+    receipt: null,
+  }));
+  const receipts = (Object.keys(KAMINO_RECEIPTS) as ReceiptKey[]).map((key) => {
+    const receipt = KAMINO_RECEIPTS[key];
+    return {
+      key,
+      priceKey: receipt.underlying,
+      mint: receipt.collateralMint,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      decimals: CTOKEN_DECIMALS,
+      receipt,
+    };
+  });
+  return [...plain, ...receipts];
 }
 
 /**
- * Fetches registered `AssetConfig`s and maps `asset_index -> {key, mint, assetConfig}`. Uses
- * `fetchNullable` because not every fork registers every `ASSET_MINTS` entry; a hard `fetch` would
- * break every borrow/withdraw/liquidate command, even ones that never touch the missing asset.
+ * Maps every registered asset (plain and Kamino cToken) by key. Uses `fetchNullable` because not
+ * every fork registers every asset; a hard `fetch` would break every risk-checked command.
  */
-export async function getAssetIndexMap(program: anchor.Program): Promise<Record<AssetKey, AssetIndexInfo>> {
+export async function getAssetIndexMap(program: anchor.Program): Promise<Partial<Record<PositionKey, AssetIndexInfo>>> {
   const entries = await Promise.all(
-    (Object.keys(ASSET_MINTS) as AssetKey[]).map(async (key) => {
-      const mint = ASSET_MINTS[key];
-      const [assetConfigAddress] = assetConfigPda(mint);
+    positionAssets().map(async (asset) => {
+      const [assetConfig] = assetConfigPda(asset.mint);
       const account = await (
         program.account as Record<string, { fetchNullable(a: PublicKey): Promise<{ assetIndex: number } | null> }>
-      ).assetConfig.fetchNullable(assetConfigAddress);
+      ).assetConfig.fetchNullable(assetConfig);
       if (!account) return null;
-      return [key, { key, index: account.assetIndex, mint, assetConfig: assetConfigAddress }] as const;
+      return [asset.key, { ...asset, index: account.assetIndex, assetConfig }] as const;
     }),
   );
-  return Object.fromEntries(entries.filter((e): e is NonNullable<typeof e> => e !== null)) as Record<AssetKey, AssetIndexInfo>;
+  return Object.fromEntries(entries.filter((e): e is NonNullable<typeof e> => e !== null));
 }
 
 interface MarginAccountData {
-  reserved: number[];
   collateralAssetIndexes: number[];
   debtAssetIndexes: number[];
 }
 
 /**
- * Builds the `remaining_accounts` list required by `user_borrow`, `user_withdraw_collateral`, and
- * `public_liquidate` — every currently active collateral/debt position on the margin account,
- * other than the one(s) already passed as named accounts, in the exact order
- * `validation/positions.rs::scan_and_validate_positions` expects (collateral groups, then debt
- * groups, then Kamino lite positions). `priceAccounts` must hold a fresh price for every asset
- * that can appear here.
+ * Builds the health-check `remaining_accounts`: every active position except the named ones, in
+ * `risk_engine.rs::scan_and_validate_positions` order. Collateral groups are
+ * `[asset_config, margin_vault, price]`, plus the Kamino reserve for a cToken; debt groups are
+ * `[asset_config, reserve, debt_position, price]`. `priceAccounts` must hold a fresh price for
+ * every asset (a cToken uses its underlying's).
  */
 export async function buildRemainingAccounts(
   program: anchor.Program,
   margin: PublicKey,
   priceAccounts: Record<AssetKey, PublicKey>,
-  opts: { excludeCollateral?: AssetKey; excludeDebt?: AssetKey } = {},
+  opts: { excludeCollateral?: PositionKey | PositionKey[]; excludeDebt?: AssetKey } = {},
 ): Promise<AccountMeta[]> {
   const marginAccount = (await (
     program.account as Record<string, { fetch(a: PublicKey): Promise<MarginAccountData> }>
@@ -61,18 +91,16 @@ export async function buildRemainingAccounts(
   const indexMap = await getAssetIndexMap(program);
   const byIndex = new Map<number, AssetIndexInfo>();
   for (const info of Object.values(indexMap)) byIndex.set(info.index, info);
+  const excluded = ([] as PositionKey[]).concat(opts.excludeCollateral ?? []);
+  const meta = (pubkey: PublicKey) => ({ pubkey, isWritable: false, isSigner: false });
 
   const metas: AccountMeta[] = [];
-
   for (const idx of marginAccount.collateralAssetIndexes) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = byIndex.get(idx);
-    if (!info || info.key === opts.excludeCollateral) continue;
-    metas.push(
-      { pubkey: info.assetConfig, isWritable: false, isSigner: false },
-      { pubkey: ata(margin, info.mint, tokenProgramFor(info.key)), isWritable: false, isSigner: false },
-      { pubkey: priceAccounts[info.key], isWritable: false, isSigner: false },
-    );
+    if (!info || excluded.includes(info.key)) continue;
+    metas.push(meta(info.assetConfig), meta(ata(margin, info.mint, info.tokenProgram)), meta(priceAccounts[info.priceKey]));
+    if (info.receipt) metas.push(meta(info.receipt.reserve));
   }
 
   for (const idx of marginAccount.debtAssetIndexes) {
@@ -81,40 +109,7 @@ export async function buildRemainingAccounts(
     if (!info || info.key === opts.excludeDebt) continue;
     const [reserve] = reservePda(info.mint);
     const [debtPosition] = debtPositionPda(margin, reserve);
-    metas.push(
-      { pubkey: info.assetConfig, isWritable: false, isSigner: false },
-      { pubkey: reserve, isWritable: false, isSigner: false },
-      { pubkey: debtPosition, isWritable: false, isSigner: false },
-      { pubkey: priceAccounts[info.key], isWritable: false, isSigner: false },
-    );
-  }
-
-  // Kamino lite-position registry packed into `MarginAccount.reserved`: a count byte followed by
-  // little-endian u16 asset indexes (see `MarginAccount::lite_indexes`). The legacy PDA (empty
-  // seed) is always scanned, then one PDA per registered index.
-  const registry = Buffer.from(marginAccount.reserved);
-  const count = registry[0];
-  if (count > 8) throw new Error("Invalid Kamino position registry");
-  const seeds = [Buffer.alloc(0), ...Array.from({ length: count }, (_, i) => registry.subarray(1 + i * 2, 3 + i * 2))];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const accounts = program.account as any;
-  for (const seed of seeds) {
-    const [position] = PublicKey.findProgramAddressSync([Buffer.from("lite_position"), margin.toBuffer(), seed], program.programId);
-    metas.push({ pubkey: position, isWritable: false, isSigner: false });
-    const lite = await accounts.litePosition.fetchNullable(position);
-    if (!lite) continue;
-    const strategy = await accounts.liteStrategyConfig.fetch(lite.strategyConfig);
-    const item = Object.values(indexMap).find((i) => i.mint.equals(lite.underlyingMint));
-    if (!item || !priceAccounts[item.key]) throw new Error("Missing price/config for Kamino collateral");
-    metas.push(
-      ...[
-        lite.strategyConfig,
-        item.assetConfig,
-        getAssociatedTokenAddressSync(strategy.reserveCollateralMint, margin, true, strategy.collateralTokenProgram),
-        strategy.kaminoReserve,
-        priceAccounts[item.key],
-      ].map((pubkey) => ({ pubkey, isWritable: false, isSigner: false })),
-    );
+    metas.push(meta(info.assetConfig), meta(reserve), meta(debtPosition), meta(priceAccounts[info.priceKey]));
   }
   return metas;
 }

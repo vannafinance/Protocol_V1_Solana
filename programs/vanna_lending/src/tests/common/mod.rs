@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+pub mod jupiter;
+pub mod kamino;
+pub mod mainnet;
+
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::clock::Clock;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
@@ -16,9 +20,11 @@ use solana_signer::Signer as SvmSigner;
 use solana_system_interface::instruction::create_account;
 use solana_transaction::versioned::VersionedTransaction;
 use vanna_lending::constants::*;
-use vanna_lending::state::{AssetConfig, ProtocolConfig, Reserve};
+use vanna_lending::state::{AssetConfig, DebtPosition, Integration, MarginAccount, ProtocolConfig, Reserve};
 
 pub use anchor_spl::associated_token::get_associated_token_address;
+pub use vanna_lending::adapters::AdapterKind;
+pub use vanna_lending::state::asset_config::PriceSource;
 pub use vanna_lending::state::reserve::RateCurve;
 
 // ---------------------------------------------------------------------------
@@ -210,9 +216,8 @@ pub fn debt_position_pda(margin: &Pubkey, reserve: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[DEBT_SEED, margin.as_ref(), reserve.as_ref()], &vanna_lending::ID)
 }
 
-/// The margin's base lite-position PDA, which risk-checked instructions take as a trailing account.
-pub fn lite_position_pda(margin: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[LITE_POSITION_SEED, margin.as_ref()], &vanna_lending::ID).0
+pub fn integration_pda(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[INTEGRATION_SEED, program_id.as_ref()], &vanna_lending::ID).0
 }
 
 // ---------------------------------------------------------------------------
@@ -645,7 +650,6 @@ pub fn ix_user_borrow(
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -686,6 +690,21 @@ pub fn ix_user_withdraw_collateral(
     min_health_factor_wad: u128,
     remaining: &[AccountMeta],
 ) -> Instruction {
+    ix_user_withdraw_collateral_priced(authority, margin, mint, price_update, None, amount, min_health_factor_wad, remaining)
+}
+
+/// Withdraw of an asset with a non-Pyth price source (e.g. a Kamino cToken and its reserve).
+#[allow(clippy::too_many_arguments)]
+pub fn ix_user_withdraw_collateral_priced(
+    authority: &Pubkey,
+    margin: &Pubkey,
+    mint: &Pubkey,
+    price_update: &Pubkey,
+    price_source_account: Option<Pubkey>,
+    amount: u64,
+    min_health_factor_wad: u128,
+    remaining: &[AccountMeta],
+) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
     let (asset_config, _) = asset_config_pda(mint);
     let margin_vault = margin_vault_ata(margin, mint);
@@ -699,11 +718,11 @@ pub fn ix_user_withdraw_collateral(
         price_update: *price_update,
         destination_token_account,
         margin_vault,
+        price_source_account,
         token_program: anchor_spl::token::ID,
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -719,6 +738,34 @@ pub fn ix_public_liquidate(
     debt_price_update: &Pubkey,
     collateral_mint: &Pubkey,
     collateral_price_update: &Pubkey,
+    max_repay_assets: u64,
+    min_collateral_out: u64,
+    remaining: &[AccountMeta],
+) -> Instruction {
+    ix_public_liquidate_priced(
+        liquidator,
+        margin,
+        debt_mint,
+        debt_price_update,
+        collateral_mint,
+        collateral_price_update,
+        None,
+        max_repay_assets,
+        min_collateral_out,
+        remaining,
+    )
+}
+
+/// Liquidation seizing collateral with a non-Pyth price source (e.g. a Kamino cToken).
+#[allow(clippy::too_many_arguments)]
+pub fn ix_public_liquidate_priced(
+    liquidator: &Pubkey,
+    margin: &Pubkey,
+    debt_mint: &Pubkey,
+    debt_price_update: &Pubkey,
+    collateral_mint: &Pubkey,
+    collateral_price_update: &Pubkey,
+    collateral_price_source: Option<Pubkey>,
     max_repay_assets: u64,
     min_collateral_out: u64,
     remaining: &[AccountMeta],
@@ -746,13 +793,13 @@ pub fn ix_public_liquidate(
         collateral_mint: *collateral_mint,
         liquidator_collateral_destination,
         collateral_margin_vault,
+        collateral_price_source,
         token_program: anchor_spl::token::ID,
         associated_token_program: anchor_spl::associated_token::ID,
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(lite_position_pda(margin), false));
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
@@ -760,55 +807,112 @@ pub fn ix_public_liquidate(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn ix_user_deposit_and_borrow(
-    authority: &Pubkey,
-    deposit_mint: &Pubkey,
-    deposit_price_update: &Pubkey,
-    borrow_mint: &Pubkey,
-    borrow_price_update: &Pubkey,
-    deposit_amount: u64,
-    borrow_amount: u64,
-    max_debt_shares: u128,
-    remaining: &[AccountMeta],
+// ---------------------------------------------------------------------------
+// External integrations
+// ---------------------------------------------------------------------------
+
+pub fn ix_admin_register_integration(admin: &Pubkey, payer: &Pubkey, target_program: &Pubkey, adapter: AdapterKind) -> Instruction {
+    let (protocol_config, _) = protocol_config_pda();
+    Instruction {
+        program_id: vanna_lending::ID,
+        accounts: vanna_lending::accounts::AdminRegisterIntegration {
+            admin: *admin,
+            payer: *payer,
+            protocol_config,
+            target_program: *target_program,
+            integration: integration_pda(target_program),
+            system_program: anchor_lang::system_program::ID,
+        }
+        .to_account_metas(None),
+        data: vanna_lending::instruction::AdminRegisterIntegration { adapter }.data(),
+    }
+}
+
+pub fn ix_admin_set_integration_enabled(admin: &Pubkey, target_program: &Pubkey, enabled: bool) -> Instruction {
+    let (protocol_config, _) = protocol_config_pda();
+    Instruction {
+        program_id: vanna_lending::ID,
+        accounts: vanna_lending::accounts::AdminSetIntegrationEnabled {
+            admin: *admin,
+            protocol_config,
+            integration: integration_pda(target_program),
+        }
+        .to_account_metas(None),
+        data: vanna_lending::instruction::AdminSetIntegrationEnabled { enabled }.data(),
+    }
+}
+
+/// `source_account` / `underlying_mint` are the receipt's Kamino reserve and underlying asset.
+pub fn ix_admin_set_asset_price_source(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    price_source: PriceSource,
+    source_account: Option<Pubkey>,
+    underlying_mint: Option<Pubkey>,
+    source_program: Pubkey,
 ) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
-    let (margin_account, _) = margin_pda(authority);
-    let (deposit_asset_config, _) = asset_config_pda(deposit_mint);
-    let deposit_source_token_account = get_associated_token_address(authority, deposit_mint);
-    let deposit_margin_vault = margin_vault_ata(&margin_account, deposit_mint);
-    let (borrow_asset_config, _) = asset_config_pda(borrow_mint);
-    let (borrow_reserve, _) = reserve_pda(borrow_mint);
-    let (debt_position, _) = debt_position_pda(&margin_account, &borrow_reserve);
-    let borrow_reserve_vault = get_associated_token_address(&borrow_reserve, borrow_mint);
-    let borrow_margin_vault = margin_vault_ata(&margin_account, borrow_mint);
-    let mut accounts = vanna_lending::accounts::UserDepositAndBorrow {
+    Instruction {
+        program_id: vanna_lending::ID,
+        accounts: vanna_lending::accounts::AdminSetAssetPriceSource {
+            admin: *admin,
+            protocol_config,
+            asset_config: asset_config_pda(mint).0,
+            source_account,
+            underlying_asset_config: underlying_mint.map(|m| asset_config_pda(&m).0),
+        }
+        .to_account_metas(None),
+        data: vanna_lending::instruction::AdminSetAssetPriceSource { price_source, source_program }.data(),
+    }
+}
+
+/// `margin_execute`: `cpi_accounts` in the external program's order, then `health` accounts.
+#[allow(clippy::too_many_arguments)]
+pub fn ix_margin_execute(
+    authority: &Pubkey,
+    target_program: &Pubkey,
+    spent_mint: &Pubkey,
+    spent_price_update: &Pubkey,
+    received_mint: &Pubkey,
+    received_price_update: &Pubkey,
+    data: Vec<u8>,
+    cpi_accounts: &[AccountMeta],
+    health: &[AccountMeta],
+    min_received: u64,
+) -> Instruction {
+    let (protocol_config, _) = protocol_config_pda();
+    let (margin, _) = margin_pda(authority);
+    let mut accounts = vanna_lending::accounts::MarginExecute {
         authority: *authority,
         protocol_config,
-        margin_account,
-        deposit_asset_config,
-        deposit_mint: *deposit_mint,
-        deposit_price_update: *deposit_price_update,
-        deposit_source_token_account,
-        deposit_margin_vault,
-        borrow_asset_config,
-        borrow_reserve,
-        debt_position,
-        borrow_price_update: *borrow_price_update,
-        borrow_mint: *borrow_mint,
-        borrow_reserve_vault,
-        borrow_margin_vault,
-        token_program: anchor_spl::token::ID,
+        margin_account: margin,
+        integration: integration_pda(target_program),
+        target_program: *target_program,
+        spent_asset: asset_config_pda(spent_mint).0,
+        spent_mint: *spent_mint,
+        spent_vault: margin_vault_ata(&margin, spent_mint),
+        spent_price_update: *spent_price_update,
+        received_asset: asset_config_pda(received_mint).0,
+        received_mint: *received_mint,
+        received_vault: margin_vault_ata(&margin, received_mint),
+        received_price_update: *received_price_update,
+        spent_token_program: anchor_spl::token::ID,
+        received_token_program: anchor_spl::token::ID,
         associated_token_program: anchor_spl::associated_token::ID,
         system_program: anchor_lang::system_program::ID,
     }
     .to_account_metas(None);
-    accounts.extend_from_slice(remaining);
-    accounts.push(AccountMeta::new_readonly(lite_position_pda(&margin_account), false));
+    accounts.extend_from_slice(cpi_accounts);
+    accounts.extend_from_slice(health);
     Instruction {
         program_id: vanna_lending::ID,
         accounts,
-        data: vanna_lending::instruction::UserDepositAndBorrow { deposit_amount, borrow_amount, max_debt_shares }.data(),
+        data: vanna_lending::instruction::MarginExecute {
+            data,
+            cpi_account_count: cpi_accounts.len() as u16,
+            min_received,
+        }
+        .data(),
     }
 }
 
@@ -816,7 +920,8 @@ pub fn ix_user_deposit_and_borrow(
 // remaining_accounts builders
 // ---------------------------------------------------------------------------
 
-/// One collateral group: `AssetConfig`, margin vault, `PriceUpdateV2` (all read-only).
+/// One collateral group: `AssetConfig`, margin vault, `PriceUpdateV2` (all read-only). A
+/// non-Pyth asset adds its price-source account; see [`collateral_group_with_source`].
 pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {
     let (asset_config, _) = asset_config_pda(mint);
     let margin_vault = margin_vault_ata(margin, mint);
@@ -825,6 +930,13 @@ pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pub
         AccountMeta::new_readonly(margin_vault, false),
         AccountMeta::new_readonly(*price_update, false),
     ]
+}
+
+/// Collateral group for an asset whose price source reads `source` (e.g. a Kamino reserve).
+pub fn collateral_group_with_source(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey, source: &Pubkey) -> Vec<AccountMeta> {
+    let mut metas = collateral_group_metas(mint, margin, price_update);
+    metas.push(AccountMeta::new_readonly(*source, false));
+    metas
 }
 
 /// One debt group: `AssetConfig`, `Reserve`, `DebtPosition`, `PriceUpdateV2` (all read-only).
@@ -859,4 +971,16 @@ pub fn fetch_asset_config(svm: &LiteSVM, mint: &Pubkey) -> AssetConfig {
 
 pub fn fetch_reserve(svm: &LiteSVM, mint: &Pubkey) -> Reserve {
     fetch(svm, &reserve_pda(mint).0)
+}
+
+pub fn fetch_integration(svm: &LiteSVM, program_id: &Pubkey) -> Integration {
+    fetch(svm, &integration_pda(program_id))
+}
+
+pub fn fetch_margin(svm: &LiteSVM, authority: &Pubkey) -> MarginAccount {
+    fetch(svm, &margin_pda(authority).0)
+}
+
+pub fn fetch_debt_position(svm: &LiteSVM, margin: &Pubkey, mint: &Pubkey) -> DebtPosition {
+    fetch(svm, &debt_position_pda(margin, &reserve_pda(mint).0).0)
 }
