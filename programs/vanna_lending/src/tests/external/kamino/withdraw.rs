@@ -19,8 +19,7 @@ fn wallet_balance(env: &Env, owner: &Pubkey, mint: &Pubkey) -> u64 {
 fn withdraw_all(env: &mut Env, user: &Keypair, mint: &Pubkey, health: &[AccountMeta]) -> u64 {
     let margin = margin_pda(&user.pubkey()).0;
     let amount = env.balance(&margin, mint);
-    let price = if *mint == NATIVE_MINT { env.sol_price } else { env.usdc_price };
-    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, mint, &price, amount, 0, health);
+    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, mint, amount, 0, &env.health(health));
     send(&mut env.svm, user, &[ix], &[]).expect("withdraw to wallet");
     amount
 }
@@ -99,15 +98,11 @@ fn withdraw_from_kamino_in_steps() {
         let received = env.balance(&margin, &MAINNET_USDC) - usdc_before;
         assert!(received.abs_diff(expected) <= 1, "step {step}: redeemed {received}, expected {expected}");
 
-        // Until the last redeem the cUSDC position is open, so every withdrawal must show it.
+        // The cUSDC position stays open until the last redeem. Without debt, a withdrawal reads
+        // no positions or prices (Solidity: `if hasNoDebt return true`).
         let last = step == 2;
         assert_eq!(env.is_active(&user, &USDC_RESERVE.collateral_mint), !last);
-        let open = if last { Vec::new() } else { env.receipt_group(&margin, &USDC_RESERVE) };
-        if !last {
-            let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &MAINNET_USDC, &env.usdc_price, received, 0, &[]);
-            assert_vanna_error(send(&mut env.svm, &user, &[ix], &[]), VannaError::IncompletePositionAccounts);
-        }
-        wallet += withdraw_all(&mut env, &user, &MAINNET_USDC, &open);
+        wallet += withdraw_all(&mut env, &user, &MAINNET_USDC, &[]);
         assert_eq!(wallet_balance(&env, &user.pubkey(), &MAINNET_USDC), wallet);
     }
     assert_eq!(env.balance(&margin, &USDC_RESERVE.collateral_mint), 0);
@@ -124,11 +119,9 @@ fn ctokens_can_be_withdrawn_and_redeemed_at_kamino_directly() {
     let receipts = env.balance(&margin, &USDC_RESERVE.collateral_mint);
 
     let wallet_cusdc = set_token_balance(&mut env.svm, &user.pubkey(), &USDC_RESERVE.collateral_mint, 0);
-    let withdraw = |source| {
-        ix_user_withdraw_collateral_priced(&user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, &env.usdc_price, source, receipts, 0, &[])
-    };
-    assert_vanna_error(send(&mut env.svm, &user, &[withdraw(None)], &[]), VannaError::InvalidPriceSource);
-    send(&mut env.svm, &user, &[withdraw(Some(USDC_RESERVE.reserve))], &[]).expect("withdraw cUSDC to the wallet");
+    // Debt-free: the withdrawal needs neither the receipt's reserve nor any price.
+    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, receipts, 0, &[]);
+    send(&mut env.svm, &user, &[ix], &[]).expect("withdraw cUSDC to the wallet");
     assert_eq!(token_balance(&env.svm, &wallet_cusdc), receipts);
     assert!(!env.is_active(&user, &USDC_RESERVE.collateral_mint));
 
@@ -151,17 +144,15 @@ fn leveraged_position_exits_kamino_repays_and_closes() {
     let (user, margin) = env.user_with_collateral(MAINNET_USDC, 1_000 * USDC);
     env.open_usdc_debt(&user);
     env.borrow_usdc(&user, 1_000 * USDC, &[]).unwrap();
-    let debt = debt_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
+    let debt = debt_group_metas(&MAINNET_USDC, &margin);
     env.supply(&user, &USDC_RESERVE, 1_500 * USDC, 1, &debt).unwrap();
     let receipts = env.balance(&margin, &USDC_RESERVE.collateral_mint);
 
     // Taking the cUSDC out would leave $500 against $1,000 of debt.
-    let usdc_group = collateral_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
+    let usdc_group = collateral_group_metas(&MAINNET_USDC, &margin);
     let health: Vec<_> = usdc_group.iter().chain(debt.iter()).cloned().collect();
     set_token_balance(&mut env.svm, &user.pubkey(), &USDC_RESERVE.collateral_mint, 0);
-    let ix = ix_user_withdraw_collateral_priced(
-        &user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, &env.usdc_price, Some(USDC_RESERVE.reserve), receipts, 0, &health,
-    );
+    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, receipts, 0, &env.health(&health));
     assert_vanna_error(send(&mut env.svm, &user, &[ix], &[]), VannaError::HealthFactorTooLow);
     // Nor can the debt position or the margin be closed while the debt is open.
     let close_debt = ix_user_close_debt_position(&user.pubkey(), &margin, &MAINNET_USDC);

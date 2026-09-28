@@ -25,22 +25,20 @@ import { ata, optionalArg, parseArgs, requireArg, toBaseUnits } from "./devnet-c
 import {
   ASSET_DECIMALS,
   ASSET_MINTS,
-  ASSET_PRICING,
   AssetKey,
   DEVNET_RPC_URL,
   assetKeyFromString,
   devnetConnection,
-  feedIdToBytes,
   loadKeypair,
   log,
+  oracleAccountsFor,
+  oracleConfigArg,
   programAs,
-  priceSourceAccountFor,
-  PYTH_FEED_IDS,
   tokenProgramFor,
 } from "./devnet-env";
 import { buildRemainingAccounts } from "./devnet-positions";
 import { JUPITER, jupiterRouteForMargin } from "./jupiter";
-import { refreshPrice } from "./devnet-pyth";
+import { oracleMetas, refreshOraclesOnFork } from "./oracle";
 import {
   CTOKEN_DECIMALS,
   KAMINO_RECEIPTS,
@@ -148,11 +146,11 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
   },
 
   /**
-   * Registers a Kamino cToken as collateral priced by its reserve's rate × the underlying price.
-   * Order matters: register disabled, attach the price source, then enable, so the cToken is never
-   * live as collateral under plain Pyth pricing.
+   * Registers a Kamino cToken as collateral priced as its underlying (same oracle) through its
+   * reserve's exchange rate. The program checks the reserve, its cToken mint, and that the
+   * underlying's registered oracle is the one given, so the underlying's `AssetConfig` is passed.
    */
-  "register-receipt": async ({ args, wallet, program }) => {
+  "register-receipt": async ({ args, wallet, program, conn }) => {
     const key = receiptKeyFromString(requireArg(args, "symbol"));
     const receipt = KAMINO_RECEIPTS[key];
     const [protocolConfig] = protocolConfigPda();
@@ -161,17 +159,12 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
       Number(optionalArg(args, "ltv-bps", "5000")),
       Number(optionalArg(args, "liq-threshold-bps", "6000")),
       Number(optionalArg(args, "liq-bonus-bps", "500")),
-      Number(optionalArg(args, "max-confidence-bps", "1000")),
-      Number(optionalArg(args, "max-price-age-secs", "3600")),
     ];
     const maxCollateral = toBaseUnits(optionalArg(args, "max-collateral", "0"), CTOKEN_DECIMALS);
-    const registerSig = await method(program, "admin_register_asset", "adminRegisterAsset")(
-      feedIdToBytes(PYTH_FEED_IDS[receipt.underlying]),
-      maxCollateral,
-      ...risk,
-      false,
-      false,
-    )
+    await refreshOraclesOnFork(conn, new anchor.Wallet(wallet), [receipt.underlying]);
+    const oracle = oracleConfigArg(receipt.underlying, { reserve: receipt.reserve, program: KLEND });
+    const accounts = [...oracleAccountsFor(receipt.underlying), receipt.reserve, assetConfigPda(ASSET_MINTS[receipt.underlying])[0]];
+    const sig = await method(program, "admin_register_asset", "adminRegisterAsset")(oracle, maxCollateral, ...risk, true, false)
       .accounts({
         admin: wallet.publicKey,
         payer: wallet.publicKey,
@@ -181,28 +174,9 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
+      .remainingAccounts(oracleMetas(accounts))
       .rpc();
-    const sourceSig = await method(program, "admin_set_asset_price_source", "adminSetAssetPriceSource")(
-      { kaminoReceipt: {} },
-      KLEND,
-    )
-      .accounts({
-        admin: wallet.publicKey,
-        protocolConfig,
-        assetConfig,
-        sourceAccount: receipt.reserve,
-        underlyingAssetConfig: assetConfigPda(ASSET_MINTS[receipt.underlying])[0],
-      })
-      .rpc();
-    const enableSig = await method(program, "admin_update_asset_config", "adminUpdateAssetConfig")(
-      maxCollateral,
-      ...risk,
-      true,
-      false,
-    )
-      .accounts({ admin: wallet.publicKey, protocolConfig, assetConfig })
-      .rpc();
-    log("register-receipt", `${key} assetConfig=${assetConfig.toBase58()} txs=${registerSig},${sourceSig},${enableSig}`);
+    log("register-receipt", `${key} assetConfig=${assetConfig.toBase58()} tx=${sig}`);
   },
 
   "kamino-deposit": async (ctx) => kaminoCall(ctx, "deposit"),
@@ -245,12 +219,8 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
       ? toBaseUnits(args["min-received"], ASSET_DECIMALS[to])
       : new anchor.BN(swap.minOut.toString());
 
-    const prices = await refreshAllPrices(conn, wallet);
-    const health = await buildRemainingAccounts(program, margin, prices, { excludeCollateral: [from, to] });
-    // A JupSOL leg is valued × SOL/USD: pass that feed account after the health accounts.
-    const legSources = [from, to]
-      .filter((asset) => ASSET_PRICING[asset].kind === "redemptionRate")
-      .map((asset) => ({ pubkey: priceSourceAccountFor(asset)!, isWritable: false, isSigner: false }));
+    await refreshAllOracles(conn, wallet);
+    const health = await buildRemainingAccounts(program, margin, { excludeCollateral: [from, to], priced: [from, to] });
     const [protocolConfig] = protocolConfigPda();
     const ix = await method(program, "margin_execute", "marginExecute")(swap.data, swap.accounts.length, minReceived)
       .accounts({
@@ -262,17 +232,15 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         spentAsset: assetConfigPda(ASSET_MINTS[from])[0],
         spentMint: ASSET_MINTS[from],
         spentVault: ata(margin, ASSET_MINTS[from], tokenProgramFor(from)),
-        spentPriceUpdate: prices[from],
         receivedAsset: assetConfigPda(ASSET_MINTS[to])[0],
         receivedMint: ASSET_MINTS[to],
         receivedVault: ata(margin, ASSET_MINTS[to], tokenProgramFor(to)),
-        receivedPriceUpdate: prices[to],
         spentTokenProgram: tokenProgramFor(from),
         receivedTokenProgram: tokenProgramFor(to),
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([...swap.accounts, ...health, ...legSources])
+      .remainingAccounts([...swap.accounts, ...health])
       .instruction();
 
     // A route plus the health scan exceeds a legacy transaction; Jupiter's lookup tables fit it.
@@ -290,11 +258,9 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
   },
 };
 
-async function refreshAllPrices(conn: Connection, wallet: anchor.web3.Keypair): Promise<Record<AssetKey, PublicKey>> {
-  const anchorWallet = new anchor.Wallet(wallet);
-  const prices = {} as Record<AssetKey, PublicKey>;
-  for (const key of Object.keys(ASSET_MINTS) as AssetKey[]) prices[key] = await refreshPrice(conn, anchorWallet, key);
-  return prices;
+/** Makes every asset's price fresh on the fork before a health-checked call. */
+async function refreshAllOracles(conn: Connection, wallet: anchor.web3.Keypair): Promise<void> {
+  await refreshOraclesOnFork(conn, new anchor.Wallet(wallet), Object.keys(ASSET_MINTS) as AssetKey[]);
 }
 
 /**
@@ -318,8 +284,9 @@ async function kaminoCall({ args, wallet, program, conn }: Ctx, call: KaminoCall
   };
   const [spent, received] = call === "deposit" ? [legs.underlying, legs.receipt] : [legs.receipt, legs.underlying];
 
-  const prices = await refreshAllPrices(conn, wallet);
-  const health = await buildRemainingAccounts(program, margin, prices, { excludeCollateral: [underlying, key] });
+  await refreshAllOracles(conn, wallet);
+  // The receipt's reserve is in the CPI accounts, read after the call.
+  const health = await buildRemainingAccounts(program, margin, { excludeCollateral: [underlying, key], priced: [underlying] });
   const cpiAccounts = kaminoCallAccounts(call, receipt, margin);
   const [protocolConfig] = protocolConfigPda();
   const [integration] = integrationPda(KLEND);
@@ -338,11 +305,9 @@ async function kaminoCall({ args, wallet, program, conn }: Ctx, call: KaminoCall
       spentAsset: assetConfigPda(spent.mint)[0],
       spentMint: spent.mint,
       spentVault: ata(margin, spent.mint, spent.tokenProgram),
-      spentPriceUpdate: prices[underlying],
       receivedAsset: assetConfigPda(received.mint)[0],
       receivedMint: received.mint,
       receivedVault: ata(margin, received.mint, received.tokenProgram),
-      receivedPriceUpdate: prices[underlying],
       spentTokenProgram: spent.tokenProgram,
       receivedTokenProgram: received.tokenProgram,
       associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,

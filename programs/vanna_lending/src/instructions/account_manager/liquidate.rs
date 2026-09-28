@@ -10,7 +10,8 @@ use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::health::calculate_health;
 use crate::math::shares::debt_shares_to_assets_up;
-use crate::risk_engine::scan_positions;
+use crate::oracle::PriceStatus;
+use crate::risk_engine::{scan_positions, split_positions, COLLATERAL_GROUP_LEN, DEBT_GROUP_LEN};
 use crate::state::asset_config::AssetConfig;
 use crate::state::debt_position::DebtPosition;
 use crate::state::margin_account::MarginAccount;
@@ -33,12 +34,16 @@ pub struct PublicLiquidate<'info> {
 }
 
 /// `remaining_accounts`, in this order:
-/// 1. The health accounts of every active position (the `risk_engine` layout, nothing skipped),
+/// 1. The health groups of every active position (the `risk_engine` layout, nothing skipped),
 ///    with each margin vault, reserve and debt position writable.
 /// 2. Per active collateral, in the same order: `[mint, destination (w), token_program]`. The
 ///    destination is any token account of that mint, usually the liquidator's ATA.
 /// 3. Per active debt, in the same order: `[mint, reserve liquidity vault (w), source (w),
 ///    token_program]`. The source is a token account the liquidator owns.
+/// 4. The oracle accounts of every asset of the account (any order).
+///
+/// Only a fresh price is required: a TWAP or confidence alarm during a crash never blocks a
+/// liquidation.
 ///
 /// Collateral is swept before debts are repaid, so the liquidator can repay a debt with the same
 /// token swept from the account (e.g. USDC) and only needs to bring the difference.
@@ -47,19 +52,16 @@ pub fn public_liquidate<'info>(ctx: Context<'info, PublicLiquidate<'info>>) -> R
     let margin_key = ctx.accounts.margin_account.key();
 
     // Solidity: `if (riskEngine.isAccountHealthy(account)) revert AccountNotLiquidatable()`.
-    let (collaterals, debts, health_len) = scan_positions(
-        &margin_key,
-        &ctx.accounts.margin_account,
-        ctx.remaining_accounts,
-        ctx.program_id,
-        &clock,
-        &[],
-        None,
-    )?;
-    let health = calculate_health(&collaterals, &debts)?;
+    let margin = &ctx.accounts.margin_account;
+    let (groups, rest) = split_positions(ctx.remaining_accounts, margin, &[], None)?;
+    let settlement_len = margin.active_collateral_indexes().count() * 3 + margin.active_debt_indexes().count() * 4;
+    require!(settlement_len <= rest.len(), VannaError::IncompletePositionAccounts);
+    let (settlement, oracle_accounts) = rest.split_at(settlement_len);
+    let valuation = scan_positions(&margin_key, margin, groups, &[oracle_accounts], ctx.program_id, &clock, &[], None)?;
+    valuation.status.require(PriceStatus::LIQUIDATION_CHECKS)?;
+    let health = calculate_health(&valuation.collaterals, &valuation.debts)?;
     require!(health.is_liquidatable(), VannaError::PositionHealthy);
 
-    let (groups, settlement) = ctx.remaining_accounts.split_at(health_len);
     let mut settlement = settlement.iter();
     let mut next_settlement = || settlement.next().ok_or(VannaError::IncompletePositionAccounts);
     let mut group = 0usize;
@@ -77,7 +79,7 @@ pub fn public_liquidate<'info>(ctx: Context<'info, PublicLiquidate<'info>>) -> R
     for index in collateral_indexes {
         let asset = Account::<AssetConfig>::try_from(&groups[group])?;
         let vault = &groups[group + 1];
-        group += if asset.is_pyth_priced() { 3 } else { 4 };
+        group += COLLATERAL_GROUP_LEN;
         let (mint, destination, token_program) = (next_settlement()?, next_settlement()?, next_settlement()?);
         validate_asset_config(&asset, &mint.key(), &token_program.key())?;
 
@@ -104,7 +106,7 @@ pub fn public_liquidate<'info>(ctx: Context<'info, PublicLiquidate<'info>>) -> R
         let asset = Account::<AssetConfig>::try_from(&groups[group])?;
         let mut reserve = Account::<Reserve>::try_from(&groups[group + 1])?;
         let mut position = Account::<DebtPosition>::try_from(&groups[group + 2])?;
-        group += 4;
+        group += DEBT_GROUP_LEN;
         let (mint, reserve_vault, source, token_program) =
             (next_settlement()?, next_settlement()?, next_settlement()?, next_settlement()?);
         validate_asset_config(&asset, &mint.key(), &token_program.key())?;

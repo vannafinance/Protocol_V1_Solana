@@ -10,7 +10,6 @@ use litesvm::types::TransactionResult;
 use litesvm::LiteSVM;
 use solana_keypair::Keypair;
 use solana_signer::Signer as SvmSigner;
-use vanna_lending::errors::VannaError;
 
 pub(crate) const USDC: u64 = 1_000_000;
 pub(crate) const SOL: u64 = 1_000_000_000;
@@ -22,20 +21,17 @@ pub(crate) struct Env {
     pub(crate) sol_price: Pubkey,
 }
 
-pub(crate) fn assert_vanna_error(res: TransactionResult, err: VannaError) {
-    let code = anchor_lang::error::ERROR_CODE_OFFSET + err as u32;
-    let failure = format!("{:?}", res.expect_err("transaction should have failed").err);
-    assert!(failure.contains(&format!("Custom({code})")), "expected error {code}, got {failure}");
+/// A klend cToken's oracle: its underlying's Pyth feed, converted through the reserve's rate.
+pub(crate) fn receipt_oracle(r: &KaminoReserve, feed: [u8; 32], klend: Pubkey) -> OracleConfig {
+    OracleConfig { klend_reserve: r.reserve, klend_program: klend, ..pyth_oracle(&feed, 3_600, 1_000) }
 }
 
-/// Registers a klend cToken as collateral: disabled, then its reserve as price source, then enabled.
+/// Registers a klend cToken as collateral, priced through the real klend reserve.
 pub(crate) fn register_receipt(svm: &mut LiteSVM, admin: &Keypair, r: &KaminoReserve, feed: [u8; 32]) {
     let a = admin.pubkey();
-    let mint = r.collateral_mint;
-    send(svm, admin, &[ix_admin_register_asset(&a, &a, &mint, feed, 0, 8_000, 8_500, 500, 1_000, 3_600, false, false)], &[]).unwrap();
-    let set = ix_admin_set_asset_price_source(&a, &mint, PriceSource::KaminoReceipt, Some(r.reserve), Some(r.liquidity_mint), KLEND);
-    send(svm, admin, &[set], &[]).expect("receipt price source on the real klend reserve");
-    send(svm, admin, &[ix_admin_update_asset_config(&a, &mint, 0, 8_000, 8_500, 500, 1_000, 3_600, true, false)], &[]).unwrap();
+    let underlying = asset_config_pda(&r.liquidity_mint).0;
+    let ix = ix_admin_register_collateral(&a, &r.collateral_mint, &anchor_spl::token::ID, receipt_oracle(r, feed, KLEND), &[underlying]);
+    send(svm, admin, &[ix], &[]).expect("receipt priced through the real klend reserve");
 }
 
 /// Protocol with USDC and SOL pools, cUSDC / cSOL as collateral, klend whitelisted, and a lender
@@ -55,10 +51,8 @@ pub(crate) fn setup() -> Env {
     register_receipt(&mut svm, &admin, &SOL_RESERVE, WSOL_FEED);
     send(&mut svm, &admin, &[ix_admin_register_integration(&a, &a, &KLEND, AdapterKind::KaminoLend)], &[]).unwrap();
 
-    let usdc_price = Pubkey::new_unique();
-    let sol_price = Pubkey::new_unique();
-    set_price(&mut svm, &usdc_price, USDC_FEED, USDC_PRICE, 0, -8, FIXTURE_UNIX_TIMESTAMP);
-    set_price(&mut svm, &sol_price, WSOL_FEED, WSOL_PRICE, 0, -8, FIXTURE_UNIX_TIMESTAMP);
+    let usdc_price = set_pyth(&mut svm, USDC_FEED, USDC_PRICE, -8, FIXTURE_UNIX_TIMESTAMP);
+    let sol_price = set_pyth(&mut svm, WSOL_FEED, WSOL_PRICE, -8, FIXTURE_UNIX_TIMESTAMP);
 
     let lender = funded_keypair(&mut svm);
     set_token_balance(&mut svm, &lender.pubkey(), &MAINNET_USDC, 100_000 * USDC);
@@ -68,8 +62,14 @@ pub(crate) fn setup() -> Env {
 }
 
 impl Env {
-    pub(crate) fn price_of(&self, r: &KaminoReserve) -> Pubkey {
-        if r.liquidity_mint == MAINNET_USDC { self.usdc_price } else { self.sol_price }
+    /// Every oracle account an asset here reads: both Pyth feeds and both klend reserves.
+    pub(crate) fn oracles(&self) -> [Pubkey; 4] {
+        [self.usdc_price, self.sol_price, USDC_RESERVE.reserve, SOL_RESERVE.reserve]
+    }
+
+    /// Position groups followed by every oracle account.
+    pub(crate) fn health(&self, groups: &[AccountMeta]) -> Vec<AccountMeta> {
+        with_oracles(groups.to_vec(), &self.oracles())
     }
 
     /// A user whose margin account holds `amount` of `mint` as collateral.
@@ -82,8 +82,9 @@ impl Env {
         (user, margin)
     }
 
-    pub(crate) fn execute(&mut self, user: &Keypair, spent: Pubkey, received: Pubkey, price: Pubkey, data: Vec<u8>, cpi: &[AccountMeta], health: &[AccountMeta], min_received: u64) -> TransactionResult {
-        let ix = ix_margin_execute(&user.pubkey(), &KLEND, &spent, &price, &received, &price, data, cpi, health, min_received);
+    /// `margin_execute` into klend; `groups` are the other positions', the oracle accounts are added.
+    pub(crate) fn execute(&mut self, user: &Keypair, spent: Pubkey, received: Pubkey, data: Vec<u8>, cpi: &[AccountMeta], groups: &[AccountMeta], min_received: u64) -> TransactionResult {
+        let ix = ix_margin_execute(&user.pubkey(), &KLEND, &spent, &received, data, cpi, &self.health(groups), min_received);
         send(&mut self.svm, user, &[ix], &[])
     }
 
@@ -92,7 +93,7 @@ impl Env {
         let margin = margin_pda(&user.pubkey()).0;
         let cpi = kamino_supply_accounts(r, &margin, &margin_vault_ata(&margin, &r.liquidity_mint), &margin_vault_ata(&margin, &r.collateral_mint));
         let data = kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, amount);
-        self.execute(user, r.liquidity_mint, r.collateral_mint, self.price_of(r), data, &cpi, health, min_received)
+        self.execute(user, r.liquidity_mint, r.collateral_mint, data, &cpi, health, min_received)
     }
 
     /// Redeems `receipts` cTokens from klend back into the margin.
@@ -100,7 +101,7 @@ impl Env {
         let margin = margin_pda(&user.pubkey()).0;
         let cpi = kamino_redeem_accounts(r, &margin, &margin_vault_ata(&margin, &r.collateral_mint), &margin_vault_ata(&margin, &r.liquidity_mint));
         let data = kamino_call_data(REDEEM_RESERVE_COLLATERAL, receipts);
-        self.execute(user, r.collateral_mint, r.liquidity_mint, self.price_of(r), data, &cpi, health, min_received)
+        self.execute(user, r.collateral_mint, r.liquidity_mint, data, &cpi, health, min_received)
     }
 
     pub(crate) fn balance(&self, margin: &Pubkey, mint: &Pubkey) -> u64 {
@@ -113,12 +114,13 @@ impl Env {
     }
 
     pub(crate) fn receipt_group(&self, margin: &Pubkey, r: &KaminoReserve) -> Vec<AccountMeta> {
-        collateral_group_with_source(&r.collateral_mint, margin, &self.price_of(r), &r.reserve)
+        collateral_group_metas(&r.collateral_mint, margin)
     }
 
-    pub(crate) fn borrow_usdc(&mut self, user: &Keypair, amount: u64, health: &[AccountMeta]) -> TransactionResult {
+    /// Borrows USDC; `groups` are the other positions', the oracle accounts are added.
+    pub(crate) fn borrow_usdc(&mut self, user: &Keypair, amount: u64, groups: &[AccountMeta]) -> TransactionResult {
         let margin = margin_pda(&user.pubkey()).0;
-        let ix = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, &self.usdc_price, amount, u128::MAX, health);
+        let ix = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, amount, u128::MAX, &self.health(groups));
         send(&mut self.svm, user, &[ix], &[])
     }
 

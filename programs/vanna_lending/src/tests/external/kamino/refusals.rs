@@ -22,7 +22,7 @@ fn other_klend_instructions_are_refused() {
         [251, 10, 231, 76, 27, 11, 159, 96],   // init_obligation
         [2, 218, 138, 235, 79, 201, 25, 102],  // refresh_reserve
     ] {
-        let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, kamino_call_data(selector, USDC), &cpi, &[], 0);
+        let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, kamino_call_data(selector, USDC), &cpi, &[], 0);
         assert_vanna_error(res, VannaError::CallNotAllowed);
     }
     // Malformed allowed calls: zero amount, extra data, missing accounts.
@@ -30,10 +30,10 @@ fn other_klend_instructions_are_refused() {
     assert_vanna_error(res, VannaError::ZeroAmount);
     let mut long = kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC);
     long.push(0);
-    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, long, &cpi, &[], 0);
+    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, long, &cpi, &[], 0);
     assert_vanna_error(res, VannaError::CallNotAllowed);
     let short = &cpi[..11];
-    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), short, &[], 0);
+    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), short, &[], 0);
     assert_vanna_error(res, VannaError::InvalidCallAccounts);
 }
 
@@ -44,7 +44,7 @@ fn supply_through_another_reserve_is_refused() {
     let (user, margin) = env.user_with_collateral(MAINNET_USDC, 1_000 * USDC);
     let mut cpi = kamino_supply_accounts(&USDC_RESERVE, &margin, &margin_vault_ata(&margin, &MAINNET_USDC), &margin_vault_ata(&margin, &USDC_RESERVE.collateral_mint));
     cpi[1] = AccountMeta::new(SOL_RESERVE.reserve, false);
-    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), &cpi, &[], 0);
+    let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), &cpi, &[], 0);
     assert_vanna_error(res, VannaError::InvalidCallAccounts);
 }
 
@@ -67,16 +67,16 @@ fn another_users_margin_cannot_be_used() {
 
     // The victim's vault as the spent vault: it isn't the attacker margin's vault.
     let cpi = kamino_supply_accounts(&USDC_RESERVE, &attacker_margin, &margin_vault_ata(&victim_margin, &MAINNET_USDC), &margin_vault_ata(&attacker_margin, &USDC_RESERVE.collateral_mint));
-    let res = env.execute(&attacker, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, data(), &cpi, &[], 0);
+    let res = env.execute(&attacker, MAINNET_USDC, USDC_RESERVE.collateral_mint, data(), &cpi, &[], 0);
     assert_vanna_error(res, VannaError::InvalidCallAccounts);
 
     // The victim's margin as the signing owner: the attacker can't sign for it.
     let cpi = kamino_supply_accounts(&USDC_RESERVE, &victim_margin, &margin_vault_ata(&victim_margin, &MAINNET_USDC), &margin_vault_ata(&victim_margin, &USDC_RESERVE.collateral_mint));
-    let res = env.execute(&attacker, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, data(), &cpi, &[], 0);
+    let res = env.execute(&attacker, MAINNET_USDC, USDC_RESERVE.collateral_mint, data(), &cpi, &[], 0);
     assert_vanna_error(res, VannaError::InvalidCallAccounts);
 
     // Swapping the victim's margin in as the named margin account breaks its PDA seeds.
-    let mut ix = ix_margin_execute(&attacker.pubkey(), &KLEND, &MAINNET_USDC, &env.usdc_price, &USDC_RESERVE.collateral_mint, &env.usdc_price, data(), &cpi, &[], 0);
+    let mut ix = ix_margin_execute(&attacker.pubkey(), &KLEND, &MAINNET_USDC, &USDC_RESERVE.collateral_mint, data(), &cpi, &env.health(&[]), 0);
     for meta in ix.accounts.iter_mut().filter(|m| m.pubkey == attacker_margin) {
         meta.pubkey = victim_margin;
     }
@@ -97,7 +97,7 @@ fn privileged_accounts_cannot_be_passed_to_klend() {
     for smuggled in [user.pubkey(), margin_vault_ata(&margin, &NATIVE_MINT), reserve_pda(&MAINNET_USDC).0, vanna_lending::ID] {
         let mut cpi = base.clone();
         cpi[3] = AccountMeta::new(smuggled, false); // the market-authority slot
-        let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, env.usdc_price, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), &cpi, &[], 0);
+        let res = env.execute(&user, MAINNET_USDC, USDC_RESERVE.collateral_mint, kamino_call_data(DEPOSIT_RESERVE_LIQUIDITY, USDC), &cpi, &[], 0);
         assert_vanna_error(res, VannaError::InvalidCallAccounts);
     }
 }
@@ -127,7 +127,7 @@ fn disabled_integration_or_receipt_blocks_calls() {
 
     // A receipt that isn't collateral-enabled can't be received.
     let cusdc = USDC_RESERVE.collateral_mint;
-    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &cusdc, 0, 8_000, 8_500, 500, 1_000, 3_600, false, false)], &[]).unwrap();
+    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &cusdc, 0, 8_000, 8_500, 500, false, false)], &[]).unwrap();
     assert_vanna_error(env.supply(&user, &USDC_RESERVE, 100 * USDC, 1, &[]), VannaError::AssetNotCollateralEnabled);
 
     // Non-admins can't toggle the integration.
@@ -142,7 +142,7 @@ fn only_held_collateral_can_be_spent() {
     let (user, margin) = env.user_with_collateral(MAINNET_USDC, 1_000 * USDC);
 
     // Withdraw everything: the vault stays but is no longer active collateral.
-    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &MAINNET_USDC, &env.usdc_price, 1_000 * USDC, 0, &[]);
+    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &MAINNET_USDC, 1_000 * USDC, 0, &env.health(&[]));
     send(&mut env.svm, &user, &[ix], &[]).unwrap();
     assert_vanna_error(env.supply(&user, &USDC_RESERVE, 100 * USDC, 1, &[]), VannaError::IncompletePositionAccounts);
 
@@ -163,12 +163,12 @@ fn receipt_positions_cannot_be_hidden_from_health_checks() {
 
     // Omitted entirely.
     assert_vanna_error(env.borrow_usdc(&user, 100 * USDC, &[]), VannaError::IncompletePositionAccounts);
-    // Without its reserve account.
-    let no_source = collateral_group_metas(&USDC_RESERVE.collateral_mint, &margin, &env.usdc_price);
-    assert_vanna_error(env.borrow_usdc(&user, 100 * USDC, &no_source), VannaError::IncompletePositionAccounts);
-    // With another reserve substituted for its price source.
-    let wrong_source = collateral_group_with_source(&USDC_RESERVE.collateral_mint, &margin, &env.usdc_price, &SOL_RESERVE.reserve);
-    assert_vanna_error(env.borrow_usdc(&user, 100 * USDC, &wrong_source), VannaError::InvalidPriceSource);
+    // Without its reserve among the oracle accounts. The reserve is pinned in cUSDC's oracle
+    // config, so another reserve passed in its place doesn't count either.
+    let group = env.receipt_group(&margin, &USDC_RESERVE);
+    let oracles = [env.usdc_price, env.sol_price, SOL_RESERVE.reserve];
+    let ix = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, 100 * USDC, u128::MAX, &with_oracles(group, &oracles));
+    assert_vanna_error(send(&mut env.svm, &user, &[ix], &[]), VannaError::InvalidPriceSource);
 
     env.borrow_usdc(&user, 100 * USDC, &env.receipt_group(&margin, &USDC_RESERVE)).expect("complete, correctly priced scan");
 }

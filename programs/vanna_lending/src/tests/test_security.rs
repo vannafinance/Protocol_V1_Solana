@@ -26,8 +26,8 @@ fn setup_protocol_with_two_assets(svm: &mut litesvm::LiteSVM) -> Env {
     send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
     send(svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
 
-    let usdc_price_update = Pubkey::new_unique();
-    let wsol_price_update = Pubkey::new_unique();
+    let usdc_price_update = pyth_account(&USDC_FEED);
+    let wsol_price_update = pyth_account(&WSOL_FEED);
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(svm, &usdc_price_update, USDC_FEED, USDC_PRICE, 0, -8, now);
     set_price(svm, &wsol_price_update, WSOL_FEED, WSOL_PRICE, 0, -8, now);
@@ -75,7 +75,7 @@ fn donation_into_margin_vault_becomes_live_collateral() {
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_withdraw_collateral(&borrower.pubkey(), &margin, &env.wsol_mint, &env.wsol_price_update, total, 0, &[])],
+        &[ix_user_withdraw_collateral(&borrower.pubkey(), &margin, &env.wsol_mint, total, 0, &oracle_metas(&[env.wsol_price_update]))],
         &[],
     );
     assert!(res.is_ok(), "the full donated + deposited balance should be withdrawable: {res:?}");
@@ -103,14 +103,14 @@ fn stale_oracle_price_is_rejected() {
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(&mut svm, &env.wsol_price_update, WSOL_FEED, WSOL_PRICE, 0, -8, now - 100_000);
 
-    let remaining = collateral_group_metas(&env.wsol_mint, &margin, &env.wsol_price_update);
+    let remaining = with_oracles(collateral_group_metas(&env.wsol_mint, &margin), &[env.usdc_price_update, env.wsol_price_update]);
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_borrow(&borrower.pubkey(), &margin, &env.usdc_mint, &env.usdc_price_update, 100 * 10u64.pow(6), u128::MAX, &remaining)],
+        &[ix_user_borrow(&borrower.pubkey(), &margin, &env.usdc_mint, 100 * 10u64.pow(6), u128::MAX, &remaining)],
         &[],
     );
-    assert!(res.is_err(), "borrowing against a stale WSOL price must fail");
+    assert_vanna_error(res, vanna_lending::errors::VannaError::StalePrice);
 }
 
 /// Only the margin account's own authority may deposit/withdraw on its behalf.

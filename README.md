@@ -94,7 +94,8 @@ Each test binary can be run on its own with `--test <name>`:
 | `test_interest_rate` | `src/tests/test_interest_rate.rs` | interest-rate model and accrual |
 | `test_math` | `src/tests/test_math.rs` | fixed-point, share and health math |
 | `test_state` | `src/tests/test_state.rs` | margin account position registries |
-| `test_price_sources` | `src/tests/test_price_sources.rs` | xStock (Scaled UI Amount) and JupSOL (redemption rate) valuation, Token-2022 collateral liquidation |
+| `test_oracle` | `src/tests/test_oracle.rs` | the oracle facade: Scope chains, Pyth fallback and factor, TWAP / staleness / confidence checks per instruction, pinned accounts, admin rules; plus every asset priced from real mainnet Scope and Pyth accounts |
+| `test_oracle_live` | `src/tests/test_oracle_live.rs` | **live, ignored by default**: reads the current mainnet oracle accounts, checks every asset's price (Kamino cTokens included) against Jupiter / Kamino market prices, and the health factor of a margin account holding all ten assets on-chain against the facade's and the market's |
 
 ```bash
 M=programs/vanna_lending/Cargo.toml
@@ -105,6 +106,9 @@ cargo test --manifest-path $M --test jupiter -- --nocapture  # show println! out
 
 # 5x leveraged Kamino farm: prints expected vs. actual health factor, interest and yield per step
 cargo test --manifest-path $M --test kamino leveraged_kamino_farm_walkthrough -- --nocapture
+
+# Live prices and margin health against mainnet right now (network; MAINNET_RPC_URL to override)
+cargo test --manifest-path $M --test test_oracle_live -- --ignored --nocapture
 ```
 
 ### Mainnet fixtures
@@ -115,6 +119,8 @@ The `kamino` and `jupiter` tests load real mainnet programs (klend, Jupiter v6, 
 python3 scripts/dump-mainnet-fixtures.py                # or: --rpc <mainnet RPC URL>
 anchor build && cargo test --manifest-path programs/vanna_lending/Cargo.toml
 ```
+
+`test_oracle` loads Kamino's Scope prices account, the Pyth feed accounts and the eight mints, all read at one slot, from `src/tests/fixtures/oracles/` (clock pinned to that slot's block time). Refresh them with `python3 scripts/dump-oracle-fixtures.py`; the tests compare against the raw fixture data, so a refresh needs no test changes.
 
 ## Run on a local mainnet fork
 
@@ -138,7 +144,8 @@ The scripts use:
 | RPC | `http://127.0.0.1:8899` | `DEVNET_RPC_URL=<url>` |
 | Wallet | `~/.config/solana/id.json` | `ANCHOR_WALLET=<path>` or `--wallet <path>` |
 | Jupiter API | `https://lite-api.jup.ag/swap/v1` | `JUPITER_API_URL=<url>` |
-| Pyth Hermes | `https://hermes.pyth.network`, no key | `PYTH_API_KEY=<key>` (required for real prices; without it the fork gets fixed fallback prices), `HERMES_URL=<url>` |
+| Scope prices | Kamino's live `OraclePrices` account, copied from mainnet onto the fork before each command that values an account | `MAINNET_RPC_URL=<url>` |
+| Pyth Hermes (Pyth fallbacks and JupUSD) | `https://hermes.pyth.network`, no key | `PYTH_API_KEY=<key>` (required for real prices; without it the fork gets fixed fallback prices), `HERMES_URL=<url>` |
 
 The wallet that runs `bootstrap-fork.sh` becomes the protocol admin.
 
@@ -189,14 +196,14 @@ Run either CLI with no command to print its command list.
 
 | Group | Commands |
 |---|---|
-| Admin | `initialize-protocol`, `register-asset`, `initialize-reserve`, `update-asset-config`, `update-reserve-config`, `set-operating-mode`, `propose-authority`, `accept-admin`, `collect-protocol-fees` |
+| Admin | `initialize-protocol`, `register-asset`, `set-asset-oracle`, `initialize-reserve`, `update-asset-config`, `update-reserve-config`, `set-operating-mode`, `propose-authority`, `accept-admin`, `collect-protocol-fees` |
 | Lending pool | `supply-liquidity`, `redeem-liquidity`, `refresh-reserve` |
 | Margin account | `create-margin`, `close-margin`, `deposit-collateral`, `withdraw-collateral`, `close-collateral-position` |
 | Borrowing | `open-debt-position`, `borrow`, `repay-from-margin`, `repay-from-wallet`, `close-debt-position` |
 | Liquidation | `liquidate --margin-owner <pubkey>`: repays every debt from the wallet and sweeps every asset (incl. Kamino cTokens) to it |
 | Queries | `get-protocol-config`, `get-asset-config`, `get-reserve`, `get-margin-account`, `get-debt-position`, `get-balance`, `get-margin-vault-balance`, `get-share-balance`, `get-health-factor`, `get-position-summary` |
 
-Assets (`--asset`): `usdc`, `usdt`, `wsol` (alias `sol`), `jitosol`, `jupsol`, `jupusd`, `nvdax`, `tslax`. `register-asset` makes only the pool assets borrowable and attaches the right price source; `initialize-reserve` refuses anything but USDC, USDT and SOL.
+Assets (`--asset`): `usdc`, `usdt`, `wsol` (alias `sol`), `jitosol`, `jupsol`, `jupusd`, `nvdax`, `tslax`. `register-asset` registers the asset with its oracle (`ASSET_ORACLES` in `scripts/src/devnet-env.ts`) and makes only the pool assets borrowable; `set-asset-oracle` re-applies that oracle to a registered asset; `initialize-reserve` refuses anything but USDC, USDT and SOL.
 
 **`npm run integrations-fork -- <command>`** (`scripts/src/integrations-fork.ts`): fork setup and external integrations.
 
@@ -210,19 +217,31 @@ Kamino symbols (`--symbol`): `usdc`, `sol` (main market).
 
 ## Assets
 
-| Asset | Role | Token program | Priced by |
-|---|---|---|---|
-| USDC | Lending pool + collateral | SPL Token | Pyth `Crypto.USDC/USD` |
-| USDT | Lending pool + collateral | SPL Token | Pyth `Crypto.USDT/USD` |
-| SOL (wSOL) | Lending pool + collateral | SPL Token | Pyth `Crypto.SOL/USD` |
-| JitoSOL | Collateral only | SPL Token | Pyth `Crypto.JITOSOL/USD` |
-| JupSOL | Collateral only | SPL Token | Pyth `Crypto.JUPSOL/SOL.RR` × `Crypto.SOL/USD` (`RedemptionRate`) |
-| JupUSD | Collateral only | SPL Token | Pyth `Crypto.JUPUSD/USD` |
-| NVDAx | Collateral only | Token-2022 | Pyth `Crypto.NVDAX/USD` × mint's Scaled UI multiplier (`ScaledUiAmount`) |
-| TSLAx | Collateral only | Token-2022 | Pyth `Crypto.TSLAX/USD` × mint's Scaled UI multiplier (`ScaledUiAmount`) |
-| Kamino cUSDC / cSOL | Collateral only (from Kamino deposits) | SPL Token | Kamino exchange rate × underlying's Pyth price (`KaminoReceipt`) |
+| Asset | Role | Token program | Price (Scope entries) | Pyth fallback |
+|---|---|---|---|---|
+| USDC | Lending pool + collateral | SPL Token | #13: Chainlink / Pyth Lazer, capped at $1 | `Crypto.USDC/USD` |
+| USDT | Lending pool + collateral | SPL Token | #16: Chainlink / Pyth Lazer, capped at $1 | `Crypto.USDT/USD` |
+| SOL (wSOL) | Lending pool + collateral | SPL Token | #3: Chainlink / Pyth Lazer | `Crypto.SOL/USD` |
+| JitoSOL | Collateral only | SPL Token | #210 × #3: stake-pool rate × SOL | — |
+| JupSOL | Collateral only | SPL Token | #224 × #3: stake-pool rate × SOL | `Crypto.JUPSOL/SOL.RR` × `Crypto.SOL/USD` |
+| JupUSD | Collateral only | SPL Token | — | `Crypto.JUPUSD/USD` (only source) |
+| NVDAx | Collateral only | Token-2022 | #332: Chainlink xStocks / Pyth Lazer | — |
+| TSLAx | Collateral only | Token-2022 | #338: Chainlink xStocks / Pyth Lazer | — |
+| Kamino cUSDC / cSOL | Collateral only (from Kamino deposits) | SPL Token | the underlying's price, through the Kamino reserve's exchange rate | the underlying's |
 
-Mints, feed ids and the xStock / JupSOL rules are in `scripts/src/devnet-env.ts` and `programs/vanna_lending/src/constants.rs`. The xStocks' feeds price one UI token (one share); the raw on-chain amount is converted with the mint's current multiplier, as Token-2022 does. Their Pyth feed accounts aren't pushed regularly on mainnet, so post a fresh update before any transaction that values them.
+Every price but JupUSD's comes from Kamino's Scope aggregator (`3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH`), whose keepers refresh these entries about every 40 s and which cross-checks Chainlink against Pyth Lazer; these are the entries Kamino's own reserves use, with Kamino's max ages (120–300 s) and TWAP limits (3–10%). The Chainlink xStocks price already applies the mint's Scaled UI multiplier, so it prices one raw token. Pyth fallbacks are the push oracle's own feed accounts, which Pyth updates every 55 s or on a 0.5% move. Mints, feed ids and Scope entries are in `scripts/src/devnet-env.ts` (`ASSET_ORACLES`) and `programs/vanna_lending/src/constants.rs`.
+
+### How prices are read
+
+Like the Solidity `OracleFacade`, one function prices every asset: `oracle::get_price` reads the asset's `OracleConfig` (set by `admin_register_asset` / `admin_set_asset_oracle`, the Solidity `setOracle`) and returns a price plus the checks it passed:
+
+- **Source.** The Scope chain (product of up to 4 entries) while it is fresh; otherwise the Pyth feed (× an optional second feed) if it is newer. A zero Scope entry counts as unavailable.
+- **Checks.** Fresh (≤ `max_age_secs`), within `max_twap_divergence_bps` of its TWAP (Scope's TWAP chain, or Pyth's EMA), Pyth confidence within `max_confidence_bps`.
+- **What each instruction requires**, as in Kamino: borrowing, and withdrawing or `margin_execute` while in debt, need every check on every asset of the account; liquidation needs only fresh prices, so a TWAP or confidence alarm in a crash never blocks it; a debt-free withdrawal reads no price at all (Solidity `isWithdrawAllowed`).
+
+Every oracle account is pinned in the asset's config, and registration checks each one (owner, Pyth account = the feed's shard-0 account, a receipt uses its underlying's sources) and prices the asset once.
+
+**Accounts.** Instructions that value an account take, in `remaining_accounts`: the position groups (collateral `[asset_config, margin_vault]`, debt `[asset_config, reserve, debt_position]`, in the margin's slot order), then every oracle account the involved assets read, each once, in any order (for `public_liquidate`, after the settlement accounts). The program finds oracle accounts by key; one that is needed but missing fails the instruction. `scripts/src/devnet-positions.ts` builds these lists.
 
 ## What the program does
 
@@ -235,13 +254,13 @@ Mints, feed ids and the xStock / JupSOL rules are in `scripts/src/devnet-env.ts`
 | **Farm** | Borrow USDC or SOL from Vanna at 1–5× and supply it into Kamino; the cTokens stay in the margin account as collateral, valued at Kamino's exchange rate. | <a href="https://docs.solana.vanna.finance/guides/farm/overview" target="_blank" rel="noopener noreferrer">Farm</a> |
 | **Swap** | Jupiter-routed swaps from the margin account, health-checked on post-trade balances. | <a href="https://docs.solana.vanna.finance/guides/trade/spot-swap" target="_blank" rel="noopener noreferrer">Swap</a> |
 
-Prices come from Pyth (see [Assets](#assets)). Token-2022 mints are supported; any transfer fee is measured on every transfer, not assumed.
+Prices come from Kamino's Scope aggregator (Chainlink and Pyth Lazer), with Pyth as the fallback (see [Assets](#assets)). Token-2022 mints are supported; any transfer fee is measured on every transfer, not assumed.
 
 | | |
 |---|---|
 | Program ID | `BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg` |
 | Framework | Anchor 1.1.2 (`anchor-lang`, `anchor-spl` with `token_2022`) |
-| External programs | Kamino Lend, Jupiter v6, Pyth Receiver |
+| External programs | Kamino Lend, Jupiter v6; price accounts of Kamino Scope and the Pyth Receiver (read only) |
 
 Full reference: <a href="https://docs.solana.vanna.finance/developers/contracts/program" target="_blank" rel="noopener noreferrer">Contract Reference</a> · <a href="https://docs.solana.vanna.finance/developers/math-reference" target="_blank" rel="noopener noreferrer">Math Reference</a> · <a href="https://docs.solana.vanna.finance/developers/deployed-contracts" target="_blank" rel="noopener noreferrer">Configured Accounts</a>
 
@@ -250,24 +269,27 @@ Full reference: <a href="https://docs.solana.vanna.finance/developers/contracts/
 ```
 programs/vanna_lending/src/
 ├── instructions/
-│   ├── admin/            protocol, assets (incl. price sources), reserves, integrations
+│   ├── admin/            protocol, assets (incl. their oracles), reserves, integrations
 │   ├── lending_pool.rs   lender supply / redeem, interest refresh
 │   └── account_manager/  account, collateral, borrow (borrow / repay), exec (margin_execute),
 │                         liquidate
 ├── adapters/       per-protocol call validators for margin_execute (Kamino Lend, Jupiter)
 ├── risk_engine.rs  finds, validates and values every position of a margin account
-├── oracle/         Pyth price validation and collateral valuation (Pyth, Kamino cTokens,
-│                   Scaled UI Amount xStocks, redemption-rate LSTs)
+├── oracle/         the oracle facade (get_price): Scope and Pyth readers, price checks,
+│                   Kamino cToken exchange rate
 ├── state/          ProtocolConfig, AssetConfig, Reserve, MarginAccount, DebtPosition, Integration
 ├── math/           fixed point, shares, interest-rate model, health factor
 ├── validation/     account and token-transfer checks
 └── tests/          LiteSVM unit and integration tests
     ├── external/kamino/   supply, redeem, withdraw, leverage, refusals against the real klend
     ├── external/jupiter/  swaps against the real Jupiter v6 and Orca programs
-    └── fixtures/mainnet/  those programs and accounts (scripts/dump-mainnet-fixtures.py)
+    ├── fixtures/mainnet/  those programs and accounts (scripts/dump-mainnet-fixtures.py)
+    └── fixtures/oracles/  real Scope and Pyth accounts (scripts/dump-oracle-fixtures.py)
 scripts/
 ├── src/devnet.ts             one command per program instruction
 ├── src/integrations-fork.ts  fork funding, Kamino and Jupiter via margin_execute
+├── src/oracle.ts             the program's price reads mirrored for display; fork oracle refresh
 ├── bootstrap-fork.sh         registers everything on a fresh Surfpool fork
-└── dump-mainnet-fixtures.py  refreshes the test fixtures from mainnet
+├── dump-mainnet-fixtures.py  refreshes the klend / Jupiter test fixtures from mainnet
+└── dump-oracle-fixtures.py   refreshes the oracle test fixtures from mainnet
 ```

@@ -3,7 +3,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 import { sendTransactions } from "@pythnetwork/solana-utils";
-import { AssetKey, DEVNET_RPC_URL, PYTH_FEED_IDS, PYTH_RECEIVER_PROGRAM_ID, PYTH_SHARD_ID, pythFeedAccount } from "./devnet-env";
+import { PYTH_FEED_IDS, PYTH_RECEIVER_PROGRAM_ID, PYTH_SHARD_ID, PythFeedKey, pythFeedAccount } from "./devnet-env";
 
 const HERMES_URL = process.env.HERMES_URL ?? "https://hermes.pyth.network";
 
@@ -14,28 +14,27 @@ function hermesClient(): HermesClient {
 }
 
 /** Fallback values written on the local Surfpool fork only when Hermes is unreachable (e.g. no
- * PYTH_API_KEY). They are what each feed publishes: USD per token, except JupSOL's feed, which is
- * the JUPSOL/SOL redemption rate. Never used against a real cluster. */
-const REFERENCE_PRICE: Record<AssetKey, number> = {
+ * PYTH_API_KEY). They are what each feed publishes: USD per token, except `jupsolRate`, the
+ * JUPSOL/SOL redemption rate. Never used against a real cluster. */
+const REFERENCE_PRICE: Record<PythFeedKey, number> = {
   usdc: 1,
   usdt: 1,
   wsol: 118,
-  jitosol: 153,
-  jupsol: 1.21,
+  jupsolRate: 1.21,
   jupusd: 1,
-  nvdax: 222,
-  tslax: 378,
 };
 
 
+/** `PriceUpdateV2` layout with a fully verified (1-byte) `verification_level`, as the push
+ * oracle writes it. */
 const PRICE_UPDATE_V2_DISCRIMINATOR = Buffer.from([0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
 const PRICE_FEED_ID_OFFSET = 41;
-const PRICE_OFFSET = 73;
-const CONF_OFFSET = 81;
-const EXPONENT_OFFSET = 89;
-const PUBLISH_TIME_OFFSET = 93;
+export const PRICE_OFFSET = 73;
+export const CONF_OFFSET = 81;
+export const EXPONENT_OFFSET = 89;
+export const PUBLISH_TIME_OFFSET = 93;
 const PREV_PUBLISH_TIME_OFFSET = 101;
-const EMA_PRICE_OFFSET = 109;
+export const EMA_PRICE_OFFSET = 109;
 const EMA_CONF_OFFSET = 117;
 const MIN_PRICE_ACCOUNT_SIZE = 134;
 
@@ -70,7 +69,7 @@ function buildForkPriceAccountData(template: Buffer, feedId: string, usdPrice: n
   return data;
 }
 
-async function callForkCheatcode(rpcUrl: string, method: string, params: unknown[]): Promise<void> {
+export async function callForkCheatcode(rpcUrl: string, method: string, params: unknown[]): Promise<void> {
   const response = await fetch(rpcUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -80,11 +79,11 @@ async function callForkCheatcode(rpcUrl: string, method: string, params: unknown
   if (body.error) throw new Error(`${method} failed: ${body.error.message}`);
 }
 
-/** Fabricates (or refreshes) `asset`'s PriceUpdateV2 account directly on the Surfpool fork via
+/** Fabricates (or refreshes) `feed`'s PriceUpdateV2 account directly on the Surfpool fork via
  * the `surfnet_setAccount` cheatcode — no Hermes call, no wallet signature. Used as the fallback
  * whenever real Hermes is unreachable (401 without an API key). */
-async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<PublicKey> {
-  const feedId = PYTH_FEED_IDS[asset];
+async function fabricatePrice(connection: Connection, feed: PythFeedKey): Promise<PublicKey> {
+  const feedId = PYTH_FEED_IDS[feed];
   const address = priceFeedAccountAddress(feedId);
 
   // Any existing PriceUpdateV2 account (this asset's own, if already fabricated once, else any
@@ -102,7 +101,7 @@ async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<
     );
   }
 
-  const price = REFERENCE_PRICE[asset];
+  const price = REFERENCE_PRICE[feed];
   const data = buildForkPriceAccountData(template.data, feedId, price);
   await callForkCheatcode(connection.rpcEndpoint, "surfnet_setAccount", [
     address.toBase58(),
@@ -118,9 +117,8 @@ async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<
 }
 
 /**
- * Posts a fresh Pyth price update for `asset` to its long-lived Pyth "price feed account" and
- * returns that account's address to pass as the `price_update` / `debt_price_update` /
- * `collateral_price_update` account in a vanna_lending instruction.
+ * Posts a fresh Pyth price update for `feed` to its shard-0 price-feed account (the account assets
+ * pin) and returns that account's address.
  *
  * Tries a real, signed Hermes update first (what a production integration does); falls back to
  * fabricating the PriceUpdateV2 directly on the local Surfpool fork via `surfnet_setAccount` when
@@ -129,10 +127,10 @@ async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<
 export async function refreshPrice(
   connection: Connection,
   wallet: anchor.Wallet,
-  asset: AssetKey,
+  feed: PythFeedKey,
 ): Promise<PublicKey> {
   try {
-    const feedId = PYTH_FEED_IDS[asset];
+    const feedId = PYTH_FEED_IDS[feed];
     const hermes = hermesClient();
     const priceUpdate = await hermes.getLatestPriceUpdates([feedId], { encoding: "base64" });
 
@@ -144,47 +142,7 @@ export async function refreshPrice(
 
     return receiver.getPriceFeedAccountAddress(PYTH_SHARD_ID, feedId);
   } catch (err) {
-    console.warn(`[pyth] real Hermes update for ${asset} failed (${(err as Error).message}); fabricating on fork`);
-    return fabricatePrice(connection, asset);
-  }
-}
-
-export interface LivePrice {
-  price: bigint;
-  exponent: number;
-  confidence: bigint;
-  publishTime: bigint;
-}
-
-/**
- * Reads the current real Pyth price for `asset` directly from Hermes — no transaction, no wallet,
- * no on-chain post. Falls back to the fork's already-fabricated on-chain PriceUpdateV2 (if any)
- * when Hermes is unreachable or has no feed for `asset`.
- */
-export async function fetchLivePrice(asset: AssetKey): Promise<LivePrice> {
-  try {
-    const hermes = hermesClient();
-    const result = await hermes.getLatestPriceUpdates([PYTH_FEED_IDS[asset]], { parsed: true });
-    const parsed = result.parsed?.[0];
-    if (!parsed) throw new Error(`Hermes returned no parsed price update for ${asset}`);
-    return {
-      price: BigInt(parsed.price.price),
-      exponent: parsed.price.expo,
-      confidence: BigInt(parsed.price.conf),
-      publishTime: BigInt(parsed.price.publish_time),
-    };
-  } catch (err) {
-    console.warn(`[pyth] real Hermes read for ${asset} failed (${(err as Error).message}); reading fork account`);
-    const connection = new Connection(DEVNET_RPC_URL, "confirmed");
-    const address = priceFeedAccountAddress(PYTH_FEED_IDS[asset]);
-    const info = await connection.getAccountInfo(address);
-    if (!info?.owner.equals(PYTH_RECEIVER_PROGRAM_ID)) {
-      throw new Error(`No fabricated PriceUpdateV2 for ${asset} on the fork yet — call refreshPrice first`);
-    }
-    const price = info.data.readBigInt64LE(PRICE_OFFSET);
-    const exponent = info.data.readInt32LE(EXPONENT_OFFSET);
-    const confidence = info.data.readBigUInt64LE(CONF_OFFSET);
-    const publishTime = info.data.readBigInt64LE(PUBLISH_TIME_OFFSET);
-    return { price, exponent, confidence, publishTime };
+    console.warn(`[pyth] real Hermes update for ${feed} failed (${(err as Error).message}); fabricating on fork`);
+    return fabricatePrice(connection, feed);
   }
 }

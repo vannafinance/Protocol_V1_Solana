@@ -35,10 +35,11 @@ struct Env {
     wsol_price: Pubkey,
 }
 
-fn assert_vanna_error(res: TransactionResult, err: VannaError) {
-    let code = anchor_lang::error::ERROR_CODE_OFFSET + err as u32;
-    let failure = format!("{:?}", res.expect_err("transaction should have failed").err);
-    assert!(failure.contains(&format!("Custom({code})")), "expected error {code}, got {failure}");
+impl Env {
+    /// Every oracle account an asset here reads.
+    fn oracles(&self) -> [Pubkey; 4] {
+        [self.usdc_price, self.wsol_price, self.kusdc_reserve, self.ksol_reserve]
+    }
 }
 
 struct FakeReserve {
@@ -72,22 +73,21 @@ fn register_disabled_receipt(svm: &mut LiteSVM, admin: &Keypair, mint: &Pubkey, 
     send(svm, admin, &[ix_admin_register_asset(&a, &a, mint, feed, 0, 8_000, 8_500, 500, 1_000, 3_600, false, false)], &[]).unwrap();
 }
 
-fn enable_collateral(svm: &mut LiteSVM, admin: &Keypair, mint: &Pubkey) {
-    let a = admin.pubkey();
-    send(svm, admin, &[ix_admin_update_asset_config(&a, mint, 0, 8_000, 8_500, 500, 1_000, 3_600, true, false)], &[]).unwrap();
+/// A receipt's oracle: the underlying's Pyth feed through the (fake) klend reserve's rate.
+fn receipt_oracle(reserve: &Pubkey, feed: [u8; 32]) -> OracleConfig {
+    OracleConfig { klend_reserve: *reserve, klend_program: fake_klend(), ..pyth_oracle(&feed, 3_600, 1_000) }
 }
 
-/// The safe order: register disabled, attach the Kamino price source, then enable as collateral.
+/// Sets a receipt's oracle; `underlying` is the asset whose `AssetConfig` is passed for the check.
+fn set_receipt_oracle(a: &Pubkey, mint: &Pubkey, reserve: &Pubkey, feed: [u8; 32], underlying: Option<Pubkey>) -> anchor_lang::solana_program::instruction::Instruction {
+    let extra: Vec<Pubkey> = underlying.iter().map(|m| asset_config_pda(m).0).collect();
+    ix_admin_set_asset_oracle(a, mint, receipt_oracle(reserve, feed), &extra)
+}
+
 fn register_receipt(svm: &mut LiteSVM, admin: &Keypair, mint: &Pubkey, underlying: &Pubkey, feed: [u8; 32], reserve: &Pubkey) {
-    register_disabled_receipt(svm, admin, mint, feed);
-    send(
-        svm,
-        admin,
-        &[ix_admin_set_asset_price_source(&admin.pubkey(), mint, PriceSource::KaminoReceipt, Some(*reserve), Some(*underlying), fake_klend())],
-        &[],
-    )
-    .expect("set receipt price source");
-    enable_collateral(svm, admin, mint);
+    let a = admin.pubkey();
+    let ix = ix_admin_register_collateral(&a, mint, &anchor_spl::token::ID, receipt_oracle(reserve, feed), &[asset_config_pda(underlying).0]);
+    send(svm, admin, &[ix], &[]).expect("register receipt");
 }
 
 fn setup() -> Env {
@@ -128,8 +128,8 @@ fn setup() -> Env {
     set_account_data(&mut svm, &ksol_reserve, kamino_reserve_data(&sol_rate));
     register_receipt(&mut svm, &admin, &ksol, &wsol, WSOL_FEED, &ksol_reserve);
 
-    let usdc_price = Pubkey::new_unique();
-    let wsol_price = Pubkey::new_unique();
+    let usdc_price = pyth_account(&USDC_FEED);
+    let wsol_price = pyth_account(&WSOL_FEED);
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(&mut svm, &usdc_price, USDC_FEED, USDC_PRICE, 0, -8, now);
     set_price(&mut svm, &wsol_price, WSOL_FEED, WSOL_PRICE, 0, -8, now);
@@ -151,8 +151,10 @@ fn borrower_with_collateral(env: &mut Env, mint: Pubkey, amount: u64) -> (Keypai
     (borrower, margin)
 }
 
-fn borrow_usdc(env: &mut Env, borrower: &Keypair, margin: &Pubkey, usdc: u64, health: &[AccountMeta]) -> TransactionResult {
-    let ix = ix_user_borrow(&borrower.pubkey(), margin, &env.usdc, &env.usdc_price, usdc * 10u64.pow(6), u128::MAX, health);
+/// Borrows USDC; `groups` are the other positions', every oracle account is added.
+fn borrow_usdc(env: &mut Env, borrower: &Keypair, margin: &Pubkey, usdc: u64, groups: &[AccountMeta]) -> TransactionResult {
+    let remaining = with_oracles(groups.to_vec(), &env.oracles());
+    let ix = ix_user_borrow(&borrower.pubkey(), margin, &env.usdc, usdc * 10u64.pow(6), u128::MAX, &remaining);
     send(&mut env.svm, borrower, &[ix], &[])
 }
 
@@ -161,31 +163,27 @@ fn borrow_usdc(env: &mut Env, borrower: &Keypair, margin: &Pubkey, usdc: u64, he
 // ---------------------------------------------------------------------------
 
 #[test]
-fn receipt_price_source_admin_rules() {
+fn receipt_oracle_admin_rules() {
     let mut env = setup();
     let a = env.admin.pubkey();
 
     let asset = fetch_asset_config(&env.svm, &env.kusdc);
-    assert_eq!(asset.price_source, PriceSource::KaminoReceipt);
-    assert_eq!(asset.price_source_account, env.kusdc_reserve);
-    assert_eq!(asset.price_source_program, fake_klend());
+    assert_eq!(asset.oracle, receipt_oracle(&env.kusdc_reserve, USDC_FEED));
 
-    // The source can't change while the asset is live collateral.
-    let res = send(&mut env.svm, &env.admin, &[ix_admin_set_asset_price_source(&a, &env.kusdc, PriceSource::Pyth, None, None, Pubkey::default())], &[]);
-    assert_vanna_error(res, VannaError::UnsupportedPriceSource);
+    // A live receipt's oracle can be rotated (like Solidity's `setOracle`), still fully checked.
+    let rotate = set_receipt_oracle(&a, &env.kusdc, &env.kusdc_reserve, USDC_FEED, Some(env.usdc));
+    send(&mut env.svm, &env.admin, &[rotate], &[]).expect("rotate a live receipt's oracle");
 
     // A receipt can't be made borrowable or get a lending pool.
-    let res = send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &env.kusdc, 0, 8_000, 8_500, 500, 1_000, 3_600, true, true)], &[]);
+    let res = send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &env.kusdc, 0, 8_000, 8_500, 500, true, true)], &[]);
     assert_vanna_error(res, VannaError::UnsupportedPriceSource);
     let res = send(&mut env.svm, &env.admin, &[ix_admin_initialize_reserve(&a, &a, &env.kusdc, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]);
     assert_vanna_error(res, VannaError::UnsupportedPriceSource);
 
-    // A new cToken, registered disabled, must match its reserve and its underlying.
+    // A new cToken must match its reserve and its underlying.
     let kbad = create_mint(&mut env.svm, &env.admin, &a, CTOKEN_DECIMALS);
     register_disabled_receipt(&mut env.svm, &env.admin, &kbad, USDC_FEED);
-    let set = |reserve: Pubkey, underlying: Option<Pubkey>| {
-        ix_admin_set_asset_price_source(&a, &kbad, PriceSource::KaminoReceipt, Some(reserve), underlying, fake_klend())
-    };
+    let set = |reserve: Pubkey, underlying: Option<Pubkey>| set_receipt_oracle(&a, &kbad, &reserve, USDC_FEED, underlying);
     let bad_reserve = Pubkey::new_unique();
     let fake = FakeReserve {
         liquidity_mint: env.usdc,
@@ -204,16 +202,16 @@ fn receipt_price_source_admin_rules() {
     assert_vanna_error(send(&mut env.svm, &env.admin, &[set(bad_reserve, Some(env.usdc))], &[]), VannaError::InvalidKaminoAccounts);
 
     set_account_data(&mut env.svm, &bad_reserve, kamino_reserve_data(&fake));
-    // The underlying asset must be supplied, and be the reserve's liquidity mint.
+    // The config of the reserve's liquidity mint must be supplied: none, or another asset's.
     assert_vanna_error(send(&mut env.svm, &env.admin, &[set(bad_reserve, None)], &[]), VannaError::InvalidPriceSource);
-    assert_vanna_error(send(&mut env.svm, &env.admin, &[set(bad_reserve, Some(env.wsol))], &[]), VannaError::InvalidKaminoAccounts);
+    assert_vanna_error(send(&mut env.svm, &env.admin, &[set(bad_reserve, Some(env.wsol))], &[]), VannaError::InvalidPriceSource);
     // The reserve's liquidity decimals must match the registered underlying.
     let wrong_decimals = FakeReserve { liquidity_decimals: 9, ..fake };
     set_account_data(&mut env.svm, &bad_reserve, kamino_reserve_data(&wrong_decimals));
     assert_vanna_error(send(&mut env.svm, &env.admin, &[set(bad_reserve, Some(env.usdc))], &[]), VannaError::InvalidKaminoAccounts);
 
     // A cSOL registered with the USDC feed: reserve, mint and decimals all match SOL, so only the
-    // feed check stands between it and pricing SOL at $1.
+    // same-sources check stands between it and pricing SOL at $1.
     let kfeed = create_mint(&mut env.svm, &env.admin, &a, CTOKEN_DECIMALS);
     register_disabled_receipt(&mut env.svm, &env.admin, &kfeed, USDC_FEED);
     let feed_reserve = Pubkey::new_unique();
@@ -225,12 +223,7 @@ fn receipt_price_source_admin_rules() {
         collateral_supply: 1,
     };
     set_account_data(&mut env.svm, &feed_reserve, kamino_reserve_data(&sol_reserve));
-    let res = send(
-        &mut env.svm,
-        &env.admin,
-        &[ix_admin_set_asset_price_source(&a, &kfeed, PriceSource::KaminoReceipt, Some(feed_reserve), Some(env.wsol), fake_klend())],
-        &[],
-    );
+    let res = send(&mut env.svm, &env.admin, &[set_receipt_oracle(&a, &kfeed, &feed_reserve, USDC_FEED, Some(env.wsol))], &[]);
     assert_vanna_error(res, VannaError::InvalidPriceFeed);
 }
 
@@ -243,11 +236,12 @@ fn receipt_collateral_is_valued_at_the_kamino_rate() {
     let kusdc = env.kusdc;
     let (borrower, margin) = borrower_with_collateral(&mut env, kusdc, 1_000 * 10u64.pow(6));
     send(&mut env.svm, &borrower, &[ix_user_open_debt_position(&borrower.pubkey(), &borrower.pubkey(), &margin, &env.usdc)], &[]).unwrap();
-    let with_source = collateral_group_with_source(&env.kusdc, &margin, &env.usdc_price, &env.kusdc_reserve);
+    let with_source = collateral_group_metas(&env.kusdc, &margin);
 
     // Without the reserve account the cToken can't be valued, so the scan fails closed.
-    let without_source = collateral_group_metas(&env.kusdc, &margin, &env.usdc_price);
-    assert_vanna_error(borrow_usdc(&mut env, &borrower, &margin, 15_000, &without_source), VannaError::IncompletePositionAccounts);
+    let without_reserve = with_oracles(collateral_group_metas(&env.kusdc, &margin), &[env.usdc_price, env.wsol_price]);
+    let ix = ix_user_borrow(&borrower.pubkey(), &margin, &env.usdc, 15_000 * 10u64.pow(6), u128::MAX, &without_reserve);
+    assert_vanna_error(send(&mut env.svm, &borrower, &[ix], &[]), VannaError::InvalidPriceSource);
 
     // Above the limit: (2,000 + 25,000) / 25,000 = 1.08.
     assert_vanna_error(borrow_usdc(&mut env, &borrower, &margin, 25_000, &with_source), VannaError::HealthFactorTooLow);
@@ -263,7 +257,7 @@ fn receipt_value_uses_the_underlying_decimals() {
     let ksol = env.ksol;
     let (borrower, margin) = borrower_with_collateral(&mut env, ksol, 10 * 10u64.pow(6));
     send(&mut env.svm, &borrower, &[ix_user_open_debt_position(&borrower.pubkey(), &borrower.pubkey(), &margin, &env.usdc)], &[]).unwrap();
-    let health = collateral_group_with_source(&env.ksol, &margin, &env.wsol_price, &env.ksol_reserve);
+    let health = collateral_group_metas(&env.ksol, &margin);
 
     assert_vanna_error(borrow_usdc(&mut env, &borrower, &margin, 25_000, &health), VannaError::HealthFactorTooLow);
     borrow_usdc(&mut env, &borrower, &margin, 15_000, &health).expect("borrow against cSOL valued at 1 SOL each");
@@ -304,18 +298,8 @@ fn kamino_deposit_accounts(env: &Env, margin: &Pubkey) -> Vec<AccountMeta> {
 }
 
 fn execute(env: &mut Env, borrower: &Keypair, data: Vec<u8>, cpi: &[AccountMeta]) -> TransactionResult {
-    let ix = ix_margin_execute(
-        &borrower.pubkey(),
-        &stand_in_program(),
-        &env.usdc,
-        &env.usdc_price,
-        &env.kusdc,
-        &env.usdc_price,
-        data,
-        cpi,
-        &[],
-        0,
-    );
+    let oracles = oracle_metas(&env.oracles());
+    let ix = ix_margin_execute(&borrower.pubkey(), &stand_in_program(), &env.usdc, &env.kusdc, data, cpi, &oracles, 0);
     send(&mut env.svm, borrower, &[ix], &[])
 }
 

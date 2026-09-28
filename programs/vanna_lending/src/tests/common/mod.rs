@@ -3,6 +3,7 @@
 pub mod jupiter;
 pub mod kamino;
 pub mod mainnet;
+pub mod oracles;
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::clock::Clock;
@@ -24,7 +25,8 @@ use vanna_lending::state::{AssetConfig, DebtPosition, Integration, MarginAccount
 
 pub use anchor_spl::associated_token::get_associated_token_address;
 pub use vanna_lending::adapters::AdapterKind;
-pub use vanna_lending::state::asset_config::PriceSource;
+pub use vanna_lending::oracle::pyth::canonical_feed_account;
+pub use vanna_lending::state::asset_config::{OracleConfig, EMPTY_SCOPE_CHAIN};
 pub use vanna_lending::state::reserve::RateCurve;
 
 // ---------------------------------------------------------------------------
@@ -56,9 +58,14 @@ pub fn program_bytes() -> &'static [u8] {
     include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/vanna_lending.so"))
 }
 
+/// A fresh SVM with the program loaded and the two standard test feeds (USDC $1, WSOL $200) at
+/// their canonical Pyth accounts, so assets priced by them can be registered right away.
 pub fn setup_svm() -> LiteSVM {
     let mut svm = LiteSVM::new();
     svm.add_program(vanna_lending::ID, program_bytes()).unwrap();
+    let now = svm.get_sysvar::<Clock>().unix_timestamp;
+    set_pyth(&mut svm, USDC_FEED, USDC_PRICE, -8, now);
+    set_pyth(&mut svm, WSOL_FEED, WSOL_PRICE, -8, now);
     svm
 }
 
@@ -197,6 +204,13 @@ pub fn mint_to_wallet_with(
     ata
 }
 
+/// Asserts `res` failed with the program error `err`.
+pub fn assert_vanna_error(res: TransactionResult, err: vanna_lending::errors::VannaError) {
+    let code = anchor_lang::error::ERROR_CODE_OFFSET + err as u32;
+    let failure = format!("{:?}", res.expect_err("transaction should have failed").err);
+    assert!(failure.contains(&format!("Custom({code})")), "expected error {code}, got {failure}");
+}
+
 /// The last event of type `E` the program emitted in a transaction.
 pub fn event<E: anchor_lang::Event + anchor_lang::AnchorDeserialize + anchor_lang::Discriminator>(logs: &[String]) -> E {
     use anchor_lang::__private::base64::{engine::general_purpose::STANDARD, Engine};
@@ -253,6 +267,98 @@ pub fn set_price(
         },
     )
     .unwrap();
+}
+
+/// Pyth's shard-0 price-feed account for `feed_id`: the only Pyth account an asset may pin.
+pub fn pyth_account(feed_id: &[u8; 32]) -> Pubkey {
+    canonical_feed_account(feed_id)
+}
+
+/// Writes `feed_id`'s price at its canonical account and returns that account.
+pub fn set_pyth(svm: &mut LiteSVM, feed_id: [u8; 32], price: i64, exponent: i32, publish_time: i64) -> Pubkey {
+    let key = pyth_account(&feed_id);
+    set_price(svm, &key, feed_id, price, 0, exponent, publish_time);
+    key
+}
+
+/// Like [`set_price`], with an EMA different from the price (for the TWAP check).
+#[allow(clippy::too_many_arguments)]
+pub fn set_price_with_ema(
+    svm: &mut LiteSVM,
+    pubkey: &Pubkey,
+    feed_id: [u8; 32],
+    price: i64,
+    ema_price: i64,
+    conf: u64,
+    exponent: i32,
+    publish_time: i64,
+) {
+    set_price(svm, pubkey, feed_id, price, conf, exponent, publish_time);
+    let mut account = svm.get_account(pubkey).unwrap();
+    let mut update = PriceUpdateV2::try_deserialize(&mut &account.data[..]).unwrap();
+    update.price_message.ema_price = ema_price;
+    account.data.clear();
+    update.try_serialize(&mut account.data).unwrap();
+    svm.set_account(*pubkey, account).unwrap();
+}
+
+/// An `OracleConfig` reading one Pyth feed.
+pub fn pyth_oracle(feed_id: &[u8; 32], max_age_secs: u32, max_confidence_bps: u16) -> OracleConfig {
+    OracleConfig { pyth_price: pyth_account(feed_id), max_age_secs, max_confidence_bps, ..OracleConfig::default() }
+}
+
+/// A Scope chain from its used entries.
+pub fn scope_chain(entries: &[u16]) -> [u16; 4] {
+    let mut chain = EMPTY_SCOPE_CHAIN;
+    chain[..entries.len()].copy_from_slice(entries);
+    chain
+}
+
+/// An `OracleConfig` reading a Scope chain (and its TWAP chain, checked within `twap_bps`).
+pub fn scope_oracle(prices: &Pubkey, chain: &[u16], twap: &[u16], max_age_secs: u32, twap_bps: u16) -> OracleConfig {
+    OracleConfig {
+        scope_prices: *prices,
+        scope_chain: scope_chain(chain),
+        scope_twap_chain: scope_chain(twap),
+        max_age_secs,
+        max_twap_divergence_bps: twap_bps,
+        max_confidence_bps: 1_000,
+        ..OracleConfig::default()
+    }
+}
+
+/// Offset of Scope entry `index` in an `OraclePrices` account.
+fn scope_entry_offset(index: u16) -> usize {
+    40 + 56 * usize::from(index)
+}
+
+/// Writes Scope entries `(index, value, exp, unix_timestamp)` (price = value / 10^exp) into the
+/// `OraclePrices` account at `key`, creating it (owned by Scope, all other entries zero) if needed.
+pub fn set_scope_prices(svm: &mut LiteSVM, key: &Pubkey, entries: &[(u16, u64, u64, i64)]) {
+    use vanna_lending::oracle::scope::{ORACLE_PRICES_DISCRIMINATOR, ORACLE_PRICES_LEN};
+    let mut account = svm.get_account(key).filter(|a| a.owner == SCOPE_PROGRAM_ID).unwrap_or_else(|| {
+        let mut data = vec![0u8; ORACLE_PRICES_LEN];
+        data[..8].copy_from_slice(&ORACLE_PRICES_DISCRIMINATOR);
+        SvmAccount { lamports: svm.minimum_balance_for_rent_exemption(data.len()), data, owner: SCOPE_PROGRAM_ID, executable: false, rent_epoch: 0 }
+    });
+    for (index, value, exp, unix_timestamp) in entries {
+        let at = scope_entry_offset(*index);
+        account.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        account.data[at + 8..at + 16].copy_from_slice(&exp.to_le_bytes());
+        account.data[at + 24..at + 32].copy_from_slice(&(*unix_timestamp as u64).to_le_bytes());
+    }
+    svm.set_account(*key, account).unwrap();
+}
+
+/// Read-only metas for oracle accounts, each once.
+pub fn oracle_metas(keys: &[Pubkey]) -> Vec<AccountMeta> {
+    let mut metas: Vec<AccountMeta> = Vec::new();
+    for key in keys {
+        if !metas.iter().any(|m| m.pubkey == *key) {
+            metas.push(AccountMeta::new_readonly(*key, false));
+        }
+    }
+    metas
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +426,8 @@ pub fn ix_initialize_protocol(admin: &Pubkey, treasury: &Pubkey, payer: &Pubkey,
     }
 }
 
+/// Registration of a classic-SPL asset priced by one Pyth feed (whose canonical account must hold
+/// a price already: registration reads it).
 #[allow(clippy::too_many_arguments)]
 pub fn ix_admin_register_asset(
     admin: &Pubkey,
@@ -335,69 +443,87 @@ pub fn ix_admin_register_asset(
     collateral_enabled: bool,
     borrow_enabled: bool,
 ) -> Instruction {
-    ix_admin_register_asset_raw(
-        admin, payer, mint, price_feed_id, max_collateral_per_margin, ltv_bps, liquidation_threshold_bps,
-        liquidation_bonus_bps, max_confidence_bps, max_price_age_secs, collateral_enabled, borrow_enabled,
+    ix_admin_register_asset_with(
+        admin,
+        payer,
+        mint,
+        &anchor_spl::token::ID,
+        pyth_oracle(&price_feed_id, max_price_age_secs, max_confidence_bps),
+        &[],
+        max_collateral_per_margin,
+        ltv_bps,
+        liquidation_threshold_bps,
+        liquidation_bonus_bps,
+        collateral_enabled,
+        borrow_enabled,
     )
 }
 
-/// Registration of a Token-2022 mint (e.g. an xStock).
+/// Registration with any oracle. `extra` = accounts beyond the oracle's own (a receipt's
+/// underlying `AssetConfig`).
 #[allow(clippy::too_many_arguments)]
-pub fn ix_admin_register_asset_2022(
-    admin: &Pubkey,
-    mint: &Pubkey,
-    price_feed_id: [u8; 32],
-    max_price_age_secs: u32,
-    collateral_enabled: bool,
-) -> Instruction {
-    let mut ix = ix_admin_register_asset_raw(
-        admin, admin, mint, price_feed_id, 0, 8_000, 8_500, 500, 1_000, max_price_age_secs, collateral_enabled, false,
-    );
-    ix.accounts[5].pubkey = TOKEN_2022; // AdminRegisterAsset::token_program
-    ix
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ix_admin_register_asset_raw(
+pub fn ix_admin_register_asset_with(
     admin: &Pubkey,
     payer: &Pubkey,
     mint: &Pubkey,
-    price_feed_id: [u8; 32],
+    token_program: &Pubkey,
+    oracle: OracleConfig,
+    extra: &[Pubkey],
     max_collateral_per_margin: u64,
     ltv_bps: u16,
     liquidation_threshold_bps: u16,
     liquidation_bonus_bps: u16,
-    max_confidence_bps: u16,
-    max_price_age_secs: u32,
     collateral_enabled: bool,
     borrow_enabled: bool,
 ) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
     let (asset_config, _) = asset_config_pda(mint);
+    let mut accounts = vanna_lending::accounts::AdminRegisterAsset {
+        admin: *admin,
+        payer: *payer,
+        protocol_config,
+        underlying_mint: *mint,
+        asset_config,
+        token_program: *token_program,
+        system_program: anchor_lang::system_program::ID,
+    }
+    .to_account_metas(None);
+    accounts.extend(oracle_metas(&oracle.accounts().chain(extra.iter().copied()).collect::<Vec<_>>()));
     Instruction {
         program_id: vanna_lending::ID,
-        accounts: vanna_lending::accounts::AdminRegisterAsset {
-            admin: *admin,
-            payer: *payer,
-            protocol_config,
-            underlying_mint: *mint,
-            asset_config,
-            token_program: anchor_spl::token::ID,
-            system_program: anchor_lang::system_program::ID,
-        }
-        .to_account_metas(None),
+        accounts,
         data: vanna_lending::instruction::AdminRegisterAsset {
-            price_feed_id,
+            oracle,
             max_collateral_per_margin,
             ltv_bps,
             liquidation_threshold_bps,
             liquidation_bonus_bps,
-            max_confidence_bps,
-            max_price_age_secs,
             collateral_enabled,
             borrow_enabled,
         }
         .data(),
+    }
+}
+
+/// Collateral-only registration of any mint with any oracle (e.g. an xStock priced by Scope).
+pub fn ix_admin_register_collateral(admin: &Pubkey, mint: &Pubkey, token_program: &Pubkey, oracle: OracleConfig, extra: &[Pubkey]) -> Instruction {
+    ix_admin_register_asset_with(admin, admin, mint, token_program, oracle, extra, 0, 8_000, 8_500, 500, true, false)
+}
+
+/// `admin_set_asset_oracle`. `extra` as for [`ix_admin_register_asset_with`].
+pub fn ix_admin_set_asset_oracle(admin: &Pubkey, mint: &Pubkey, oracle: OracleConfig, extra: &[Pubkey]) -> Instruction {
+    let (protocol_config, _) = protocol_config_pda();
+    let mut accounts = vanna_lending::accounts::AdminSetAssetOracle {
+        admin: *admin,
+        protocol_config,
+        asset_config: asset_config_pda(mint).0,
+    }
+    .to_account_metas(None);
+    accounts.extend(oracle_metas(&oracle.accounts().chain(extra.iter().copied()).collect::<Vec<_>>()));
+    Instruction {
+        program_id: vanna_lending::ID,
+        accounts,
+        data: vanna_lending::instruction::AdminSetAssetOracle { oracle }.data(),
     }
 }
 
@@ -481,8 +607,6 @@ pub fn ix_admin_update_asset_config(
     ltv_bps: u16,
     liquidation_threshold_bps: u16,
     liquidation_bonus_bps: u16,
-    max_confidence_bps: u16,
-    max_price_age_secs: u32,
     collateral_enabled: bool,
     borrow_enabled: bool,
 ) -> Instruction {
@@ -497,8 +621,6 @@ pub fn ix_admin_update_asset_config(
             ltv_bps,
             liquidation_threshold_bps,
             liquidation_bonus_bps,
-            max_confidence_bps,
-            max_price_age_secs,
             collateral_enabled,
             borrow_enabled,
         }
@@ -740,11 +862,11 @@ pub fn ix_user_open_debt_position(authority: &Pubkey, payer: &Pubkey, margin: &P
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `remaining` = the other positions' groups, then the oracle accounts (see [`oracle_metas`]).
 pub fn ix_user_borrow(
     authority: &Pubkey,
     margin: &Pubkey,
     mint: &Pubkey,
-    price_update: &Pubkey,
     assets: u64,
     max_debt_shares: u128,
     remaining: &[AccountMeta],
@@ -762,7 +884,6 @@ pub fn ix_user_borrow(
         asset_config,
         reserve,
         debt_position,
-        price_update: *price_update,
         mint: *mint,
         reserve_vault,
         margin_vault,
@@ -803,44 +924,23 @@ pub fn ix_user_repay_from_margin(authority: &Pubkey, margin: &Pubkey, mint: &Pub
     }
 }
 
+/// `remaining` = the other positions' groups, then the oracle accounts (see [`oracle_metas`]).
 pub fn ix_user_withdraw_collateral(
     authority: &Pubkey,
     margin: &Pubkey,
     mint: &Pubkey,
-    price_update: &Pubkey,
     amount: u64,
     min_health_factor_wad: u128,
     remaining: &[AccountMeta],
 ) -> Instruction {
-    ix_user_withdraw_collateral_priced(authority, margin, mint, price_update, None, amount, min_health_factor_wad, remaining)
+    ix_user_withdraw_collateral_with(authority, margin, mint, &anchor_spl::token::ID, amount, min_health_factor_wad, remaining)
 }
 
-/// Withdraw of an asset with a non-Pyth price source (e.g. a Kamino cToken and its reserve).
-#[allow(clippy::too_many_arguments)]
-pub fn ix_user_withdraw_collateral_priced(
-    authority: &Pubkey,
-    margin: &Pubkey,
-    mint: &Pubkey,
-    price_update: &Pubkey,
-    price_source_account: Option<Pubkey>,
-    amount: u64,
-    min_health_factor_wad: u128,
-    remaining: &[AccountMeta],
-) -> Instruction {
-    ix_user_withdraw_collateral_with(
-        authority, margin, mint, &anchor_spl::token::ID, price_update, price_source_account, amount, min_health_factor_wad,
-        remaining,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn ix_user_withdraw_collateral_with(
     authority: &Pubkey,
     margin: &Pubkey,
     mint: &Pubkey,
     token_program: &Pubkey,
-    price_update: &Pubkey,
-    price_source_account: Option<Pubkey>,
     amount: u64,
     min_health_factor_wad: u128,
     remaining: &[AccountMeta],
@@ -855,10 +955,8 @@ pub fn ix_user_withdraw_collateral_with(
         margin_account: *margin,
         asset_config,
         mint: *mint,
-        price_update: *price_update,
         destination_token_account,
         margin_vault,
-        price_source_account,
         token_program: *token_program,
     }
     .to_account_metas(None);
@@ -871,8 +969,9 @@ pub fn ix_user_withdraw_collateral_with(
 }
 
 /// Whole-account liquidation. `positions` are the liquidation groups of every active position
-/// (see [`liq_collateral`] / [`liq_debt`]), collaterals first, each in the margin's slot order.
-pub fn ix_public_liquidate(liquidator: &Pubkey, margin: &Pubkey, positions: &[LiqPosition]) -> Instruction {
+/// (see [`liq_collateral`] / [`liq_debt`]), collaterals first, each in the margin's slot order;
+/// `oracles` are the oracle accounts of every asset involved.
+pub fn ix_public_liquidate(liquidator: &Pubkey, margin: &Pubkey, positions: &[LiqPosition], oracles: &[Pubkey]) -> Instruction {
     let mut accounts = vanna_lending::accounts::PublicLiquidate { liquidator: *liquidator, margin_account: *margin }
         .to_account_metas(None);
     for p in positions {
@@ -881,6 +980,7 @@ pub fn ix_public_liquidate(liquidator: &Pubkey, margin: &Pubkey, positions: &[Li
     for p in positions {
         accounts.extend_from_slice(&p.settlement);
     }
+    accounts.extend(oracle_metas(oracles));
     Instruction { program_id: vanna_lending::ID, accounts, data: vanna_lending::instruction::PublicLiquidate {}.data() }
 }
 
@@ -890,17 +990,10 @@ pub struct LiqPosition {
     pub settlement: Vec<AccountMeta>,
 }
 
-/// A collateral swept to `destination`: `[asset_config, margin_vault (w), price, source?]` and
+/// A collateral swept to `destination`: `[asset_config, margin_vault (w)]` and
 /// `[mint, destination (w), token_program]`.
-pub fn liq_collateral(
-    mint: &Pubkey,
-    token_program: &Pubkey,
-    margin: &Pubkey,
-    price_update: &Pubkey,
-    source: Option<&Pubkey>,
-    destination: &Pubkey,
-) -> LiqPosition {
-    let mut health = collateral_group_with(mint, token_program, margin, price_update, source);
+pub fn liq_collateral(mint: &Pubkey, token_program: &Pubkey, margin: &Pubkey, destination: &Pubkey) -> LiqPosition {
+    let mut health = collateral_group_with(mint, token_program, margin);
     health[1].is_writable = true;
     LiqPosition {
         health,
@@ -912,10 +1005,10 @@ pub fn liq_collateral(
     }
 }
 
-/// A classic-SPL debt repaid in full from `source`: `[asset_config, reserve (w), debt_position (w),
-/// price]` and `[mint, reserve vault (w), source (w), token_program]`.
-pub fn liq_debt(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey, source: &Pubkey) -> LiqPosition {
-    let mut health = debt_group_metas(mint, margin, price_update);
+/// A classic-SPL debt repaid in full from `source`: `[asset_config, reserve (w), debt_position (w)]`
+/// and `[mint, reserve vault (w), source (w), token_program]`.
+pub fn liq_debt(mint: &Pubkey, margin: &Pubkey, source: &Pubkey) -> LiqPosition {
+    let mut health = debt_group_metas(mint, margin);
     health[1].is_writable = true;
     health[2].is_writable = true;
     let reserve = reserve_pda(mint).0;
@@ -965,39 +1058,14 @@ pub fn ix_admin_set_integration_enabled(admin: &Pubkey, target_program: &Pubkey,
     }
 }
 
-/// `source_account` / `underlying_mint` are the receipt's Kamino reserve and underlying asset.
-pub fn ix_admin_set_asset_price_source(
-    admin: &Pubkey,
-    mint: &Pubkey,
-    price_source: PriceSource,
-    source_account: Option<Pubkey>,
-    underlying_mint: Option<Pubkey>,
-    source_program: Pubkey,
-) -> Instruction {
-    let (protocol_config, _) = protocol_config_pda();
-    Instruction {
-        program_id: vanna_lending::ID,
-        accounts: vanna_lending::accounts::AdminSetAssetPriceSource {
-            admin: *admin,
-            protocol_config,
-            asset_config: asset_config_pda(mint).0,
-            source_account,
-            underlying_asset_config: underlying_mint.map(|m| asset_config_pda(&m).0),
-        }
-        .to_account_metas(None),
-        data: vanna_lending::instruction::AdminSetAssetPriceSource { price_source, source_program }.data(),
-    }
-}
-
-/// `margin_execute`: `cpi_accounts` in the external program's order, then `health` accounts.
+/// `margin_execute`: `cpi_accounts` in the external program's order, then `health` = the other
+/// positions' groups followed by the oracle accounts.
 #[allow(clippy::too_many_arguments)]
 pub fn ix_margin_execute(
     authority: &Pubkey,
     target_program: &Pubkey,
     spent_mint: &Pubkey,
-    spent_price_update: &Pubkey,
     received_mint: &Pubkey,
-    received_price_update: &Pubkey,
     data: Vec<u8>,
     cpi_accounts: &[AccountMeta],
     health: &[AccountMeta],
@@ -1014,11 +1082,9 @@ pub fn ix_margin_execute(
         spent_asset: asset_config_pda(spent_mint).0,
         spent_mint: *spent_mint,
         spent_vault: margin_vault_ata(&margin, spent_mint),
-        spent_price_update: *spent_price_update,
         received_asset: asset_config_pda(received_mint).0,
         received_mint: *received_mint,
         received_vault: margin_vault_ata(&margin, received_mint),
-        received_price_update: *received_price_update,
         spent_token_program: anchor_spl::token::ID,
         received_token_program: anchor_spl::token::ID,
         associated_token_program: anchor_spl::associated_token::ID,
@@ -1043,44 +1109,21 @@ pub fn ix_margin_execute(
 // remaining_accounts builders
 // ---------------------------------------------------------------------------
 
-/// One collateral group: `AssetConfig`, margin vault, `PriceUpdateV2` (all read-only). A
-/// non-Pyth asset adds its price-source account; see [`collateral_group_with_source`].
-pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {
-    let (asset_config, _) = asset_config_pda(mint);
-    let margin_vault = margin_vault_ata(margin, mint);
+/// One collateral group: `AssetConfig`, margin vault (read-only).
+pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey) -> Vec<AccountMeta> {
+    collateral_group_with(mint, &anchor_spl::token::ID, margin)
+}
+
+/// Collateral group for an asset of any token program.
+pub fn collateral_group_with(mint: &Pubkey, token_program: &Pubkey, margin: &Pubkey) -> Vec<AccountMeta> {
     vec![
-        AccountMeta::new_readonly(asset_config, false),
-        AccountMeta::new_readonly(margin_vault, false),
-        AccountMeta::new_readonly(*price_update, false),
+        AccountMeta::new_readonly(asset_config_pda(mint).0, false),
+        AccountMeta::new_readonly(margin_vault_ata_with(margin, mint, token_program), false),
     ]
 }
 
-/// Collateral group for an asset whose price source reads `source` (e.g. a Kamino reserve).
-pub fn collateral_group_with_source(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey, source: &Pubkey) -> Vec<AccountMeta> {
-    let mut metas = collateral_group_metas(mint, margin, price_update);
-    metas.push(AccountMeta::new_readonly(*source, false));
-    metas
-}
-
-/// Collateral group for an asset of any token program, with its price-source account if any.
-pub fn collateral_group_with(
-    mint: &Pubkey,
-    token_program: &Pubkey,
-    margin: &Pubkey,
-    price_update: &Pubkey,
-    source: Option<&Pubkey>,
-) -> Vec<AccountMeta> {
-    let mut metas = vec![
-        AccountMeta::new_readonly(asset_config_pda(mint).0, false),
-        AccountMeta::new_readonly(margin_vault_ata_with(margin, mint, token_program), false),
-        AccountMeta::new_readonly(*price_update, false),
-    ];
-    metas.extend(source.map(|s| AccountMeta::new_readonly(*s, false)));
-    metas
-}
-
-/// One debt group: `AssetConfig`, `Reserve`, `DebtPosition`, `PriceUpdateV2` (all read-only).
-pub fn debt_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -> Vec<AccountMeta> {
+/// One debt group: `AssetConfig`, `Reserve`, `DebtPosition` (all read-only).
+pub fn debt_group_metas(mint: &Pubkey, margin: &Pubkey) -> Vec<AccountMeta> {
     let (asset_config, _) = asset_config_pda(mint);
     let (reserve, _) = reserve_pda(mint);
     let (debt_position, _) = debt_position_pda(margin, &reserve);
@@ -1088,8 +1131,13 @@ pub fn debt_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey) -
         AccountMeta::new_readonly(asset_config, false),
         AccountMeta::new_readonly(reserve, false),
         AccountMeta::new_readonly(debt_position, false),
-        AccountMeta::new_readonly(*price_update, false),
     ]
+}
+
+/// Position groups followed by the oracle accounts: an instruction's `remaining_accounts`.
+pub fn with_oracles(mut groups: Vec<AccountMeta>, oracles: &[Pubkey]) -> Vec<AccountMeta> {
+    groups.extend(oracle_metas(oracles));
+    groups
 }
 
 // ---------------------------------------------------------------------------

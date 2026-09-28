@@ -35,8 +35,8 @@ fn admin_transfer_and_operating_mode_gate_borrow() {
     send(&mut svm, &new_admin, &[ix_admin_initialize_reserve(&new_admin.pubkey(), &new_admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
     send(&mut svm, &new_admin, &[ix_admin_initialize_reserve(&new_admin.pubkey(), &new_admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
 
-    let usdc_price_update = Pubkey::new_unique();
-    let wsol_price_update = Pubkey::new_unique();
+    let usdc_price_update = pyth_account(&USDC_FEED);
+    let wsol_price_update = pyth_account(&WSOL_FEED);
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(&mut svm, &usdc_price_update, USDC_FEED, USDC_PRICE, 0, -8, now);
     set_price(&mut svm, &wsol_price_update, WSOL_FEED, WSOL_PRICE, 0, -8, now);
@@ -55,11 +55,11 @@ fn admin_transfer_and_operating_mode_gate_borrow() {
     send(&mut svm, &new_admin, &[ix_admin_set_operating_mode(&new_admin.pubkey(), 1)], &[]).expect("set BorrowPaused");
     send(&mut svm, &lender, &[ix_lender_supply(&lender.pubkey(), &usdc_mint, 500_000 * 10u64.pow(6), 1)], &[]).expect("supply still allowed while BorrowPaused");
 
-    let remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
+    let remaining = with_oracles(collateral_group_metas(&wsol_mint, &margin), &[usdc_price_update, wsol_price_update]);
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, &usdc_price_update, 100 * 10u64.pow(6), u128::MAX, &remaining)],
+        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, 100 * 10u64.pow(6), u128::MAX, &remaining)],
         &[],
     );
     assert!(res.is_err(), "borrowing must be blocked while the protocol is in BorrowPaused mode");
@@ -69,7 +69,7 @@ fn admin_transfer_and_operating_mode_gate_borrow() {
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, &usdc_price_update, 100 * 10u64.pow(6), u128::MAX, &remaining)],
+        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, 100 * 10u64.pow(6), u128::MAX, &remaining)],
         &[],
     );
     assert!(res.is_ok(), "borrowing should succeed again once mode is Normal: {res:?}");
@@ -90,7 +90,7 @@ fn admin_config_updates_persist() {
     send(
         &mut svm,
         &admin,
-        &[ix_admin_update_asset_config(&admin.pubkey(), &usdc_mint, 1_000_000 * 10u64.pow(6), 7_500, 8_000, 600, 500, 7_200, false, true)],
+        &[ix_admin_update_asset_config(&admin.pubkey(), &usdc_mint, 1_000_000 * 10u64.pow(6), 7_500, 8_000, 600, false, true)],
         &[],
     )
     .expect("admin_update_asset_config");
@@ -145,8 +145,8 @@ fn interest_accrues_and_fees_are_collectible() {
     send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &usdc_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
     send(&mut svm, &admin, &[ix_admin_initialize_reserve(&admin.pubkey(), &admin.pubkey(), &wsol_mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
 
-    let usdc_price_update = Pubkey::new_unique();
-    let wsol_price_update = Pubkey::new_unique();
+    let usdc_price_update = pyth_account(&USDC_FEED);
+    let wsol_price_update = pyth_account(&WSOL_FEED);
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(&mut svm, &usdc_price_update, USDC_FEED, USDC_PRICE, 0, -8, now);
     set_price(&mut svm, &wsol_price_update, WSOL_FEED, WSOL_PRICE, 0, -8, now);
@@ -162,11 +162,11 @@ fn interest_accrues_and_fees_are_collectible() {
     send(&mut svm, &borrower, &[ix_user_deposit_collateral(&borrower.pubkey(), &margin, &wsol_mint, 500 * 10u64.pow(9))], &[]).unwrap(); // ~$100,000 of WSOL
     send(&mut svm, &borrower, &[ix_user_open_debt_position(&borrower.pubkey(), &borrower.pubkey(), &margin, &usdc_mint)], &[]).unwrap();
 
-    let remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
+    let remaining = with_oracles(collateral_group_metas(&wsol_mint, &margin), &[usdc_price_update, wsol_price_update]);
     send(
         &mut svm,
         &borrower,
-        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, &usdc_price_update, 50_000 * 10u64.pow(6), u128::MAX, &remaining)],
+        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, 50_000 * 10u64.pow(6), u128::MAX, &remaining)],
         &[],
     )
     .expect("user_borrow"); // 50% utilization of the 100,000 USDC pool
@@ -217,9 +217,9 @@ fn full_position_close_lifecycle() {
 
     // No debt anywhere, so no remaining_accounts are needed.
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
-    let usdc_price_update = Pubkey::new_unique();
+    let usdc_price_update = pyth_account(&USDC_FEED);
     set_price(&mut svm, &usdc_price_update, USDC_FEED, USDC_PRICE, 0, -8, now);
-    send(&mut svm, &user, &[ix_user_withdraw_collateral(&user.pubkey(), &margin, &usdc_mint, &usdc_price_update, 500 * 10u64.pow(6), 0, &[])], &[])
+    send(&mut svm, &user, &[ix_user_withdraw_collateral(&user.pubkey(), &margin, &usdc_mint, 500 * 10u64.pow(6), 0, &oracle_metas(&[usdc_price_update]))], &[])
         .expect("user_withdraw_collateral");
 
     send(&mut svm, &user, &[ix_user_close_collateral_position(&user.pubkey(), &margin, &usdc_mint)], &[]).expect("user_close_collateral_position");

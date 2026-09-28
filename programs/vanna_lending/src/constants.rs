@@ -46,6 +46,12 @@ pub const CLASSIC_SPL_TOKEN_PROGRAM: Pubkey = anchor_spl::token::ID;
 
 pub const TOKEN_2022_PROGRAM: Pubkey = anchor_spl::token_2022::ID;
 
+/// Kamino Scope, the price aggregator whose `OraclePrices` accounts assets can be priced from.
+pub const SCOPE_PROGRAM_ID: Pubkey = pubkey!("HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ");
+
+/// Number of price entries in a Scope `OraclePrices` account.
+pub const SCOPE_MAX_ENTRIES: usize = 512;
+
 /// Reference mint addresses (not enforced on-chain — assets are registered by the admin).
 /// Lending pools: USDC, USDT, SOL. Margin collateral: those three plus the collateral-only
 /// assets below.
@@ -56,22 +62,37 @@ pub mod known_mints {
     pub const JITOSOL: &str = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn";
     pub const JUPSOL: &str = "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v";
     pub const JUPUSD: &str = "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD";
-    /// xStocks: Token-2022 with the Scaled UI Amount extension (`PriceSource::ScaledUiAmount`).
+    /// xStocks: Token-2022. Priced by Scope's Chainlink xStocks entries, which already apply the
+    /// mint's Scaled UI multiplier, so the price is per raw token.
     pub const NVDAX: &str = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh";
     pub const TSLAX: &str = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB";
 }
 
-/// Reference Pyth feed ids (hex). JupSOL has no USD feed: it is priced as JUPSOL/SOL.RR × SOL/USD
-/// (`PriceSource::RedemptionRate`). The xStocks use their own token feeds, not the shares'.
+/// Reference Pyth feed ids (hex). Each asset reads its feed's shard-0 push account, which Pyth
+/// keeps updated (55 s heartbeat / 0.5% deviation). JupSOL has no USD feed: its Pyth fallback is
+/// JUPSOL/SOL.RR × SOL/USD. JitoSOL (stake rate × SOL/USD) and NVDAx / TSLAx (no maintained push
+/// account) use Scope only.
 pub mod pyth_feeds {
     pub const USDC_USD: &str = "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a";
     pub const USDT_USD: &str = "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b";
     pub const SOL_USD: &str = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
-    pub const JITOSOL_USD: &str = "67be9f519b95cf24338801051f9a808eff0a578ccb388db73b7f6fe1de019ffb";
     pub const JUPSOL_SOL_RR: &str = "f8d8d6b6c866c8b2624fb5b679ae846738725e5fc887fa8e927c8d8645018a2b";
     pub const JUPUSD_USD: &str = "8ed858a2214e892c9371694fb6c8a9037b6ed4052c4edf209f8cb988484e81d9";
-    pub const NVDAX_USD: &str = "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f";
-    pub const TSLAX_USD: &str = "47a156470288850a440df3a6ce85a55917b813a19bb5b31128a33a986566a362";
+}
+
+/// Kamino's Scope entries for the protocol's assets (reference only; each asset's `OracleConfig`
+/// is set by the admin). Entries are `[price chain]` / `[TWAP chain]`; every price is Chainlink
+/// and Pyth Lazer cross-checked by Scope, stablecoins are capped at $1, and liquid-staked SOL is
+/// the stake-pool rate × SOL/USD, as Kamino prices them.
+pub mod kamino_scope {
+    pub const ORACLE_PRICES: &str = "3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH";
+    pub const USDC: ([u16; 4], [u16; 4]) = ([13, u16::MAX, u16::MAX, u16::MAX], [456, u16::MAX, u16::MAX, u16::MAX]);
+    pub const USDT: ([u16; 4], [u16; 4]) = ([16, u16::MAX, u16::MAX, u16::MAX], [457, u16::MAX, u16::MAX, u16::MAX]);
+    pub const SOL: ([u16; 4], [u16; 4]) = ([3, u16::MAX, u16::MAX, u16::MAX], [455, u16::MAX, u16::MAX, u16::MAX]);
+    pub const JITOSOL: ([u16; 4], [u16; 4]) = ([210, 3, u16::MAX, u16::MAX], [210, 455, u16::MAX, u16::MAX]);
+    pub const JUPSOL: ([u16; 4], [u16; 4]) = ([224, 3, u16::MAX, u16::MAX], [224, 455, u16::MAX, u16::MAX]);
+    pub const NVDAX: ([u16; 4], [u16; 4]) = ([332, u16::MAX, u16::MAX, u16::MAX], [269, u16::MAX, u16::MAX, u16::MAX]);
+    pub const TSLAX: ([u16; 4], [u16; 4]) = ([338, u16::MAX, u16::MAX, u16::MAX], [273, u16::MAX, u16::MAX, u16::MAX]);
 }
 
 /// Kamino main market addresses — reference only; the live whitelist is the `Integration` registry.

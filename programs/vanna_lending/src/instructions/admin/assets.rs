@@ -3,9 +3,8 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::oracle::pyth::{canonical_feed_account, read_price_update};
-use crate::oracle::valuation::{receipt_rate, ui_multiplier_wad};
-use crate::state::asset_config::{AssetConfig, PriceSource};
+use crate::oracle;
+use crate::state::asset_config::{AssetConfig, OracleConfig};
 use crate::state::protocol_config::ProtocolConfig;
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{Mint, TokenInterface};
@@ -39,20 +38,19 @@ pub struct AdminRegisterAsset<'info> {
     pub system_program: Program<'info, System>,
 }
 
+/// Registers a mint with its oracle. `remaining_accounts` = every account `oracle` names (and, for a
+/// Kamino receipt, its underlying's `AssetConfig`), for the checks in `oracle::validate_config`.
 #[allow(clippy::too_many_arguments)]
 pub fn admin_register_asset(
     ctx: Context<AdminRegisterAsset>,
-    price_feed_id: [u8; 32],
+    oracle: OracleConfig,
     max_collateral_per_margin: u64,
     ltv_bps: u16,
     liquidation_threshold_bps: u16,
     liquidation_bonus_bps: u16,
-    max_confidence_bps: u16,
-    max_price_age_secs: u32,
     collateral_enabled: bool,
     borrow_enabled: bool,
 ) -> Result<()> {
-    require!(price_feed_id != [0u8; 32], VannaError::InvalidPriceFeed);
     AssetConfig::validate_risk_parameters(ltv_bps, liquidation_threshold_bps, liquidation_bonus_bps)?;
 
     let protocol_config = &mut ctx.accounts.protocol_config;
@@ -63,22 +61,18 @@ pub fn admin_register_asset(
     asset_config.mint = ctx.accounts.underlying_mint.key();
     asset_config.token_program = ctx.accounts.token_program.key();
     asset_config.reserve = Pubkey::default();
-    asset_config.price_feed_id = price_feed_id;
     asset_config.max_collateral_per_margin = max_collateral_per_margin;
     asset_config.ltv_bps = ltv_bps;
     asset_config.liquidation_threshold_bps = liquidation_threshold_bps;
     asset_config.liquidation_bonus_bps = liquidation_bonus_bps;
-    asset_config.max_confidence_bps = max_confidence_bps;
-    asset_config.max_price_age_secs = max_price_age_secs;
     asset_config.asset_index = asset_index;
     asset_config.decimals = ctx.accounts.underlying_mint.decimals;
     asset_config.collateral_enabled = collateral_enabled;
     asset_config.borrow_enabled = borrow_enabled;
     asset_config.bump = ctx.bumps.asset_config;
-    asset_config.price_source = PriceSource::Pyth;
-    asset_config.price_source_account = Pubkey::default();
-    asset_config.price_source_program = Pubkey::default();
-    asset_config.reserved = [0u8; 31];
+    asset_config.oracle = oracle;
+    asset_config.reserved = [0u8; 32];
+    oracle::validate_config(asset_config, &[ctx.remaining_accounts], ctx.program_id, &Clock::get()?)?;
 
     emit!(AssetRegistered {
         asset_config: asset_config.key(),
@@ -87,6 +81,11 @@ pub fn admin_register_asset(
         ltv_bps,
         liquidation_threshold_bps,
         liquidation_bonus_bps,
+        timestamp: Clock::get()?.unix_timestamp,
+    });
+    emit!(AssetOracleUpdated {
+        asset_config: asset_config.key(),
+        oracle,
         timestamp: Clock::get()?.unix_timestamp,
     });
     Ok(())
@@ -120,14 +119,13 @@ pub fn admin_update_asset_config(
     ltv_bps: u16,
     liquidation_threshold_bps: u16,
     liquidation_bonus_bps: u16,
-    max_confidence_bps: u16,
-    max_price_age_secs: u32,
     collateral_enabled: bool,
     borrow_enabled: bool,
 ) -> Result<()> {
     AssetConfig::validate_risk_parameters(ltv_bps, liquidation_threshold_bps, liquidation_bonus_bps)?;
+    // A Kamino receipt is collateral only.
     require!(
-        !borrow_enabled || ctx.accounts.asset_config.is_pyth_priced(),
+        !borrow_enabled || !ctx.accounts.asset_config.oracle.uses_klend(),
         VannaError::UnsupportedPriceSource
     );
 
@@ -136,8 +134,6 @@ pub fn admin_update_asset_config(
     asset_config.ltv_bps = ltv_bps;
     asset_config.liquidation_threshold_bps = liquidation_threshold_bps;
     asset_config.liquidation_bonus_bps = liquidation_bonus_bps;
-    asset_config.max_confidence_bps = max_confidence_bps;
-    asset_config.max_price_age_secs = max_price_age_secs;
     asset_config.collateral_enabled = collateral_enabled;
     asset_config.borrow_enabled = borrow_enabled;
 
@@ -155,11 +151,11 @@ pub fn admin_update_asset_config(
 }
 
 // ---------------------------------------------------------------------------
-// admin_set_asset_price_source
+// admin_set_asset_oracle
 // ---------------------------------------------------------------------------
 
 #[derive(Accounts)]
-pub struct AdminSetAssetPriceSource<'info> {
+pub struct AdminSetAssetOracle<'info> {
     pub admin: Signer<'info>,
     #[account(
         seeds = [PROTOCOL_SEED],
@@ -173,80 +169,20 @@ pub struct AdminSetAssetPriceSource<'info> {
         bump = asset_config.bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    /// CHECK: the account a non-Pyth source reads: the Kamino reserve, the asset's own mint
-    /// (Scaled UI Amount) or the base price feed (redemption rate). Validated below per source.
-    /// Omitted for `Pyth`.
-    pub source_account: Option<UncheckedAccount<'info>>,
-    /// The registered asset a source is anchored to: a receipt's underlying, or a redemption
-    /// rate's base asset (e.g. SOL for JupSOL). Omitted for `Pyth` and `ScaledUiAmount`.
-    #[account(seeds = [ASSET_SEED, underlying_asset_config.mint.as_ref()], bump = underlying_asset_config.bump)]
-    pub underlying_asset_config: Option<Box<Account<'info, AssetConfig>>>,
 }
 
-/// Switches how an asset is valued. Only allowed while the asset is not collateral-enabled, so an
-/// asset is never live under the wrong pricing: register it disabled, set the source, then enable
-/// it. Non-Pyth assets are collateral-only: no reserve and no borrowing.
-pub fn admin_set_asset_price_source(
-    mut ctx: Context<AdminSetAssetPriceSource>,
-    price_source: PriceSource,
-    source_program: Pubkey,
-) -> Result<()> {
-    let accounts = &mut ctx.accounts;
-    require!(!accounts.asset_config.collateral_enabled, VannaError::UnsupportedPriceSource);
-    if price_source != PriceSource::Pyth {
-        require!(
-            !accounts.asset_config.borrow_enabled && accounts.asset_config.reserve == Pubkey::default(),
-            VannaError::UnsupportedPriceSource
-        );
-    }
+/// Replaces how an asset is priced (the Solidity `OracleFacade.setOracle`). Allowed while the asset
+/// is live, so a source can be rotated without pausing it: the new config must pass every check in
+/// `oracle::validate_config`, including pricing the asset now. `remaining_accounts` as for
+/// `admin_register_asset`.
+pub fn admin_set_asset_oracle(ctx: Context<AdminSetAssetOracle>, oracle: OracleConfig) -> Result<()> {
+    let asset_config = &mut ctx.accounts.asset_config;
+    asset_config.oracle = oracle;
+    oracle::validate_config(asset_config, &[ctx.remaining_accounts], ctx.program_id, &Clock::get()?)?;
 
-    let source = accounts.source_account.as_ref().map(|a| a.to_account_info());
-    let asset_config = &mut accounts.asset_config;
-    asset_config.price_source = price_source;
-    match price_source {
-        PriceSource::Pyth => {
-            asset_config.price_source_account = Pubkey::default();
-            asset_config.price_source_program = Pubkey::default();
-        }
-        PriceSource::KaminoReceipt => {
-            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
-            asset_config.price_source_account = source.key();
-            asset_config.price_source_program = source_program;
-            let rate = receipt_rate(asset_config, Some(source))?;
-
-            // The cToken is priced with the underlying's feed at the underlying's decimals.
-            let underlying = accounts.underlying_asset_config.as_ref().ok_or(VannaError::InvalidPriceSource)?;
-            require_keys_eq!(underlying.mint, rate.liquidity_mint, VannaError::InvalidKaminoAccounts);
-            require!(underlying.decimals == rate.liquidity_decimals, VannaError::InvalidKaminoAccounts);
-            require!(asset_config.price_feed_id == underlying.price_feed_id, VannaError::InvalidPriceFeed);
-        }
-        PriceSource::ScaledUiAmount => {
-            // The source is the asset's own Token-2022 mint, which must carry the extension.
-            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
-            require_keys_eq!(source.key(), asset_config.mint, VannaError::InvalidPriceSource);
-            require_keys_eq!(source_program, anchor_spl::token_2022::ID, VannaError::InvalidPriceSource);
-            ui_multiplier_wad(source, Clock::get()?.unix_timestamp)?;
-            asset_config.price_source_account = source.key();
-            asset_config.price_source_program = source_program;
-        }
-        PriceSource::RedemptionRate => {
-            // The source is the base asset's canonical Pyth feed account, pinned by address.
-            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
-            let base = accounts.underlying_asset_config.as_ref().ok_or(VannaError::InvalidPriceSource)?;
-            require!(base.is_pyth_priced(), VannaError::InvalidPriceSource);
-            require_keys_eq!(source.key(), canonical_feed_account(&base.price_feed_id), VannaError::InvalidPriceSource);
-            require_keys_eq!(source_program, pyth_solana_receiver_sdk::ID, VannaError::InvalidPriceSource);
-            require!(read_price_update(source)?.price_message.feed_id == base.price_feed_id, VannaError::InvalidPriceFeed);
-            asset_config.price_source_account = source.key();
-            asset_config.price_source_program = source_program;
-        }
-    }
-
-    emit!(AssetPriceSourceUpdated {
+    emit!(AssetOracleUpdated {
         asset_config: asset_config.key(),
-        price_source,
-        source_account: asset_config.price_source_account,
-        source_program: asset_config.price_source_program,
+        oracle,
         timestamp: Clock::get()?.unix_timestamp,
     });
     Ok(())

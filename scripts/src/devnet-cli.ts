@@ -67,5 +67,3 @@ export async function tokenBalance(connection: Connection, tokenAccount: PublicK
   return BigInt(info.value.amount);
 }
 
-/** Passes an Anchor optional account as omitted: the resolver maps `null` to the program id. */
-export const OMITTED_ACCOUNT = null as unknown as PublicKey;

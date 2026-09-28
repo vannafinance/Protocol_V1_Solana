@@ -33,11 +33,6 @@ struct Env {
     sol_price: Pubkey,
 }
 
-fn assert_vanna_error(res: TransactionResult, err: VannaError) {
-    let code = anchor_lang::error::ERROR_CODE_OFFSET + err as u32;
-    let failure = format!("{:?}", res.expect_err("transaction should have failed").err);
-    assert!(failure.contains(&format!("Custom({code})")), "expected error {code}, got {failure}");
-}
 
 fn data(kind: Kind, args: RouteArgs) -> Vec<u8> {
     match kind {
@@ -78,10 +73,8 @@ fn setup() -> Env {
     }
     send(&mut svm, &admin, &[ix_admin_register_integration(&a, &a, &JUPITER, AdapterKind::Jupiter)], &[]).unwrap();
 
-    let usdc_price = Pubkey::new_unique();
-    let sol_price = Pubkey::new_unique();
-    set_price(&mut svm, &usdc_price, USDC_FEED, USDC_PRICE, 0, -8, FIXTURE_UNIX_TIMESTAMP);
-    set_price(&mut svm, &sol_price, WSOL_FEED, WSOL_PRICE, 0, -8, FIXTURE_UNIX_TIMESTAMP);
+    let usdc_price = set_pyth(&mut svm, USDC_FEED, USDC_PRICE, -8, FIXTURE_UNIX_TIMESTAMP);
+    let sol_price = set_pyth(&mut svm, WSOL_FEED, WSOL_PRICE, -8, FIXTURE_UNIX_TIMESTAMP);
 
     let lender = funded_keypair(&mut svm);
     set_token_balance(&mut svm, &lender.pubkey(), &MAINNET_USDC, 100_000 * USDC);
@@ -100,9 +93,11 @@ impl Env {
         (user, margin)
     }
 
-    /// `margin_execute` of a SOL -> USDC Jupiter call with the given data and accounts.
-    fn execute(&mut self, user: &Keypair, data: Vec<u8>, cpi: &[AccountMeta], health: &[AccountMeta], min_received: u64) -> TransactionResult {
-        let ix = ix_margin_execute(&user.pubkey(), &JUPITER, &NATIVE_MINT, &self.sol_price, &MAINNET_USDC, &self.usdc_price, data, cpi, health, min_received);
+    /// `margin_execute` of a SOL -> USDC Jupiter call; `groups` are the other positions', the
+    /// oracle accounts are added.
+    fn execute(&mut self, user: &Keypair, data: Vec<u8>, cpi: &[AccountMeta], groups: &[AccountMeta], min_received: u64) -> TransactionResult {
+        let health = with_oracles(groups.to_vec(), &[self.sol_price, self.usdc_price]);
+        let ix = ix_margin_execute(&user.pubkey(), &JUPITER, &NATIVE_MINT, &MAINNET_USDC, data, cpi, &health, min_received);
         send(&mut self.svm, user, &[ix], &[])
     }
 
@@ -181,17 +176,37 @@ fn swaps_are_health_checked_on_post_trade_balances() {
     let mut env = setup();
     let (user, margin) = env.user_with_collateral(NATIVE_MINT, 10 * SOL);
     send(&mut env.svm, &user, &[ix_user_open_debt_position(&user.pubkey(), &user.pubkey(), &margin, &MAINNET_USDC)], &[]).unwrap();
-    let sol_group = collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price);
-    let borrow = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, &env.usdc_price, 13_000 * USDC, u128::MAX, &sol_group);
+    let sol_group = with_oracles(collateral_group_metas(&NATIVE_MINT, &margin), &[env.sol_price, env.usdc_price]);
+    let borrow = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, 13_000 * USDC, u128::MAX, &sol_group);
     send(&mut env.svm, &user, &[borrow], &[]).expect("borrow 13,000 USDC");
 
-    let debt = debt_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
+    let debt = debt_group_metas(&MAINNET_USDC, &margin);
     assert_vanna_error(env.swap(&user, Kind::Route, 10 * SOL, 1, &debt), VannaError::HealthFactorTooLow);
     assert_eq!(env.balance(&margin, &NATIVE_MINT), 10 * SOL, "the refused swap rolled back");
 
     env.swap(&user, Kind::Route, 2 * SOL, 1, &debt).expect("a smaller swap stays healthy");
     // The health check must see the debt: without it the scan is incomplete.
     assert_vanna_error(env.swap(&user, Kind::Route, SOL, 1, &[]), VannaError::IncompletePositionAccounts);
+}
+
+/// While the account has debt a swap needs every price check; without debt it can't hurt the
+/// protocol, so a stale price doesn't block it.
+#[test]
+fn swaps_need_fresh_prices_only_while_in_debt() {
+    let mut env = setup();
+    let stale = FIXTURE_UNIX_TIMESTAMP - 3_601;
+    let (saver, _) = env.user_with_collateral(NATIVE_MINT, 2 * SOL);
+    let (user, margin) = env.user_with_collateral(NATIVE_MINT, 10 * SOL);
+    send(&mut env.svm, &user, &[ix_user_open_debt_position(&user.pubkey(), &user.pubkey(), &margin, &MAINNET_USDC)], &[]).unwrap();
+    let sol_group = with_oracles(collateral_group_metas(&NATIVE_MINT, &margin), &[env.sol_price, env.usdc_price]);
+    let borrow = ix_user_borrow(&user.pubkey(), &margin, &MAINNET_USDC, 1_000 * USDC, u128::MAX, &sol_group);
+    send(&mut env.svm, &user, &[borrow], &[]).expect("borrow 1,000 USDC");
+
+    let sol_price = env.sol_price;
+    set_price(&mut env.svm, &sol_price, WSOL_FEED, WSOL_PRICE, 0, -8, stale);
+    env.swap(&saver, Kind::Route, SOL, 1, &[]).expect("a debt-free swap goes through on a stale price");
+    let debt = debt_group_metas(&MAINNET_USDC, &margin);
+    assert_vanna_error(env.swap(&user, Kind::Route, SOL, 1, &debt), VannaError::StalePrice);
 }
 
 /// `min_received` is measured on the margin vault after Jupiter runs; Jupiter's own quote and
@@ -311,9 +326,9 @@ fn registry_assets_and_operating_mode_gate_swaps() {
     send(&mut env.svm, &env.admin, &[ix_admin_set_operating_mode(&a, 0)], &[]).unwrap();
 
     // Output into an asset that isn't collateral-enabled.
-    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &MAINNET_USDC, 0, 8_000, 8_500, 500, 1_000, 3_600, false, true)], &[]).unwrap();
+    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &MAINNET_USDC, 0, 8_000, 8_500, 500, false, true)], &[]).unwrap();
     assert_vanna_error(env.swap(&user, Kind::Route, SOL, 1, &[]), VannaError::AssetNotCollateralEnabled);
-    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &MAINNET_USDC, 0, 8_000, 8_500, 500, 1_000, 3_600, true, true)], &[]).unwrap();
+    send(&mut env.svm, &env.admin, &[ix_admin_update_asset_config(&a, &MAINNET_USDC, 0, 8_000, 8_500, 500, true, true)], &[]).unwrap();
 
     // Input the margin doesn't hold as collateral.
     let (usdc_only, _) = env.user_with_collateral(MAINNET_USDC, 100 * USDC);

@@ -4,8 +4,8 @@ use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::health::{calculate_health, CollateralValuation};
-use crate::oracle::valuation::{collateral_value, source_or_mint};
-use crate::risk_engine::scan_and_validate_positions;
+use crate::oracle::{get_price, PriceStatus};
+use crate::risk_engine::{scan_positions, split_positions};
 use crate::state::asset_config::AssetConfig;
 use crate::state::margin_account::MarginAccount;
 use crate::state::protocol_config::ProtocolConfig;
@@ -14,7 +14,6 @@ use crate::validation::token::{transfer_in_measured, transfer_out_checked, verif
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{close_account, CloseAccount, Mint, TokenAccount, TokenInterface};
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // ---------------------------------------------------------------------------
 // user_deposit_collateral
@@ -131,8 +130,6 @@ pub struct UserWithdrawCollateral<'info> {
     #[account(seeds = [ASSET_SEED, mint.key().as_ref()], bump = asset_config.bump)]
     pub asset_config: Box<Account<'info, AssetConfig>>,
     pub mint: Box<InterfaceAccount<'info, Mint>>,
-    /// Other positions' price updates come via `remaining_accounts`.
-    pub price_update: Box<Account<'info, PriceUpdateV2>>,
     #[account(
         mut,
         token::mint = mint,
@@ -147,15 +144,13 @@ pub struct UserWithdrawCollateral<'info> {
         token::token_program = token_program
     )]
     pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the asset's registered price-source account (Kamino reserve, base price feed);
-    /// checked by key in `collateral_value`. Omitted for Pyth-priced and Scaled UI Amount assets
-    /// (the latter read `mint`).
-    pub price_source_account: Option<UncheckedAccount<'info>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
-pub fn user_withdraw_collateral(
-    ctx: Context<UserWithdrawCollateral>,
+/// `remaining_accounts` = the health groups of every other position (the `risk_engine` layout),
+/// then the oracle accounts of every asset involved, the withdrawn one included (any order).
+pub fn user_withdraw_collateral<'info>(
+    ctx: Context<'info, UserWithdrawCollateral<'info>>,
     amount: u64,
     min_health_factor_wad: u128,
 ) -> Result<()> {
@@ -171,40 +166,45 @@ pub fn user_withdraw_collateral(
     require!(ctx.accounts.margin_vault.amount >= amount, VannaError::InsufficientCollateral);
 
     let clock = Clock::get()?;
-    let margin_key = ctx.accounts.margin_account.key();
-    let (mut collaterals, debts) = scan_and_validate_positions(
-        &margin_key,
-        &ctx.accounts.margin_account,
-        ctx.remaining_accounts,
-        ctx.program_id,
-        &clock,
-        &[ctx.accounts.asset_config.asset_index],
-        None,
-    )?;
-
     let projected_amount = ctx
         .accounts
         .margin_vault
         .amount
         .checked_sub(amount)
         .ok_or(VannaError::MathUnderflow)?;
-    let explicit_source = ctx.accounts.price_source_account.as_ref().map(|a| a.to_account_info());
-    let mint_info = ctx.accounts.mint.to_account_info();
-    let source = source_or_mint(&ctx.accounts.asset_config, explicit_source.as_ref(), &mint_info);
-    collaterals.push(CollateralValuation {
-        collateral_value: collateral_value(
-            &ctx.accounts.asset_config,
-            projected_amount,
-            &ctx.accounts.price_update,
-            source,
-            &clock,
-        )?,
-    });
 
-    let health = calculate_health(&collaterals, &debts)?;
-    require!(health.is_borrow_healthy(), VannaError::HealthFactorTooLow);
+    // Solidity `isWithdrawAllowed`: `if (hasNoDebt) return true`. Without debt a withdrawal can't
+    // hurt the protocol, so it reads no prices and works through any oracle outage. With debt,
+    // every price must pass every check.
+    let health_factor = if ctx.accounts.margin_account.debt_count == 0 {
+        u128::MAX
+    } else {
+        let margin_key = ctx.accounts.margin_account.key();
+        let asset_index = ctx.accounts.asset_config.asset_index;
+        let (positions, oracle_accounts) =
+            split_positions(ctx.remaining_accounts, &ctx.accounts.margin_account, &[asset_index], None)?;
+        let valuation = scan_positions(
+            &margin_key,
+            &ctx.accounts.margin_account,
+            positions,
+            &[oracle_accounts],
+            ctx.program_id,
+            &clock,
+            &[asset_index],
+            None,
+        )?;
+        let (mut collaterals, debts) = (valuation.collaterals, valuation.debts);
+        let price = get_price(&ctx.accounts.asset_config, &[oracle_accounts], &clock)?;
+        valuation.status.intersection(price.status).require(PriceStatus::ALL_CHECKS)?;
+        collaterals.push(CollateralValuation {
+            collateral_value: price.value_of(projected_amount, ctx.accounts.asset_config.decimals, false)?,
+        });
+        let health = calculate_health(&collaterals, &debts)?;
+        require!(health.is_borrow_healthy(), VannaError::HealthFactorTooLow);
+        health.borrow_health_factor_wad
+    };
     if min_health_factor_wad > 0 {
-        require!(health.borrow_health_factor_wad >= min_health_factor_wad, VannaError::HealthFactorTooLow);
+        require!(health_factor >= min_health_factor_wad, VannaError::HealthFactorTooLow);
     }
 
     let authority_key = ctx.accounts.margin_account.authority;
@@ -233,7 +233,7 @@ pub fn user_withdraw_collateral(
         mint: ctx.accounts.mint.key(),
         amount,
         new_collateral_amount: projected_amount,
-        borrow_health_factor_wad: health.borrow_health_factor_wad,
+        borrow_health_factor_wad: health_factor,
         event_sequence,
         timestamp: clock.unix_timestamp,
     });

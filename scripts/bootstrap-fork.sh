@@ -13,13 +13,14 @@ for asset in usdc usdt wsol; do
   npx tsx src/devnet.ts register-asset --asset "$asset" || true
   npx tsx src/devnet.ts initialize-reserve --asset "$asset" || true
 done
-# Collateral-only assets. JupSOL is priced against SOL, so SOL is registered first (above); the
-# xStocks and JupSOL get their price source inside register-asset.
+# Collateral-only assets. register-asset passes each asset's oracle (scripts/src/devnet-env.ts
+# ASSET_ORACLES: Kamino Scope first, Pyth fallback) and refreshes it on the fork first, because
+# the program reads the oracle accounts to check them.
 for asset in jitosol jupsol jupusd nvdax tslax; do
   npx tsx src/devnet.ts register-asset --asset "$asset" || true
 done
 # Kamino: whitelist klend for `margin_execute`, then register each cToken as collateral priced
-# through its Kamino reserve.
+# as its underlying (registered above) through its Kamino reserve.
 npx tsx src/integrations-fork.ts register-kamino || true
 for symbol in USDC SOL; do
   npx tsx src/integrations-fork.ts register-receipt --symbol "$symbol" || true

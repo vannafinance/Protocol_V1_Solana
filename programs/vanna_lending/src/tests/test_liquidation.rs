@@ -47,7 +47,7 @@ fn setup() -> Env {
             .unwrap();
         send(&mut svm, &admin, &[ix_admin_initialize_reserve(&a, &a, &mint, DEFAULT_RATE_CURVE, 1_000, 0, 0, 0)], &[]).unwrap();
     }
-    let (usdc_price, sol_price) = (Pubkey::new_unique(), Pubkey::new_unique());
+    let (usdc_price, sol_price) = (pyth_account(&USDC_FEED), pyth_account(&WSOL_FEED));
     let now = svm.get_sysvar::<Clock>().unix_timestamp;
     set_price(&mut svm, &usdc_price, USDC_FEED, USDC_PRICE, 0, -8, now);
     set_price(&mut svm, &sol_price, WSOL_FEED, WSOL_PRICE, 0, -8, now);
@@ -83,12 +83,13 @@ impl Env {
             ix_user_open_debt_position(&u, &u, &margin, &self.usdc),
         ];
         send(&mut self.svm, &user, &ixs, &[]).unwrap();
-        let sol_group = collateral_group_metas(&self.sol, &margin, &self.sol_price);
-        let borrow = ix_user_borrow(&u, &margin, &self.usdc, &self.usdc_price, usdc, u128::MAX, &sol_group);
+        let oracles = self.keys().oracles();
+        let sol_group = collateral_group_metas(&self.sol, &margin);
+        let borrow = ix_user_borrow(&u, &margin, &self.usdc, usdc, u128::MAX, &with_oracles(sol_group.clone(), &oracles));
         send(&mut self.svm, &user, &[borrow], &[]).unwrap();
         let mut health = sol_group;
-        health.extend(debt_group_metas(&self.usdc, &margin, &self.usdc_price));
-        let withdraw = ix_user_withdraw_collateral(&u, &margin, &self.usdc, &self.usdc_price, usdc, 0, &health);
+        health.extend(debt_group_metas(&self.usdc, &margin));
+        let withdraw = ix_user_withdraw_collateral(&u, &margin, &self.usdc, usdc, 0, &with_oracles(health, &oracles));
         send(&mut self.svm, &user, &[withdraw], &[]).unwrap();
         (user, margin)
     }
@@ -125,11 +126,17 @@ impl Env {
     }
 }
 
+impl Keys {
+    fn oracles(&self) -> [Pubkey; 2] {
+        [self.sol_price, self.usdc_price]
+    }
+}
+
 /// SOL collateral swept to the liquidator, USDC debt repaid from the liquidator's wallet.
 fn sol_for_usdc(k: Keys, margin: &Pubkey, sol_destination: &Pubkey, usdc_source: &Pubkey) -> Vec<LiqPosition> {
     vec![
-        liq_collateral(&k.sol, &anchor_spl::token::ID, margin, &k.sol_price, None, sol_destination),
-        liq_debt(&k.usdc, margin, &k.usdc_price, usdc_source),
+        liq_collateral(&k.sol, &anchor_spl::token::ID, margin, sol_destination),
+        liq_debt(&k.usdc, margin, usdc_source),
     ]
 }
 
@@ -145,7 +152,7 @@ fn unhealthy_account_is_liquidated_whole() {
     assert!(debt > 1_390 * USDC, "a day of interest accrued");
 
     let (liquidator, usdc_ata, sol_ata) = env.liquidator(2_000 * USDC);
-    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata));
+    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata), &env.keys().oracles());
     let meta = send(&mut env.svm, &liquidator, &[ix], &[]).expect("liquidate");
 
     assert_eq!(token_balance(&env.svm, &sol_ata), 10 * SOL, "every SOL swept");
@@ -172,7 +179,7 @@ fn account_below_health_factor_one_is_liquidated() {
     let (_user, margin) = env.sol_borrower(10 * SOL, 1_390 * USDC);
     env.set_sol_price(10_000_000_000); // $100: HF = 1,000 / 1,390 ≈ 0.72
     let (liquidator, usdc_ata, sol_ata) = env.liquidator(2_000 * USDC);
-    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata));
+    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata), &env.keys().oracles());
     let meta = send(&mut env.svm, &liquidator, &[ix], &[]).expect("liquidate below HF 1");
     let liquidated: Liquidated = event(&meta.logs);
     assert!(liquidated.health_factor_wad < 730_000_000_000_000_000);
@@ -186,7 +193,7 @@ fn healthy_account_cannot_be_liquidated() {
     let mut env = setup();
     let (_user, margin) = env.sol_borrower(10 * SOL, 1_390 * USDC); // $200: HF ≈ 1.44
     let (liquidator, usdc_ata, sol_ata) = env.liquidator(2_000 * USDC);
-    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata));
+    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata), &env.keys().oracles());
     assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::PositionHealthy);
 }
 
@@ -209,28 +216,29 @@ fn every_debt_and_collateral_settles_in_one_transaction() {
         ix_user_open_debt_position(&u, &u, &margin, &sol),
     ];
     send(&mut env.svm, &user, &setup_ixs, &[]).unwrap();
-    let sol_group = collateral_group_metas(&sol, &margin, &env.sol_price);
-    let usdc_group = collateral_group_metas(&usdc, &margin, &env.usdc_price);
-    send(&mut env.svm, &user, &[ix_user_borrow(&u, &margin, &usdc, &env.usdc_price, 1_000 * USDC, u128::MAX, &sol_group)], &[]).unwrap();
+    let oracles = env.keys().oracles();
+    let sol_group = collateral_group_metas(&sol, &margin);
+    let usdc_group = collateral_group_metas(&usdc, &margin);
+    send(&mut env.svm, &user, &[ix_user_borrow(&u, &margin, &usdc, 1_000 * USDC, u128::MAX, &with_oracles(sol_group.clone(), &oracles))], &[]).unwrap();
     let mut others = usdc_group.clone();
-    others.extend(debt_group_metas(&usdc, &margin, &env.usdc_price));
-    send(&mut env.svm, &user, &[ix_user_borrow(&u, &margin, &sol, &env.sol_price, 2 * SOL, u128::MAX, &others)], &[]).unwrap();
+    others.extend(debt_group_metas(&usdc, &margin));
+    send(&mut env.svm, &user, &[ix_user_borrow(&u, &margin, &sol, 2 * SOL, u128::MAX, &with_oracles(others, &oracles))], &[]).unwrap();
     // SOL $200 -> $110: collateral 12 SOL + 1,100 USDC = $2,420; debt $1,000 + 2 SOL = $1,220 -> HF 1.98.
     // Take 1,000 USDC out first so the account is thin: $1,420 / $1,220 ≈ 1.16, then crash to $95.
     let mut health = sol_group.clone();
-    health.extend(debt_group_metas(&usdc, &margin, &env.usdc_price));
-    health.extend(debt_group_metas(&sol, &margin, &env.sol_price));
-    send(&mut env.svm, &user, &[ix_user_withdraw_collateral(&u, &margin, &usdc, &env.usdc_price, 1_000 * USDC, 0, &health)], &[]).unwrap();
+    health.extend(debt_group_metas(&usdc, &margin));
+    health.extend(debt_group_metas(&sol, &margin));
+    send(&mut env.svm, &user, &[ix_user_withdraw_collateral(&u, &margin, &usdc, 1_000 * USDC, 0, &with_oracles(health, &oracles))], &[]).unwrap();
     env.set_sol_price(9_500_000_000); // 12 SOL × $95 + 100 USDC = $1,240 vs $1,000 + $190 -> HF ≈ 1.04
 
     let (liquidator, usdc_ata, sol_ata) = env.liquidator(1_000 * USDC);
     let positions = [
-        liq_collateral(&sol, &anchor_spl::token::ID, &margin, &env.sol_price, None, &sol_ata),
-        liq_collateral(&usdc, &anchor_spl::token::ID, &margin, &env.usdc_price, None, &usdc_ata),
-        liq_debt(&usdc, &margin, &env.usdc_price, &usdc_ata),
-        liq_debt(&sol, &margin, &env.sol_price, &sol_ata),
+        liq_collateral(&sol, &anchor_spl::token::ID, &margin, &sol_ata),
+        liq_collateral(&usdc, &anchor_spl::token::ID, &margin, &usdc_ata),
+        liq_debt(&usdc, &margin, &usdc_ata),
+        liq_debt(&sol, &margin, &sol_ata),
     ];
-    let meta = send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions)], &[])
+    let meta = send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions, &oracles)], &[])
         .expect("liquidate two debts and two collaterals");
     let liquidated: Liquidated = event(&meta.logs);
     assert_eq!((liquidated.collaterals_seized, liquidated.debts_repaid), (2, 2));
@@ -252,37 +260,38 @@ fn liquidation_accounts_are_validated() {
     let k = env.keys();
     let positions = || sol_for_usdc(k, &margin, &sol_ata, &usdc_ata);
 
+    let oracles = k.oracles();
+
     // Debt left out entirely.
-    let ix = ix_public_liquidate(&l, &margin, &positions()[..1]);
+    let ix = ix_public_liquidate(&l, &margin, &positions()[..1], &oracles);
     assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::IncompletePositionAccounts);
-    // Settlement accounts missing.
+    // A settlement account missing: the first oracle account (SOL's) is taken into the settlement
+    // list, so the SOL collateral can't be priced.
     let mut short = positions();
     short[1].settlement.pop();
-    let ix = ix_public_liquidate(&l, &margin, &short);
-    assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::IncompletePositionAccounts);
-    // An extra trailing account.
-    let mut long = positions();
-    long[1].settlement.push(anchor_lang::solana_program::instruction::AccountMeta::new_readonly(Pubkey::new_unique(), false));
-    let ix = ix_public_liquidate(&l, &margin, &long);
-    assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::IncompletePositionAccounts);
+    let ix = ix_public_liquidate(&l, &margin, &short, &oracles);
+    assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::InvalidPriceSource);
+    // A price account missing: the SOL collateral can't be valued.
+    let ix = ix_public_liquidate(&l, &margin, &positions(), &[env.usdc_price]);
+    assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::InvalidPriceSource);
     // Repayment sent to a vault that isn't the pool's.
     let mut wrong_vault = positions();
     wrong_vault[1].settlement[1].pubkey = usdc_ata;
-    let ix = ix_public_liquidate(&l, &margin, &wrong_vault);
+    let ix = ix_public_liquidate(&l, &margin, &wrong_vault, &oracles);
     assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::InvalidVaultAuthority);
     // Wrong mint for the collateral.
     let mut wrong_mint = positions();
     wrong_mint[0].settlement[0].pubkey = env.usdc;
-    let ix = ix_public_liquidate(&l, &margin, &wrong_mint);
+    let ix = ix_public_liquidate(&l, &margin, &wrong_mint, &oracles);
     assert_vanna_error(send(&mut env.svm, &liquidator, &[ix], &[]), VannaError::InvalidMint);
     // A liquidator who can't cover the debt: the whole transaction reverts.
     let (poor, poor_usdc, poor_sol) = env.liquidator(100 * USDC);
-    let ix = ix_public_liquidate(&poor.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &poor_sol, &poor_usdc));
+    let ix = ix_public_liquidate(&poor.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &poor_sol, &poor_usdc), &oracles);
     assert!(send(&mut env.svm, &poor, &[ix], &[]).is_err());
     assert_eq!(fetch_margin(&env.svm, &user.pubkey()).collateral_count, 1, "nothing moved");
     assert_eq!(token_balance(&env.svm, &poor_sol), 0);
 
-    let ix = ix_public_liquidate(&l, &margin, &positions());
+    let ix = ix_public_liquidate(&l, &margin, &positions(), &oracles);
     send(&mut env.svm, &liquidator, &[ix], &[]).expect("correct accounts liquidate");
 }
 
@@ -294,11 +303,11 @@ fn liquidation_is_never_paused_and_sweeps_disabled_collateral() {
     let (_user, margin) = env.sol_borrower(10 * SOL, 1_390 * USDC);
     env.set_sol_price(15_000_000_000);
     let a = env.admin.pubkey();
-    let disable = ix_admin_update_asset_config(&a, &env.sol, 0, 8_000, 8_500, 500, 1_000, 3_600, false, true);
+    let disable = ix_admin_update_asset_config(&a, &env.sol, 0, 8_000, 8_500, 500, false, true);
     send(&mut env.svm, &env.admin, &[disable, ix_admin_set_operating_mode(&a, 3)], &[]).unwrap();
 
     let (liquidator, usdc_ata, sol_ata) = env.liquidator(2_000 * USDC);
-    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata));
+    let ix = ix_public_liquidate(&liquidator.pubkey(), &margin, &sol_for_usdc(env.keys(), &margin, &sol_ata, &usdc_ata), &env.keys().oracles());
     send(&mut env.svm, &liquidator, &[ix], &[]).expect("liquidate while Halted and SOL collateral-disabled");
     assert_eq!(token_balance(&env.svm, &sol_ata), 10 * SOL);
 }

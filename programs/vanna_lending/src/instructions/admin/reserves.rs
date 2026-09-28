@@ -75,7 +75,9 @@ pub fn admin_initialize_reserve(
     status: u8,
 ) -> Result<()> {
     require_keys_eq!(ctx.accounts.asset_config.reserve, Pubkey::default(), VannaError::ReserveAlreadyExists);
-    require!(ctx.accounts.asset_config.is_pyth_priced(), VannaError::UnsupportedPriceSource);
+    // A pool asset must be priceable, and a Kamino receipt is collateral only.
+    let oracle = &ctx.accounts.asset_config.oracle;
+    require!(oracle.is_configured() && !oracle.uses_klend(), VannaError::UnsupportedPriceSource);
     Reserve::validate_rate_config(&rate_curve, reserve_factor_bps)?;
     ReserveStatus::from_u8(status).ok_or(VannaError::InvalidReserveStatus)?;
 

@@ -114,4 +114,10 @@ pub enum VannaError {
     InvalidPriceSource,
     #[msg("Asset's price source does not support this action")]
     UnsupportedPriceSource,
+    #[msg("No configured oracle source returned a usable price")]
+    PriceUnavailable,
+    #[msg("Oracle price is too far from its TWAP")]
+    PriceTooDivergentFromTwap,
+    #[msg("Oracle configuration is invalid")]
+    InvalidOracleConfig,
 }

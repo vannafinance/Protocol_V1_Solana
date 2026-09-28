@@ -63,6 +63,7 @@ pub fn plan_call(data: &[u8], account_count: usize) -> Result<CallPlan> {
 }
 
 /// Exchange-rate snapshot of one klend reserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReserveRate {
     pub liquidity_mint: Pubkey,
     /// Decimals of the underlying. klend cToken mints always have 6 decimals, so underlying

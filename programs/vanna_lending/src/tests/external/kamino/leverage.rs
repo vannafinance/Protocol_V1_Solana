@@ -19,25 +19,25 @@ fn borrowed_usdc_can_be_supplied_to_kamino_and_stays_health_checked() {
     env.open_usdc_debt(&user);
     env.borrow_usdc(&user, 2_000 * USDC, &[]).expect("borrow 2,000 against 1,000 (HF 1.5)");
 
-    let debt = debt_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
+    let debt = debt_group_metas(&MAINNET_USDC, &margin);
     env.supply(&user, &USDC_RESERVE, 2_500 * USDC, 1, &debt).expect("supply with open debt");
     assert!(env.is_active(&user, &USDC_RESERVE.collateral_mint));
 
     // Withdrawing every cToken to the wallet would leave ~$500 against $2,000 of debt.
-    let usdc_group = collateral_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
+    let usdc_group = collateral_group_metas(&MAINNET_USDC, &margin);
     let health: Vec<AccountMeta> = usdc_group.iter().chain(debt.iter()).cloned().collect();
     let receipts = env.balance(&margin, &USDC_RESERVE.collateral_mint);
     set_token_balance(&mut env.svm, &user.pubkey(), &USDC_RESERVE.collateral_mint, 0);
-    let withdraw = |amount, source| {
-        ix_user_withdraw_collateral_priced(&user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, &env.usdc_price, source, amount, 0, &health)
+    let withdraw = |amount, oracles: &[Pubkey]| {
+        ix_user_withdraw_collateral(&user.pubkey(), &margin, &USDC_RESERVE.collateral_mint, amount, 0, &with_oracles(health.clone(), oracles))
     };
-    let ix = withdraw(receipts, Some(USDC_RESERVE.reserve));
+    let ix = withdraw(receipts, &env.oracles());
     assert_vanna_error(send(&mut env.svm, &user, &[ix], &[]), VannaError::HealthFactorTooLow);
     // The receipt can't be valued without its reserve.
-    let ix = withdraw(100 * USDC, None);
+    let ix = withdraw(100 * USDC, &[env.usdc_price, env.sol_price]);
     assert_vanna_error(send(&mut env.svm, &user, &[ix], &[]), VannaError::InvalidPriceSource);
     // A small withdrawal keeps HF well above 1.10.
-    let ix = withdraw(100 * USDC, Some(USDC_RESERVE.reserve));
+    let ix = withdraw(100 * USDC, &env.oracles());
     send(&mut env.svm, &user, &[ix], &[]).expect("small cUSDC withdrawal stays healthy");
 }
 
@@ -52,7 +52,7 @@ fn csol_is_valued_at_sol_decimals_through_the_real_reserve() {
 
     let mut health = env.receipt_group(&margin, &SOL_RESERVE);
     if env.is_active(&user, &NATIVE_MINT) {
-        health.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price)); // rounding dust
+        health.extend(collateral_group_metas(&NATIVE_MINT, &margin)); // rounding dust
     }
     assert_vanna_error(env.borrow_usdc(&user, 25_000 * USDC, &health), VannaError::HealthFactorTooLow);
     env.borrow_usdc(&user, 15_000 * USDC, &health).expect("borrow against ~$2,000 of cSOL");
@@ -61,24 +61,19 @@ fn csol_is_valued_at_sol_decimals_through_the_real_reserve() {
 /// Liquidation accounts for every position of `margin`, in slot order, sweeping to the
 /// liquidator's ATAs and repaying the USDC debt from its USDC ATA.
 fn whole_account(env: &mut Env, user: &solana_keypair::Keypair, margin: &Pubkey, liquidator: &Pubkey) -> Vec<LiqPosition> {
-    let assets = [
-        (MAINNET_USDC, env.usdc_price, None),
-        (NATIVE_MINT, env.sol_price, None),
-        (USDC_RESERVE.collateral_mint, env.usdc_price, Some(USDC_RESERVE.reserve)),
-        (SOL_RESERVE.collateral_mint, env.sol_price, Some(SOL_RESERVE.reserve)),
-    ];
+    let assets = [MAINNET_USDC, NATIVE_MINT, USDC_RESERVE.collateral_mint, SOL_RESERVE.collateral_mint];
     let account = fetch_margin(&env.svm, &user.pubkey());
     let mut positions = Vec::new();
     for index in account.active_collateral_indexes() {
-        let (mint, price, source) = assets.into_iter().find(|(m, ..)| fetch_asset_config(&env.svm, m).asset_index == index).unwrap();
+        let mint = assets.into_iter().find(|m| fetch_asset_config(&env.svm, m).asset_index == index).unwrap();
         let destination = get_associated_token_address(liquidator, &mint);
         if env.svm.get_account(&destination).is_none() {
             set_token_balance(&mut env.svm, liquidator, &mint, 0);
         }
-        positions.push(liq_collateral(&mint, &anchor_spl::token::ID, margin, &price, source.as_ref(), &destination));
+        positions.push(liq_collateral(&mint, &anchor_spl::token::ID, margin, &destination));
     }
     let usdc_account = get_associated_token_address(liquidator, &MAINNET_USDC);
-    positions.push(liq_debt(&MAINNET_USDC, margin, &env.usdc_price, &usdc_account));
+    positions.push(liq_debt(&MAINNET_USDC, margin, &usdc_account));
     positions
 }
 
@@ -93,7 +88,7 @@ fn liquidator_takes_the_whole_account_including_ctokens() {
     env.open_usdc_debt(&user);
     let mut health = env.receipt_group(&margin, &SOL_RESERVE);
     if env.is_active(&user, &NATIVE_MINT) {
-        health.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price));
+        health.extend(collateral_group_metas(&NATIVE_MINT, &margin));
     }
     env.borrow_usdc(&user, 15_000 * USDC, &health).unwrap();
     // SOL $200 -> $100: HF = (1,000 + 15,000) / 15,000 ≈ 1.067.
@@ -103,7 +98,8 @@ fn liquidator_takes_the_whole_account_including_ctokens() {
     let usdc_account = set_token_balance(&mut env.svm, &liquidator.pubkey(), &MAINNET_USDC, 0);
     let receipts = env.balance(&margin, &SOL_RESERVE.collateral_mint);
     let positions = whole_account(&mut env, &user, &margin, &liquidator.pubkey());
-    send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions)], &[])
+    let liquidate = ix_public_liquidate(&liquidator.pubkey(), &margin, &positions, &env.oracles());
+    send(&mut env.svm, &liquidator, &[liquidate], &[])
         .expect("liquidate the whole account");
 
     assert_eq!(token_balance(&env.svm, &usdc_account), 0, "the swept 15,000 USDC repaid the 15,000 USDC debt");
@@ -133,10 +129,10 @@ fn farm_fully_in_kamino_is_liquidated_in_one_transaction() {
     env.open_usdc_debt(&user);
     let mut csol = env.receipt_group(&margin, &SOL_RESERVE);
     if env.is_active(&user, &NATIVE_MINT) {
-        csol.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price));
+        csol.extend(collateral_group_metas(&NATIVE_MINT, &margin));
     }
     env.borrow_usdc(&user, 1_500 * USDC, &csol).unwrap();
-    let health: Vec<AccountMeta> = csol.iter().cloned().chain(debt_group_metas(&MAINNET_USDC, &margin, &env.usdc_price)).collect();
+    let health: Vec<AccountMeta> = csol.iter().cloned().chain(debt_group_metas(&MAINNET_USDC, &margin)).collect();
     env.supply(&user, &USDC_RESERVE, 1_500 * USDC, 1, &health).expect("borrowed USDC into Kamino");
     // SOL $200 -> $14: HF = (140 + 1,500) / 1,500 ≈ 1.093.
     set_price(&mut env.svm, &env.sol_price, WSOL_FEED, 1_400_000_000, 0, -8, FIXTURE_UNIX_TIMESTAMP);
@@ -146,7 +142,8 @@ fn farm_fully_in_kamino_is_liquidated_in_one_transaction() {
     let (csol_before, cusdc_before) =
         (env.balance(&margin, &SOL_RESERVE.collateral_mint), env.balance(&margin, &USDC_RESERVE.collateral_mint));
     let positions = whole_account(&mut env, &user, &margin, &liquidator.pubkey());
-    send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions)], &[])
+    let liquidate = ix_public_liquidate(&liquidator.pubkey(), &margin, &positions, &env.oracles());
+    send(&mut env.svm, &liquidator, &[liquidate], &[])
         .expect("liquidate the Kamino farm");
 
     let liq = liquidator.pubkey();
@@ -187,7 +184,7 @@ fn leveraged_kamino_farm_walkthrough() {
     use vanna_lending::math::shares::{debt_shares_to_assets_up, lender_total_assets};
 
     let mut env = setup();
-    let debt_group = |env: &Env, margin: &Pubkey| debt_group_metas(&MAINNET_USDC, margin, &env.usdc_price);
+    let debt_group = |margin: &Pubkey| debt_group_metas(&MAINNET_USDC, margin);
 
     // -- 1. Deposit 1,000 USDC of own capital ---------------------------------------------------
     let equity = 1_000 * USDC;
@@ -216,7 +213,7 @@ fn leveraged_kamino_farm_walkthrough() {
     let exposure = equity + borrowed_amount;
     let (stored_liquidity, stored_supply) = reserve_rate(&env.svm, &USDC_RESERVE);
 
-    let meta = env.supply(&user, &USDC_RESERVE, exposure, 1, &debt_group(&env, &margin)).expect("supply via margin_execute");
+    let meta = env.supply(&user, &USDC_RESERVE, exposure, 1, &debt_group(&margin)).expect("supply via margin_execute");
     let supplied: MarginExecuted = event(&meta.logs);
     let usdc_left = env.balance(&margin, &MAINNET_USDC);
     let ctokens = env.balance(&margin, &USDC_RESERVE.collateral_mint);
@@ -279,7 +276,7 @@ fn leveraged_kamino_farm_walkthrough() {
     );
 
     // -- 5. Unwind: redeem from Kamino via margin_execute, repay, withdraw ----------------------
-    let meta = env.redeem(&user, &USDC_RESERVE, ctokens, 1, &debt_group(&env, &margin)).expect("redeem via margin_execute");
+    let meta = env.redeem(&user, &USDC_RESERVE, ctokens, 1, &debt_group(&margin)).expect("redeem via margin_execute");
     let redeemed: MarginExecuted = event(&meta.logs);
     assert_eq!(redeemed.amount_spent, ctokens);
     // Theory: USDC = cTokens × (USDC per cToken), at the rate klend accrued to for the redeem
@@ -307,7 +304,7 @@ fn leveraged_kamino_farm_walkthrough() {
 
     let usdc_after_repay = env.balance(&margin, &MAINNET_USDC);
     assert_eq!(usdc_after_repay, usdc_back - debt_now);
-    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &MAINNET_USDC, &env.usdc_price, usdc_after_repay, 0, &[]);
+    let ix = ix_user_withdraw_collateral(&user.pubkey(), &margin, &MAINNET_USDC, usdc_after_repay, 0, &env.health(&[]));
     send(&mut env.svm, &user, &[ix], &[]).expect("withdraw everything");
     let wallet = token_balance(&env.svm, &get_associated_token_address(&user.pubkey(), &MAINNET_USDC));
 

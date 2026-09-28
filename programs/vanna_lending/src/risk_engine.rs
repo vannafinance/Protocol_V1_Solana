@@ -1,13 +1,12 @@
 //! Account-level risk: finds, validates and values every open position of a margin account, the
-//! inputs to its health factor (`math::health`).
+//! inputs to its health factor (`math::health`). Every price comes from the oracle facade.
 
 use crate::constants::{ASSET_SEED, DEBT_SEED, RESERVE_SEED};
 use crate::errors::VannaError;
-use crate::math::health::{normalize_token_value, CollateralValuation, DebtValuation};
+use crate::math::health::{CollateralValuation, DebtValuation};
 use crate::math::interest::accrue;
 use crate::math::shares::debt_shares_to_assets_up;
-use crate::oracle::pyth::load_validated_price;
-use crate::oracle::valuation::collateral_value;
+use crate::oracle::{get_price, PriceStatus};
 use crate::state::asset_config::AssetConfig;
 use crate::state::debt_position::DebtPosition;
 use crate::state::margin_account::MarginAccount;
@@ -15,7 +14,18 @@ use crate::state::reserve::Reserve;
 use crate::validation::token::verify_associated_token_account;
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::TokenAccount;
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+/// Collateral group: `[asset_config, margin_vault]`.
+pub const COLLATERAL_GROUP_LEN: usize = 2;
+/// Debt group: `[asset_config, reserve, debt_position]`.
+pub const DEBT_GROUP_LEN: usize = 3;
+
+/// Every open position's value, and the price checks all of their prices passed.
+pub struct Valuation {
+    pub collaterals: Vec<CollateralValuation>,
+    pub debts: Vec<DebtValuation>,
+    pub status: PriceStatus,
+}
 
 fn verify_pda(actual: &Pubkey, seeds: &[&[u8]], bump: u8, program_id: &Pubkey) -> Result<()> {
     let bump_seed = [bump];
@@ -32,80 +42,79 @@ fn load_asset_config<'info>(
     asset_index: u16,
     program_id: &Pubkey,
 ) -> Result<Account<'info, AssetConfig>> {
-    let asset_config = Account::<AssetConfig>::try_from(info)?;
+    // A group that doesn't parse is a missing or shifted position.
+    let asset_config =
+        Account::<AssetConfig>::try_from(info).map_err(|_| error!(VannaError::IncompletePositionAccounts))?;
     verify_pda(info.key, &[ASSET_SEED, asset_config.mint.as_ref()], asset_config.bump, program_id)?;
     require!(asset_config.asset_index == asset_index, VannaError::IncompletePositionAccounts);
     Ok(asset_config)
 }
 
-/// Validates and values every open position of `margin` from `remaining_accounts`, skipping the
-/// `named_*` positions the caller values itself. Any missing, substituted, reordered or extra
-/// account fails closed, so no position can be hidden.
-///
-/// Per collateral: `[asset_config, margin_vault, price_update]`, plus the price-source account
-/// when the asset is not Pyth-priced. Per debt: `[asset_config, reserve, debt_position,
-/// price_update]`. Collateral is valued from the vault's live balance, which is safe without a
-/// ledger because each vault is private to one `(margin, mint)` pair. Reserves are accrued in
-/// memory only, so the scan takes no write locks.
-pub fn scan_and_validate_positions<'info>(
-    margin_key: &Pubkey,
-    margin: &MarginAccount,
-    remaining_accounts: &'info [AccountInfo<'info>],
-    program_id: &Pubkey,
-    clock: &Clock,
-    named_collaterals: &[u16],
-    named_debt: Option<u16>,
-) -> Result<(Vec<CollateralValuation>, Vec<DebtValuation>)> {
-    let (collaterals, debts, consumed) =
-        scan_positions(margin_key, margin, remaining_accounts, program_id, clock, named_collaterals, named_debt)?;
-    require!(consumed == remaining_accounts.len(), VannaError::IncompletePositionAccounts);
-    Ok((collaterals, debts))
+/// Accounts the position groups of `margin` take, without the `named_*` positions.
+pub fn position_accounts_len(margin: &MarginAccount, named_collaterals: &[u16], named_debt: Option<u16>) -> usize {
+    let collaterals = margin.active_collateral_indexes().filter(|i| !named_collaterals.contains(i)).count();
+    let debts = margin.active_debt_indexes().filter(|i| Some(*i) != named_debt).count();
+    collaterals * COLLATERAL_GROUP_LEN + debts * DEBT_GROUP_LEN
 }
 
-/// [`scan_and_validate_positions`] that stops after the last position and returns how many
-/// accounts it read, so a caller can accept further accounts after them (`margin_execute` takes
-/// price-source accounts there). Every position must still be present, in order.
+/// Splits `accounts` into the position groups and the accounts after them.
+pub fn split_positions<'a, 'info>(
+    accounts: &'a [AccountInfo<'info>],
+    margin: &MarginAccount,
+    named_collaterals: &[u16],
+    named_debt: Option<u16>,
+) -> Result<(&'a [AccountInfo<'info>], &'a [AccountInfo<'info>])> {
+    let len = position_accounts_len(margin, named_collaterals, named_debt);
+    require!(len <= accounts.len(), VannaError::IncompletePositionAccounts);
+    Ok(accounts.split_at(len))
+}
+
+/// Validates and values every open position of `margin`, skipping the `named_*` positions the
+/// caller values itself. `positions` must be exactly their groups, in the margin's slot order:
+/// any missing, substituted, reordered or extra account fails closed, so no position can be
+/// hidden. Prices are read through the oracle facade from `oracle_accounts` (found by key).
+///
+/// Collateral is valued from the vault's live balance, which is safe without a ledger because
+/// each vault is private to one `(margin, mint)` pair. Reserves are accrued in memory only, so
+/// the scan takes no write locks.
 // `#[inline(never)]`: own BPF stack frame.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub fn scan_positions<'info>(
     margin_key: &Pubkey,
     margin: &MarginAccount,
-    remaining_accounts: &'info [AccountInfo<'info>],
+    positions: &'info [AccountInfo<'info>],
+    oracle_accounts: &[&[AccountInfo<'info>]],
     program_id: &Pubkey,
     clock: &Clock,
     named_collaterals: &[u16],
     named_debt: Option<u16>,
-) -> Result<(Vec<CollateralValuation>, Vec<DebtValuation>, usize)> {
+) -> Result<Valuation> {
     let mut cursor = 0usize;
     let mut collaterals = Vec::with_capacity(margin.collateral_count as usize);
     let mut debts = Vec::with_capacity(margin.debt_count as usize);
+    let mut status = PriceStatus::ALL_CHECKS;
 
     for asset_index in margin.active_collateral_indexes() {
         if named_collaterals.contains(&asset_index) {
             continue;
         }
-        require!(cursor + 3 <= remaining_accounts.len(), VannaError::IncompletePositionAccounts);
-        let asset_config = load_asset_config(&remaining_accounts[cursor], asset_index, program_id)?;
-        let vault_info = &remaining_accounts[cursor + 1];
-        let price_info = &remaining_accounts[cursor + 2];
-        cursor += 3;
-        let source = if asset_config.is_pyth_priced() {
-            None
-        } else {
-            require!(cursor < remaining_accounts.len(), VannaError::IncompletePositionAccounts);
-            cursor += 1;
-            Some(&remaining_accounts[cursor - 1])
-        };
+        require!(cursor + COLLATERAL_GROUP_LEN <= positions.len(), VannaError::IncompletePositionAccounts);
+        let asset_config = load_asset_config(&positions[cursor], asset_index, program_id)?;
+        let vault_info = &positions[cursor + 1];
+        cursor += COLLATERAL_GROUP_LEN;
 
         // InterfaceAccount accepts classic SPL and Token-2022 token-account sizes.
-        let vault = InterfaceAccount::<TokenAccount>::try_from(vault_info)?;
+        let vault = InterfaceAccount::<TokenAccount>::try_from(vault_info)
+            .map_err(|_| error!(VannaError::IncompletePositionAccounts))?;
         verify_associated_token_account(vault_info.key, margin_key, &asset_config.mint, &asset_config.token_program)?;
         require_keys_eq!(vault.owner, *margin_key, VannaError::IncompletePositionAccounts);
         require_keys_eq!(vault.mint, asset_config.mint, VannaError::IncompletePositionAccounts);
 
-        let price_account = Account::<PriceUpdateV2>::try_from(price_info)?;
+        let price = get_price(&asset_config, oracle_accounts, clock)?;
+        status = status.intersection(price.status);
         collaterals.push(CollateralValuation {
-            collateral_value: collateral_value(&asset_config, vault.amount, &price_account, source, clock)?,
+            collateral_value: price.value_of(vault.amount, asset_config.decimals, false)?,
         });
     }
 
@@ -113,20 +122,21 @@ pub fn scan_positions<'info>(
         if Some(asset_index) == named_debt {
             continue;
         }
-        require!(cursor + 4 <= remaining_accounts.len(), VannaError::IncompletePositionAccounts);
-        let asset_info = &remaining_accounts[cursor];
+        require!(cursor + DEBT_GROUP_LEN <= positions.len(), VannaError::IncompletePositionAccounts);
+        let asset_info = &positions[cursor];
         let asset_config = load_asset_config(asset_info, asset_index, program_id)?;
-        let reserve_info = &remaining_accounts[cursor + 1];
-        let debt_position_info = &remaining_accounts[cursor + 2];
-        let price_info = &remaining_accounts[cursor + 3];
-        cursor += 4;
+        let reserve_info = &positions[cursor + 1];
+        let debt_position_info = &positions[cursor + 2];
+        cursor += DEBT_GROUP_LEN;
 
-        let reserve = Account::<Reserve>::try_from(reserve_info)?;
+        let reserve =
+            Account::<Reserve>::try_from(reserve_info).map_err(|_| error!(VannaError::IncompletePositionAccounts))?;
         verify_pda(reserve_info.key, &[RESERVE_SEED, asset_config.mint.as_ref()], reserve.bump, program_id)?;
         require_keys_eq!(reserve.asset_config, asset_info.key(), VannaError::IncompletePositionAccounts);
         require_keys_eq!(asset_config.reserve, reserve_info.key(), VannaError::IncompletePositionAccounts);
 
-        let debt_position = Account::<DebtPosition>::try_from(debt_position_info)?;
+        let debt_position = Account::<DebtPosition>::try_from(debt_position_info)
+            .map_err(|_| error!(VannaError::IncompletePositionAccounts))?;
         verify_pda(
             debt_position_info.key,
             &[DEBT_SEED, margin_key.as_ref(), reserve_info.key.as_ref()],
@@ -143,19 +153,13 @@ pub fn scan_positions<'info>(
             accrual.new_total_borrow_assets,
         )?;
 
-        // Only Pyth-priced assets can have a reserve, so debt is always valued from Pyth.
-        let price_account = Account::<PriceUpdateV2>::try_from(price_info)?;
-        let validated_price = load_validated_price(&asset_config, &price_account, clock)?;
+        let price = get_price(&asset_config, oracle_accounts, clock)?;
+        status = status.intersection(price.status);
         debts.push(DebtValuation {
-            debt_value: normalize_token_value(
-                current_debt_assets,
-                validated_price.price,
-                validated_price.exponent,
-                asset_config.decimals,
-                true,
-            )?,
+            debt_value: price.value_of(current_debt_assets, asset_config.decimals, true)?,
         });
     }
 
-    Ok((collaterals, debts, cursor))
+    require!(cursor == positions.len(), VannaError::IncompletePositionAccounts);
+    Ok(Valuation { collaterals, debts, status })
 }

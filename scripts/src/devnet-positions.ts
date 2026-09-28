@@ -2,7 +2,8 @@ import * as anchor from "@coral-xyz/anchor";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { AccountMeta, PublicKey } from "@solana/web3.js";
 import { ata } from "./devnet-cli";
-import { AssetKey, ASSET_DECIMALS, ASSET_MINTS, priceSourceAccountFor, tokenProgramFor } from "./devnet-env";
+import { AssetKey, ASSET_DECIMALS, ASSET_MINTS, oracleAccountsFor, tokenProgramFor } from "./devnet-env";
+import { oracleMetas } from "./oracle";
 import { CTOKEN_DECIMALS, KAMINO_RECEIPTS, KaminoReceipt, ReceiptKey } from "./kamino";
 import { assetConfigPda, debtPositionPda, reservePda } from "./pda";
 
@@ -14,7 +15,7 @@ export type PositionKey = AssetKey | ReceiptKey;
 
 export interface AssetIndexInfo {
   key: PositionKey;
-  /** Asset whose Pyth price values this position (a cToken's underlying). */
+  /** Asset whose oracle prices this position (a cToken's underlying). */
   priceKey: AssetKey;
   index: number;
   mint: PublicKey;
@@ -24,9 +25,9 @@ export interface AssetIndexInfo {
   decimals: number;
   /** Set for a Kamino cToken (used to value it for display). */
   receipt: KaminoReceipt | null;
-  /** The extra account the program reads to value this asset, appended to its health group:
-   * the Kamino reserve, the xStock mint, or JupSOL's SOL/USD feed. Null for plain Pyth assets. */
-  priceSource: PublicKey | null;
+  /** Every account the program reads to price this position: its oracle's Scope / Pyth accounts,
+   * plus a cToken's klend reserve. */
+  oracleAccounts: PublicKey[];
 }
 
 function positionAssets(): Omit<AssetIndexInfo, "index" | "assetConfig">[] {
@@ -37,7 +38,7 @@ function positionAssets(): Omit<AssetIndexInfo, "index" | "assetConfig">[] {
     tokenProgram: tokenProgramFor(key),
     decimals: ASSET_DECIMALS[key],
     receipt: null,
-    priceSource: priceSourceAccountFor(key),
+    oracleAccounts: oracleAccountsFor(key),
   }));
   const receipts = (Object.keys(KAMINO_RECEIPTS) as ReceiptKey[]).map((key) => {
     const receipt = KAMINO_RECEIPTS[key];
@@ -48,7 +49,7 @@ function positionAssets(): Omit<AssetIndexInfo, "index" | "assetConfig">[] {
       tokenProgram: TOKEN_PROGRAM_ID,
       decimals: CTOKEN_DECIMALS,
       receipt,
-      priceSource: receipt.reserve,
+      oracleAccounts: [...oracleAccountsFor(receipt.underlying), receipt.reserve],
     };
   });
   return [...plain, ...receipts];
@@ -78,18 +79,15 @@ interface MarginAccountData {
 }
 
 /**
- * Builds the health-check `remaining_accounts`: every active position except the named ones, in
- * `risk_engine.rs::scan_and_validate_positions` order. Collateral groups are
- * `[asset_config, margin_vault, price]`, plus the price-source account for a non-Pyth asset
- * (Kamino reserve, xStock mint, JupSOL's SOL/USD feed); debt groups are
- * `[asset_config, reserve, debt_position, price]`. `priceAccounts` must hold a fresh price for
- * every asset (a cToken uses its underlying's; JupSOL's SOL/USD base is wsol's).
+ * Builds the health-check `remaining_accounts`: the position groups of every active position except
+ * the named ones, in `risk_engine.rs::scan_positions` order (collateral `[asset_config,
+ * margin_vault]`, debt `[asset_config, reserve, debt_position]`), then the oracle accounts of every
+ * active position and of `opts.priced` (the instruction's own assets), each once.
  */
 export async function buildRemainingAccounts(
   program: anchor.Program,
   margin: PublicKey,
-  priceAccounts: Record<AssetKey, PublicKey>,
-  opts: { excludeCollateral?: PositionKey | PositionKey[]; excludeDebt?: AssetKey } = {},
+  opts: { excludeCollateral?: PositionKey | PositionKey[]; excludeDebt?: AssetKey; priced?: PositionKey[] } = {},
 ): Promise<AccountMeta[]> {
   const marginAccount = (await (
     program.account as Record<string, { fetch(a: PublicKey): Promise<MarginAccountData> }>
@@ -101,23 +99,33 @@ export async function buildRemainingAccounts(
   const meta = (pubkey: PublicKey) => ({ pubkey, isWritable: false, isSigner: false });
 
   const metas: AccountMeta[] = [];
+  const oracles: PublicKey[] = (opts.priced ?? []).flatMap((key) => positionOracleAccounts(key));
   for (const idx of marginAccount.collateralAssetIndexes) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = byIndex.get(idx);
-    if (!info || excluded.includes(info.key)) continue;
-    metas.push(meta(info.assetConfig), meta(ata(margin, info.mint, info.tokenProgram)), meta(priceAccounts[info.priceKey]));
-    if (info.priceSource) metas.push(meta(info.priceSource));
+    if (!info) continue;
+    oracles.push(...info.oracleAccounts);
+    if (excluded.includes(info.key)) continue;
+    metas.push(meta(info.assetConfig), meta(ata(margin, info.mint, info.tokenProgram)));
   }
 
   for (const idx of marginAccount.debtAssetIndexes) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = byIndex.get(idx);
-    if (!info || info.key === opts.excludeDebt) continue;
+    if (!info) continue;
+    oracles.push(...info.oracleAccounts);
+    if (info.key === opts.excludeDebt) continue;
     const [reserve] = reservePda(info.mint);
     const [debtPosition] = debtPositionPda(margin, reserve);
-    metas.push(meta(info.assetConfig), meta(reserve), meta(debtPosition), meta(priceAccounts[info.priceKey]));
+    metas.push(meta(info.assetConfig), meta(reserve), meta(debtPosition));
   }
-  return metas;
+  return [...metas, ...oracleMetas(oracles)];
+}
+
+/** The oracle accounts of a position key, registered or not. */
+function positionOracleAccounts(key: PositionKey): PublicKey[] {
+  const asset = positionAssets().find((a) => a.key === key);
+  return asset ? asset.oracleAccounts : [];
 }
 
 export interface LiquidationAccounts {
@@ -128,15 +136,15 @@ export interface LiquidationAccounts {
 }
 
 /**
- * `public_liquidate` accounts for every position of `margin`: the health groups (every position,
+ * `public_liquidate` accounts for every position of `margin`: the position groups (every position,
  * margin vaults / reserves / debt positions writable), then per collateral `[mint, destination,
- * token_program]`, then per debt `[mint, reserve vault, source, token_program]`. Collateral is
- * swept to `liquidator`'s ATAs and debts are repaid from them.
+ * token_program]`, then per debt `[mint, reserve vault, source, token_program]`, then every
+ * position's oracle accounts. Collateral is swept to `liquidator`'s ATAs and debts are repaid from
+ * them.
  */
 export async function buildLiquidationAccounts(
   program: anchor.Program,
   margin: PublicKey,
-  priceAccounts: Record<AssetKey, PublicKey>,
   liquidator: PublicKey,
 ): Promise<LiquidationAccounts> {
   const marginAccount = (await (
@@ -155,12 +163,13 @@ export async function buildLiquidationAccounts(
 
   const health: AccountMeta[] = [];
   const settlement: AccountMeta[] = [];
+  const oracles: PublicKey[] = [];
   const destinations: LiquidationAccounts["destinations"] = [];
   for (const idx of marginAccount.collateralAssetIndexes) {
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = lookup(idx);
-    health.push(ro(info.assetConfig), w(ata(margin, info.mint, info.tokenProgram)), ro(priceAccounts[info.priceKey]));
-    if (info.priceSource) health.push(ro(info.priceSource));
+    health.push(ro(info.assetConfig), w(ata(margin, info.mint, info.tokenProgram)));
+    oracles.push(...info.oracleAccounts);
     const destination = ata(liquidator, info.mint, info.tokenProgram);
     destinations.push({ mint: info.mint, tokenProgram: info.tokenProgram, account: destination });
     settlement.push(ro(info.mint), w(destination), ro(info.tokenProgram));
@@ -169,7 +178,8 @@ export async function buildLiquidationAccounts(
     if (idx === EMPTY_ASSET_INDEX) continue;
     const info = lookup(idx);
     const [reserve] = reservePda(info.mint);
-    health.push(ro(info.assetConfig), w(reserve), w(debtPositionPda(margin, reserve)[0]), ro(priceAccounts[info.priceKey]));
+    health.push(ro(info.assetConfig), w(reserve), w(debtPositionPda(margin, reserve)[0]));
+    oracles.push(...info.oracleAccounts);
     settlement.push(
       ro(info.mint),
       w(ata(reserve, info.mint, info.tokenProgram)),
@@ -177,5 +187,5 @@ export async function buildLiquidationAccounts(
       ro(info.tokenProgram),
     );
   }
-  return { metas: [...health, ...settlement], destinations };
+  return { metas: [...health, ...settlement, ...oracleMetas(oracles)], destinations };
 }

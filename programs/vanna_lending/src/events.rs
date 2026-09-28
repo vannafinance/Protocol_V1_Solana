@@ -1,5 +1,5 @@
 use crate::adapters::AdapterKind;
-use crate::state::asset_config::PriceSource;
+use crate::state::asset_config::OracleConfig;
 use crate::state::reserve::RateCurve;
 use anchor_lang::prelude::*;
 
@@ -240,11 +240,9 @@ pub struct IntegrationStatusUpdated {
 }
 
 #[event]
-pub struct AssetPriceSourceUpdated {
+pub struct AssetOracleUpdated {
     pub asset_config: Pubkey,
-    pub price_source: PriceSource,
-    pub source_account: Pubkey,
-    pub source_program: Pubkey,
+    pub oracle: OracleConfig,
     pub timestamp: i64,
 }
 

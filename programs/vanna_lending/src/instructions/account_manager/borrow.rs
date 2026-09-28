@@ -5,10 +5,10 @@ use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::fixed_point::mul_div_floor;
-use crate::math::health::{calculate_health, normalize_token_value, CollateralValuation, DebtValuation};
+use crate::math::health::{calculate_health, CollateralValuation, DebtValuation};
 use crate::math::shares::{assets_to_debt_shares_up, debt_shares_to_assets_up};
-use crate::oracle::pyth::load_validated_price;
-use crate::risk_engine::scan_and_validate_positions;
+use crate::oracle::{get_price, PriceStatus};
+use crate::risk_engine::{scan_positions, split_positions};
 use crate::state::asset_config::AssetConfig;
 use crate::state::debt_position::DebtPosition;
 use crate::state::margin_account::MarginAccount;
@@ -23,7 +23,6 @@ use crate::validation::token::{
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 // ---------------------------------------------------------------------------
 // user_open_debt_position
@@ -150,7 +149,6 @@ pub struct UserBorrow<'info> {
         bump = debt_position.bump
     )]
     pub debt_position: Box<Account<'info, DebtPosition>>,
-    pub price_update: Box<Account<'info, PriceUpdateV2>>,
     pub mint: Box<InterfaceAccount<'info, Mint>>,
     #[account(mut, token::mint = mint, token::authority = reserve, token::token_program = token_program)]
     pub reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -168,7 +166,9 @@ pub struct UserBorrow<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128) -> Result<()> {
+/// `remaining_accounts` = the health groups of every other position (the `risk_engine` layout),
+/// then the oracle accounts of every asset involved, the borrowed one included (any order).
+pub fn user_borrow<'info>(ctx: Context<'info, UserBorrow<'info>>, assets: u64, max_debt_shares: u128) -> Result<()> {
     assert_protocol_action_allowed(ctx.accounts.protocol_config.operating_mode, ProtocolAction::Borrow)?;
     assert_reserve_action_allowed(ctx.accounts.reserve.status, ProtocolAction::Borrow)?;
     require!(ctx.accounts.asset_config.borrow_enabled, VannaError::AssetNotBorrowEnabled);
@@ -207,15 +207,20 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
     let was_zero_collateral = ctx.accounts.margin_vault.amount == 0;
 
     let margin_key = ctx.accounts.margin_account.key();
-    let (mut collaterals, mut debts) = scan_and_validate_positions(
+    let asset_index = ctx.accounts.asset_config.asset_index;
+    let (positions, oracle_accounts) =
+        split_positions(ctx.remaining_accounts, &ctx.accounts.margin_account, &[asset_index], Some(asset_index))?;
+    let valuation = scan_positions(
         &margin_key,
         &ctx.accounts.margin_account,
-        ctx.remaining_accounts,
+        positions,
+        &[oracle_accounts],
         ctx.program_id,
         &clock,
-        &[ctx.accounts.asset_config.asset_index],
-        Some(ctx.accounts.asset_config.asset_index),
+        &[asset_index],
+        Some(asset_index),
     )?;
+    let (mut collaterals, mut debts) = (valuation.collaterals, valuation.debts);
 
     let projected_total_borrow_assets = ctx
         .accounts
@@ -241,14 +246,10 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
         projected_total_borrow_assets,
     )?;
 
-    let validated_price = load_validated_price(&ctx.accounts.asset_config, &ctx.accounts.price_update, &clock)?;
-    let debt_value = normalize_token_value(
-        projected_debt_assets,
-        validated_price.price,
-        validated_price.exponent,
-        ctx.accounts.asset_config.decimals,
-        true,
-    )?;
+    // Borrowing needs every price check on every asset of the account.
+    let price = get_price(&ctx.accounts.asset_config, &[oracle_accounts], &clock)?;
+    valuation.status.intersection(price.status).require(PriceStatus::ALL_CHECKS)?;
+    let debt_value = price.value_of(projected_debt_assets, ctx.accounts.asset_config.decimals, true)?;
     debts.push(DebtValuation { debt_value });
 
     if ctx.accounts.asset_config.collateral_enabled {
@@ -258,13 +259,8 @@ pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128)
             .amount
             .checked_add(assets)
             .ok_or(VannaError::MathOverflow)?;
-        let collateral_value = normalize_token_value(
-            projected_collateral_amount,
-            validated_price.price,
-            validated_price.exponent,
-            ctx.accounts.asset_config.decimals,
-            false,
-        )?;
+        let collateral_value =
+            price.value_of(projected_collateral_amount, ctx.accounts.asset_config.decimals, false)?;
         collaterals.push(CollateralValuation {
             collateral_value,
         });

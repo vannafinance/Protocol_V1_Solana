@@ -19,6 +19,12 @@ fn full_protocol_flow() {
     let usdc_mint = create_mint(&mut svm, &admin, &admin.pubkey(), USDC_DECIMALS);
     let wsol_mint = create_mint(&mut svm, &admin, &admin.pubkey(), WSOL_DECIMALS);
 
+    // Registration reads each asset's price, so the feeds come first.
+    let now = svm.get_sysvar::<Clock>().unix_timestamp;
+    let usdc_price_update = set_pyth(&mut svm, USDC_FEED, USDC_PRICE, -8, now);
+    let wsol_price_update = set_pyth(&mut svm, WSOL_FEED, WSOL_PRICE, -8, now);
+    let oracles = [usdc_price_update, wsol_price_update];
+
     let res = send(
         &mut svm,
         &admin,
@@ -50,12 +56,6 @@ fn full_protocol_flow() {
         &[],
     );
     assert!(res.is_ok(), "init WSOL reserve failed: {res:?}");
-
-    let usdc_price_update = Pubkey::new_unique();
-    let wsol_price_update = Pubkey::new_unique();
-    let now = svm.get_sysvar::<Clock>().unix_timestamp;
-    set_price(&mut svm, &usdc_price_update, USDC_FEED, USDC_PRICE, 0, -8, now);
-    set_price(&mut svm, &wsol_price_update, WSOL_FEED, WSOL_PRICE, 0, -8, now);
 
     // Lender supplies USDC.
     let lender = funded_keypair(&mut svm);
@@ -90,11 +90,11 @@ fn full_protocol_flow() {
     assert!(res.is_ok(), "open USDC debt position failed: {res:?}");
 
     let borrow_amount = 500 * 10u64.pow(6); // Projected HF = ($2,000 + $500) / $500 = 5.0
-    let remaining = collateral_group_metas(&wsol_mint, &margin, &wsol_price_update);
+    let remaining = with_oracles(collateral_group_metas(&wsol_mint, &margin), &oracles);
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, &usdc_price_update, borrow_amount, u128::MAX, &remaining)],
+        &[ix_user_borrow(&borrower.pubkey(), &margin, &usdc_mint, borrow_amount, u128::MAX, &remaining)],
         &[],
     );
     assert!(res.is_ok(), "user_borrow failed: {res:?}");
@@ -111,13 +111,14 @@ fn full_protocol_flow() {
     // Withdraw a small amount of WSOL.
     // Remaining debt is now backed by both the USDC-as-collateral credit and the still-active
     // USDC debt, neither of which is the named (WSOL) asset, so both must be scanned.
-    let mut remaining = collateral_group_metas(&usdc_mint, &margin, &usdc_price_update);
-    remaining.extend(debt_group_metas(&usdc_mint, &margin, &usdc_price_update));
+    let mut remaining = collateral_group_metas(&usdc_mint, &margin);
+    remaining.extend(debt_group_metas(&usdc_mint, &margin));
+    let remaining = with_oracles(remaining, &oracles);
     let withdraw_amount = 1 * 10u64.pow(9); // 1 WSOL
     let res = send(
         &mut svm,
         &borrower,
-        &[ix_user_withdraw_collateral(&borrower.pubkey(), &margin, &wsol_mint, &wsol_price_update, withdraw_amount, 0, &remaining)],
+        &[ix_user_withdraw_collateral(&borrower.pubkey(), &margin, &wsol_mint, withdraw_amount, 0, &remaining)],
         &[],
     );
     assert!(res.is_ok(), "user_withdraw_collateral failed: {res:?}");

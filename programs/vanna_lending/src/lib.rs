@@ -12,7 +12,7 @@ pub mod validation;
 use anchor_lang::prelude::*;
 use adapters::AdapterKind;
 use instructions::*;
-use state::asset_config::PriceSource;
+use state::asset_config::OracleConfig;
 use state::reserve::RateCurve;
 
 declare_id!("BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg");
@@ -44,25 +44,21 @@ pub mod vanna_lending {
     #[allow(clippy::too_many_arguments)]
     pub fn admin_register_asset(
         ctx: Context<AdminRegisterAsset>,
-        price_feed_id: [u8; 32],
+        oracle: OracleConfig,
         max_collateral_per_margin: u64,
         ltv_bps: u16,
         liquidation_threshold_bps: u16,
         liquidation_bonus_bps: u16,
-        max_confidence_bps: u16,
-        max_price_age_secs: u32,
         collateral_enabled: bool,
         borrow_enabled: bool,
     ) -> Result<()> {
         instructions::admin::admin_register_asset(
             ctx,
-            price_feed_id,
+            oracle,
             max_collateral_per_margin,
             ltv_bps,
             liquidation_threshold_bps,
             liquidation_bonus_bps,
-            max_confidence_bps,
-            max_price_age_secs,
             collateral_enabled,
             borrow_enabled,
         )
@@ -75,8 +71,6 @@ pub mod vanna_lending {
         ltv_bps: u16,
         liquidation_threshold_bps: u16,
         liquidation_bonus_bps: u16,
-        max_confidence_bps: u16,
-        max_price_age_secs: u32,
         collateral_enabled: bool,
         borrow_enabled: bool,
     ) -> Result<()> {
@@ -86,19 +80,13 @@ pub mod vanna_lending {
             ltv_bps,
             liquidation_threshold_bps,
             liquidation_bonus_bps,
-            max_confidence_bps,
-            max_price_age_secs,
             collateral_enabled,
             borrow_enabled,
         )
     }
 
-    pub fn admin_set_asset_price_source(
-        ctx: Context<AdminSetAssetPriceSource>,
-        price_source: PriceSource,
-        source_program: Pubkey,
-    ) -> Result<()> {
-        instructions::admin::admin_set_asset_price_source(ctx, price_source, source_program)
+    pub fn admin_set_asset_oracle(ctx: Context<AdminSetAssetOracle>, oracle: OracleConfig) -> Result<()> {
+        instructions::admin::admin_set_asset_oracle(ctx, oracle)
     }
 
     // -- Admin: lending pools --------------------------------------------------------------------
@@ -183,8 +171,8 @@ pub mod vanna_lending {
         instructions::account_manager::user_deposit_collateral(ctx, amount)
     }
 
-    pub fn user_withdraw_collateral(
-        ctx: Context<UserWithdrawCollateral>,
+    pub fn user_withdraw_collateral<'info>(
+        ctx: Context<'info, UserWithdrawCollateral<'info>>,
         amount: u64,
         min_health_factor_wad: u128,
     ) -> Result<()> {
@@ -205,7 +193,7 @@ pub mod vanna_lending {
         instructions::account_manager::user_close_debt_position(ctx)
     }
 
-    pub fn user_borrow(ctx: Context<UserBorrow>, assets: u64, max_debt_shares: u128) -> Result<()> {
+    pub fn user_borrow<'info>(ctx: Context<'info, UserBorrow<'info>>, assets: u64, max_debt_shares: u128) -> Result<()> {
         instructions::account_manager::user_borrow(ctx, assets, max_debt_shares)
     }
 

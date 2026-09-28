@@ -14,9 +14,9 @@ use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::health::{calculate_health, CollateralValuation};
-use crate::oracle::valuation::{collateral_value, find_source_account};
-use crate::risk_engine::scan_positions;
-use crate::state::asset_config::{AssetConfig, PriceSource};
+use crate::oracle::{get_price, PriceStatus};
+use crate::risk_engine::{scan_positions, split_positions};
+use crate::state::asset_config::AssetConfig;
 use crate::state::integration::Integration;
 use crate::state::margin_account::MarginAccount;
 use crate::state::protocol_config::ProtocolConfig;
@@ -28,7 +28,6 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
 
 #[derive(Accounts)]
 pub struct MarginExecute<'info> {
@@ -59,7 +58,6 @@ pub struct MarginExecute<'info> {
         associated_token::token_program = spent_token_program
     )]
     pub spent_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    pub spent_price_update: Box<Account<'info, PriceUpdateV2>>,
 
     #[account(seeds = [ASSET_SEED, received_mint.key().as_ref()], bump = received_asset.bump)]
     pub received_asset: Box<Account<'info, AssetConfig>>,
@@ -72,7 +70,6 @@ pub struct MarginExecute<'info> {
         associated_token::token_program = received_token_program
     )]
     pub received_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    pub received_price_update: Box<Account<'info, PriceUpdateV2>>,
 
     pub spent_token_program: Interface<'info, TokenInterface>,
     pub received_token_program: Interface<'info, TokenInterface>,
@@ -81,8 +78,9 @@ pub struct MarginExecute<'info> {
 }
 
 /// `remaining_accounts` = the external instruction's accounts (`cpi_account_count` of them, in
-/// that program's order), then the position-scan accounts for the health check, then any
-/// price-source account a leg needs that isn't already passed (e.g. JupSOL's SOL/USD feed).
+/// that program's order), then the health groups of every other position (the `risk_engine`
+/// layout), then the oracle accounts of every asset involved (any order). A Kamino receipt leg's
+/// reserve is the one in the CPI accounts, read after the call.
 pub fn margin_execute<'info>(
     mut ctx: Context<'info, MarginExecute<'info>>,
     data: Vec<u8>,
@@ -181,9 +179,9 @@ fn check_roles(plan: &CallPlan, cpi: &[AccountInfo], margin: &Pubkey, accounts: 
     // A Kamino receipt leg must go through the reserve that prices it: the call changes that
     // reserve's exchange rate, and the health check reads it afterwards.
     for asset in [&accounts.spent_asset, &accounts.received_asset] {
-        if asset.price_source == PriceSource::KaminoReceipt {
+        if asset.oracle.uses_klend() {
             let index = plan.price_source.ok_or(VannaError::InvalidCallAccounts)?;
-            require_keys_eq!(key_at(index)?, asset.price_source_account, VannaError::InvalidCallAccounts);
+            require_keys_eq!(key_at(index)?, asset.oracle.klend_reserve, VannaError::InvalidCallAccounts);
         }
     }
     Ok(())
@@ -241,7 +239,7 @@ fn invoke_as_margin<'info>(
 }
 
 /// Health on post-call balances: every other position from the scan, plus both vaults valued
-/// explicitly. Returns the borrow health factor.
+/// explicitly. While in debt, every price must pass every check. Returns the borrow health factor.
 #[inline(never)]
 fn check_health<'info>(
     accounts: &MarginExecute<'info>,
@@ -251,31 +249,30 @@ fn check_health<'info>(
 ) -> Result<u128> {
     let clock = Clock::get()?;
     let named = [accounts.spent_asset.asset_index, accounts.received_asset.asset_index];
-    let (mut collaterals, debts, _) = scan_positions(
+    let (positions, oracle_accounts) = split_positions(health_accounts, &accounts.margin_account, &named, None)?;
+    // A receipt leg's reserve is found among the CPI accounts, with its post-call state.
+    let oracle_accounts = [oracle_accounts, cpi_accounts];
+    let valuation = scan_positions(
         &accounts.margin_account.key(),
         &accounts.margin_account,
-        health_accounts,
+        positions,
+        &oracle_accounts,
         program_id,
         &clock,
         &named,
         None,
     )?;
-    // A leg's price source (its mint, a base price feed, a Kamino reserve) is looked up by key.
-    let passed = [
-        accounts.spent_mint.to_account_info(),
-        accounts.received_mint.to_account_info(),
-        accounts.spent_price_update.to_account_info(),
-        accounts.received_price_update.to_account_info(),
-    ];
-    let candidates = [&passed[..], cpi_accounts, health_accounts];
-    for (asset, amount, price) in [
-        (&accounts.spent_asset, accounts.spent_vault.amount, &accounts.spent_price_update),
-        (&accounts.received_asset, accounts.received_vault.amount, &accounts.received_price_update),
+    let (mut collaterals, debts, mut status) = (valuation.collaterals, valuation.debts, valuation.status);
+    for (asset, amount) in [
+        (&accounts.spent_asset, accounts.spent_vault.amount),
+        (&accounts.received_asset, accounts.received_vault.amount),
     ] {
-        let source = find_source_account(asset, &candidates)?;
-        collaterals.push(CollateralValuation {
-            collateral_value: collateral_value(asset, amount, price, source, &clock)?,
-        });
+        let price = get_price(asset, &oracle_accounts, &clock)?;
+        status = status.intersection(price.status);
+        collaterals.push(CollateralValuation { collateral_value: price.value_of(amount, asset.decimals, false)? });
+    }
+    if !debts.is_empty() {
+        status.require(PriceStatus::ALL_CHECKS)?;
     }
     let health = calculate_health(&collaterals, &debts)?;
     require!(health.is_borrow_healthy(), VannaError::HealthFactorTooLow);
