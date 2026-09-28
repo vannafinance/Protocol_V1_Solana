@@ -4,7 +4,7 @@ use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::health::{calculate_health, CollateralValuation};
-use crate::oracle::valuation::collateral_value;
+use crate::oracle::valuation::{collateral_value, source_or_mint};
 use crate::risk_engine::scan_and_validate_positions;
 use crate::state::asset_config::AssetConfig;
 use crate::state::margin_account::MarginAccount;
@@ -147,8 +147,9 @@ pub struct UserWithdrawCollateral<'info> {
         token::token_program = token_program
     )]
     pub margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the asset's registered price-source account (e.g. its Kamino reserve); checked by
-    /// key in `collateral_value`. Omitted for Pyth-priced assets.
+    /// CHECK: the asset's registered price-source account (Kamino reserve, base price feed);
+    /// checked by key in `collateral_value`. Omitted for Pyth-priced and Scaled UI Amount assets
+    /// (the latter read `mint`).
     pub price_source_account: Option<UncheckedAccount<'info>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
@@ -187,13 +188,15 @@ pub fn user_withdraw_collateral(
         .amount
         .checked_sub(amount)
         .ok_or(VannaError::MathUnderflow)?;
-    let source = ctx.accounts.price_source_account.as_ref().map(|a| a.to_account_info());
+    let explicit_source = ctx.accounts.price_source_account.as_ref().map(|a| a.to_account_info());
+    let mint_info = ctx.accounts.mint.to_account_info();
+    let source = source_or_mint(&ctx.accounts.asset_config, explicit_source.as_ref(), &mint_info);
     collaterals.push(CollateralValuation {
         collateral_value: collateral_value(
             &ctx.accounts.asset_config,
             projected_amount,
             &ctx.accounts.price_update,
-            source.as_ref(),
+            source,
             &clock,
         )?,
     });

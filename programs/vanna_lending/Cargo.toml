@@ -67,6 +67,10 @@ name = "test_state"
 path = "src/tests/test_state.rs"
 
 [[test]]
+name = "test_price_sources"
+path = "src/tests/test_price_sources.rs"
+
+[[test]]
 name = "kamino"
 path = "src/tests/external/kamino/main.rs"
 

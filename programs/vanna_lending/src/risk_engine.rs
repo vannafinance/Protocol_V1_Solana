@@ -47,8 +47,6 @@ fn load_asset_config<'info>(
 /// price_update]`. Collateral is valued from the vault's live balance, which is safe without a
 /// ledger because each vault is private to one `(margin, mint)` pair. Reserves are accrued in
 /// memory only, so the scan takes no write locks.
-// `#[inline(never)]`: own BPF stack frame.
-#[inline(never)]
 pub fn scan_and_validate_positions<'info>(
     margin_key: &Pubkey,
     margin: &MarginAccount,
@@ -58,6 +56,26 @@ pub fn scan_and_validate_positions<'info>(
     named_collaterals: &[u16],
     named_debt: Option<u16>,
 ) -> Result<(Vec<CollateralValuation>, Vec<DebtValuation>)> {
+    let (collaterals, debts, consumed) =
+        scan_positions(margin_key, margin, remaining_accounts, program_id, clock, named_collaterals, named_debt)?;
+    require!(consumed == remaining_accounts.len(), VannaError::IncompletePositionAccounts);
+    Ok((collaterals, debts))
+}
+
+/// [`scan_and_validate_positions`] that stops after the last position and returns how many
+/// accounts it read, so a caller can accept further accounts after them (`margin_execute` takes
+/// price-source accounts there). Every position must still be present, in order.
+// `#[inline(never)]`: own BPF stack frame.
+#[inline(never)]
+pub fn scan_positions<'info>(
+    margin_key: &Pubkey,
+    margin: &MarginAccount,
+    remaining_accounts: &'info [AccountInfo<'info>],
+    program_id: &Pubkey,
+    clock: &Clock,
+    named_collaterals: &[u16],
+    named_debt: Option<u16>,
+) -> Result<(Vec<CollateralValuation>, Vec<DebtValuation>, usize)> {
     let mut cursor = 0usize;
     let mut collaterals = Vec::with_capacity(margin.collateral_count as usize);
     let mut debts = Vec::with_capacity(margin.debt_count as usize);
@@ -139,6 +157,5 @@ pub fn scan_and_validate_positions<'info>(
         });
     }
 
-    require!(cursor == remaining_accounts.len(), VannaError::IncompletePositionAccounts);
-    Ok((collaterals, debts))
+    Ok((collaterals, debts, cursor))
 }

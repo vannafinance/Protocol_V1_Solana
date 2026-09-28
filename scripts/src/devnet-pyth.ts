@@ -3,26 +3,30 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { HermesClient } from "@pythnetwork/hermes-client";
 import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 import { sendTransactions } from "@pythnetwork/solana-utils";
-import { AssetKey, DEVNET_RPC_URL, PYTH_FEED_IDS, PYTH_SHARD_ID } from "./devnet-env";
+import { AssetKey, DEVNET_RPC_URL, PYTH_FEED_IDS, PYTH_RECEIVER_PROGRAM_ID, PYTH_SHARD_ID, pythFeedAccount } from "./devnet-env";
 
-const HERMES_URL = "https://hermes.pyth.network";
+const HERMES_URL = process.env.HERMES_URL ?? "https://hermes.pyth.network";
 
-/** Sentinel USD prices used only when fabricating a PriceUpdateV2 on the local Surfpool fork
- * (real Hermes has no feed for the PreStocks tokens at all, and as of 2026-08-26 requires an API
- * key for every feed — see PYTH_API_KEY in the frontend's .env.local). Not used against real
- * Devnet/mainnet. */
-const REFERENCE_PRICE_USD: Record<AssetKey, number> = {
+/** Hermes requires an API key (since the 2026-08-26 Pyth Core upgrade), sent as a bearer token. */
+function hermesClient(): HermesClient {
+  const key = process.env.PYTH_API_KEY;
+  return new HermesClient(HERMES_URL, key ? { headers: { Authorization: `Bearer ${key}` } } : undefined);
+}
+
+/** Fallback values written on the local Surfpool fork only when Hermes is unreachable (e.g. no
+ * PYTH_API_KEY). They are what each feed publishes: USD per token, except JupSOL's feed, which is
+ * the JUPSOL/SOL redemption rate. Never used against a real cluster. */
+const REFERENCE_PRICE: Record<AssetKey, number> = {
   usdc: 1,
-  wsol: 190,
-  tslax: 250,
-  googlx: 175,
-  aaplx: 340,
-  anthropic: 1020,
-  openai: 1030,
+  usdt: 1,
+  wsol: 118,
+  jitosol: 153,
+  jupsol: 1.21,
+  jupusd: 1,
+  nvdax: 222,
+  tslax: 378,
 };
 
-const PYTH_RECEIVER_PROGRAM_ID = new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
-const PYTH_PUSH_ORACLE_PROGRAM_ID = new PublicKey("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
 
 const PRICE_UPDATE_V2_DISCRIMINATOR = Buffer.from([0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
 const PRICE_FEED_ID_OFFSET = 41;
@@ -40,12 +44,7 @@ function hexToBytes(hex: string): Buffer {
   return Buffer.from(clean, "hex");
 }
 
-function priceFeedAccountAddress(feedId: string): PublicKey {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from([0, 0]), hexToBytes(feedId)],
-    PYTH_PUSH_ORACLE_PROGRAM_ID,
-  )[0];
-}
+const priceFeedAccountAddress = pythFeedAccount;
 
 /** Builds a fresh PriceUpdateV2 account buffer from a template (any existing PriceUpdateV2 —
  * layout is identical across feeds), rewriting the feed ID/price/timestamps. */
@@ -83,8 +82,7 @@ async function callForkCheatcode(rpcUrl: string, method: string, params: unknown
 
 /** Fabricates (or refreshes) `asset`'s PriceUpdateV2 account directly on the Surfpool fork via
  * the `surfnet_setAccount` cheatcode — no Hermes call, no wallet signature. Used as the fallback
- * whenever real Hermes is unreachable (401 without an API key) and for the PreStocks tokens,
- * which have no real Pyth feed to begin with. */
+ * whenever real Hermes is unreachable (401 without an API key). */
 async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<PublicKey> {
   const feedId = PYTH_FEED_IDS[asset];
   const address = priceFeedAccountAddress(feedId);
@@ -104,7 +102,7 @@ async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<
     );
   }
 
-  const price = REFERENCE_PRICE_USD[asset];
+  const price = REFERENCE_PRICE[asset];
   const data = buildForkPriceAccountData(template.data, feedId, price);
   await callForkCheatcode(connection.rpcEndpoint, "surfnet_setAccount", [
     address.toBase58(),
@@ -126,9 +124,7 @@ async function fabricatePrice(connection: Connection, asset: AssetKey): Promise<
  *
  * Tries a real, signed Hermes update first (what a production integration does); falls back to
  * fabricating the PriceUpdateV2 directly on the local Surfpool fork via `surfnet_setAccount` when
- * Hermes is unreachable (e.g. the 401-without-an-API-key case) or when `asset` has no real Pyth
- * feed at all (the PreStocks tokens — Hermes returns an empty result for their synthetic sentinel
- * feed IDs).
+ * Hermes is unreachable (e.g. no PYTH_API_KEY).
  */
 export async function refreshPrice(
   connection: Connection,
@@ -137,7 +133,7 @@ export async function refreshPrice(
 ): Promise<PublicKey> {
   try {
     const feedId = PYTH_FEED_IDS[asset];
-    const hermes = new HermesClient(HERMES_URL);
+    const hermes = hermesClient();
     const priceUpdate = await hermes.getLatestPriceUpdates([feedId], { encoding: "base64" });
 
     const receiver = new PythSolanaReceiver({ connection, wallet });
@@ -167,7 +163,7 @@ export interface LivePrice {
  */
 export async function fetchLivePrice(asset: AssetKey): Promise<LivePrice> {
   try {
-    const hermes = new HermesClient(HERMES_URL);
+    const hermes = hermesClient();
     const result = await hermes.getLatestPriceUpdates([PYTH_FEED_IDS[asset]], { parsed: true });
     const parsed = result.parsed?.[0];
     if (!parsed) throw new Error(`Hermes returned no parsed price update for ${asset}`);

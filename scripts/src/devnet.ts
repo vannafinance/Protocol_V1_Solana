@@ -9,20 +9,31 @@
  * Run with no command (or an unrecognized one) to print the full command list.
  */
 import * as anchor from "@coral-xyz/anchor";
-import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
-import { PublicKey, SystemProgram } from "@solana/web3.js";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  createAssociatedTokenAccountIdempotentInstruction,
+  getMint,
+  getScaledUiAmountConfig,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
+import { ComputeBudgetProgram, PublicKey, SystemProgram } from "@solana/web3.js";
 import { ata, OMITTED_ACCOUNT, optionalArg, parseArgs, requireArg, toBaseUnits, toBigInt, tokenBalance } from "./devnet-cli";
 import {
   AssetKey,
   ASSET_DECIMALS,
   ASSET_MINTS,
+  ASSET_PRICING,
   assetKeyFromString,
   devnetConnection,
   feedIdToBytes,
   loadKeypair,
   log,
   programAs,
+  POOL_ASSETS,
+  priceSourceAccountFor,
   PYTH_FEED_IDS,
+  PYTH_RECEIVER_PROGRAM_ID,
   tokenProgramFor,
 } from "./devnet-env";
 import {
@@ -41,7 +52,14 @@ import {
   utilizationWad,
   WAD,
 } from "./devnet-math";
-import { AssetIndexInfo, buildRemainingAccounts, EMPTY_ASSET_INDEX, getAssetIndexMap, PositionKey } from "./devnet-positions";
+import {
+  AssetIndexInfo,
+  buildLiquidationAccounts,
+  buildRemainingAccounts,
+  EMPTY_ASSET_INDEX,
+  getAssetIndexMap,
+  PositionKey,
+} from "./devnet-positions";
 import { fetchLivePrice, refreshPrice } from "./devnet-pyth";
 import { receiptUnderlying } from "./kamino";
 import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
@@ -49,15 +67,24 @@ import { assetConfigPda, debtPositionPda, marginPda, protocolConfigPda, reserveP
 const U128_MAX = new anchor.BN("340282366920938463463374607431768211455");
 const MODE_NAMES = ["Normal", "BorrowPaused", "WithdrawOnly", "Halted"];
 const RESERVE_STATUS_NAMES = ["Active", "SupplyOnly", "RepayOnly", "Frozen"];
+/** `ltv` / `liqThreshold` are stored but unused by V1 health (one 1.10 threshold); `liqBonus` is
+ * the liquidator's bonus when the asset is seized. */
 const RISK_DEFAULTS: Record<AssetKey, { ltv: number; liqThreshold: number; liqBonus: number }> = {
   usdc: { ltv: 8000, liqThreshold: 8500, liqBonus: 500 },
+  usdt: { ltv: 8000, liqThreshold: 8500, liqBonus: 500 },
   wsol: { ltv: 7000, liqThreshold: 8000, liqBonus: 500 },
+  jitosol: { ltv: 7000, liqThreshold: 8000, liqBonus: 500 },
+  jupsol: { ltv: 7000, liqThreshold: 8000, liqBonus: 500 },
+  jupusd: { ltv: 8000, liqThreshold: 8500, liqBonus: 500 },
+  nvdax: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
   tslax: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
-  googlx: { ltv: 6000, liqThreshold: 7000, liqBonus: 700 },
-  aaplx: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
-  anthropic: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
-  openai: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
 };
+
+/** Anchor enum value of an asset's non-Pyth `PriceSource`. */
+function priceSourceArg(asset: AssetKey): Record<string, Record<string, never>> {
+  const kind = ASSET_PRICING[asset].kind;
+  return { [kind]: {} };
+}
 
 interface Ctx {
   args: Record<string, string>;
@@ -70,16 +97,11 @@ interface Ctx {
 /** Refreshes real Pyth prices for every registered asset — needed by any instruction that scans
  * every active position on a margin account (borrow, withdraw-collateral, liquidate). */
 async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
-  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai (Kamino cTokens use their underlying's)");
-  return {
-    usdc: await refreshPrice(ctx.conn, ctx.anchorWallet, "usdc"),
-    wsol: await refreshPrice(ctx.conn, ctx.anchorWallet, "wsol"),
-    tslax: await refreshPrice(ctx.conn, ctx.anchorWallet, "tslax"),
-    googlx: await refreshPrice(ctx.conn, ctx.anchorWallet, "googlx"),
-    aaplx: await refreshPrice(ctx.conn, ctx.anchorWallet, "aaplx"),
-    anthropic: await refreshPrice(ctx.conn, ctx.anchorWallet, "anthropic"),
-    openai: await refreshPrice(ctx.conn, ctx.anchorWallet, "openai"),
-  };
+  const assets = Object.keys(ASSET_MINTS) as AssetKey[];
+  log("refreshing Pyth prices", `${assets.join(" + ")} (Kamino cTokens use their underlying's)`);
+  const prices = {} as Record<AssetKey, PublicKey>;
+  for (const asset of assets) prices[asset] = await refreshPrice(ctx.conn, ctx.anchorWallet, asset);
+  return prices;
 }
 
 /** Generic Anchor-account fetch by camelCase namespace (e.g. "protocolConfig", "reserve"). */
@@ -129,6 +151,34 @@ function liveAccrual(reserveAcc: any) {
   return accrue(reserveFromAccount(reserveAcc), BigInt(Math.floor(Date.now() / 1000)));
 }
 
+/**
+ * The amount, decimals and price feed the program values a position with (`oracle/valuation.rs`):
+ * a Kamino cToken as the underlying it redeems for; an xStock as raw × current Scaled UI
+ * multiplier, at its own feed; JupSOL as raw × JUPSOL/SOL rate, at the SOL/USD price.
+ */
+async function pricedPosition(conn: anchor.web3.Connection, info: AssetIndexInfo, raw: bigint) {
+  if (info.receipt) {
+    const amount = await receiptUnderlying(conn, info.receipt, raw);
+    return { amount, decimals: ASSET_DECIMALS[info.priceKey], priceKey: info.priceKey };
+  }
+  const key = info.key as AssetKey;
+  const pricing = ASSET_PRICING[key];
+  if (pricing.kind === "scaledUiAmount") {
+    const config = getScaledUiAmountConfig(await getMint(conn, info.mint, "confirmed", TOKEN_2022_PROGRAM_ID));
+    const now = BigInt(Math.floor(Date.now() / 1000));
+    const multiplier = !config ? 1 : now >= config.newMultiplierEffectiveTimestamp ? config.newMultiplier : config.multiplier;
+    const amount = (raw * BigInt(Math.floor(multiplier * 1e18))) / WAD;
+    return { amount, decimals: info.decimals, priceKey: key };
+  }
+  if (pricing.kind === "redemptionRate") {
+    const rate = await fetchLivePrice(key);
+    const amount =
+      rate.exponent >= 0 ? raw * rate.price * 10n ** BigInt(rate.exponent) : (raw * rate.price) / 10n ** BigInt(-rate.exponent);
+    return { amount, decimals: info.decimals, priceKey: pricing.base };
+  }
+  return { amount: raw, decimals: info.decimals, priceKey: info.priceKey };
+}
+
 /** Live view of one wallet's positions (balances, debt after interest, USD values) and the
  * health snapshot the program would compute, for display only. */
 async function computePositionHealth(program: anchor.Program, conn: anchor.web3.Connection, owner: PublicKey) {
@@ -144,12 +194,10 @@ async function computePositionHealth(program: anchor.Program, conn: anchor.web3.
     const info = byIndex.get(idx);
     if (!info) continue;
     const vaultBalance: bigint = await tokenBalance(conn, ata(margin, info.mint, info.tokenProgram)).catch(() => 0n);
-    const livePrice = await fetchLivePrice(info.priceKey);
     const assetConfigAcc = await fetchAccount(program, "assetConfig", info.assetConfig);
-    // A Kamino cToken is valued as the underlying it redeems for, at the underlying's decimals.
-    const pricedAmount = info.receipt ? await receiptUnderlying(conn, info.receipt, vaultBalance) : vaultBalance;
-    const pricedDecimals = info.receipt ? ASSET_DECIMALS[info.priceKey] : info.decimals;
-    const valueUsd = normalizeTokenValue(pricedAmount, livePrice.price, livePrice.exponent, pricedDecimals, false);
+    const priced = await pricedPosition(conn, info, vaultBalance);
+    const livePrice = await fetchLivePrice(priced.priceKey);
+    const valueUsd = normalizeTokenValue(priced.amount, livePrice.price, livePrice.exponent, priced.decimals, false);
     collateralBreakdown.push({
       asset: info.key,
       decimals: info.decimals,
@@ -202,27 +250,31 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const mint = ASSET_MINTS[asset];
     const decimals = ASSET_DECIMALS[asset];
     const d = RISK_DEFAULTS[asset];
-    const ltvBps = Number(optionalArg(args, "ltv-bps", String(d.ltv)));
-    const liqThresholdBps = Number(optionalArg(args, "liq-threshold-bps", String(d.liqThreshold)));
-    const liqBonusBps = Number(optionalArg(args, "liq-bonus-bps", String(d.liqBonus)));
-    const maxConfidenceBps = Number(optionalArg(args, "max-confidence-bps", "1000"));
-    const maxPriceAgeSecs = Number(optionalArg(args, "max-price-age-secs", "3600"));
+    const risk = [
+      Number(optionalArg(args, "ltv-bps", String(d.ltv))),
+      Number(optionalArg(args, "liq-threshold-bps", String(d.liqThreshold))),
+      Number(optionalArg(args, "liq-bonus-bps", String(d.liqBonus))),
+      Number(optionalArg(args, "max-confidence-bps", "1000")),
+      Number(optionalArg(args, "max-price-age-secs", "3600")),
+    ] as const;
     const maxCollateral = toBaseUnits(optionalArg(args, "max-collateral", "0"), decimals);
     const collateralEnabled = optionalArg(args, "collateral-enabled", "true") === "true";
-    const borrowEnabled = optionalArg(args, "borrow-enabled", "true") === "true";
+    // Only the lending pools (USDC, USDT, SOL) are borrowable; the rest is margin collateral only.
+    const borrowEnabled = optionalArg(args, "borrow-enabled", String(POOL_ASSETS.includes(asset))) === "true";
+    const pricing = ASSET_PRICING[asset];
     const [protocolConfig] = protocolConfigPda();
     const [assetConfig] = assetConfigPda(mint);
+
+    // A non-Pyth asset is registered disabled, gets its price source, then is enabled, so it is
+    // never live with the wrong valuation.
+    const priced = pricing.kind !== "pyth";
     const sig = await program.methods
       .adminRegisterAsset(
         feedIdToBytes(PYTH_FEED_IDS[asset]),
         maxCollateral,
-        ltvBps,
-        liqThresholdBps,
-        liqBonusBps,
-        maxConfidenceBps,
-        maxPriceAgeSecs,
-        collateralEnabled,
-        borrowEnabled,
+        ...risk,
+        collateralEnabled && !priced,
+        borrowEnabled && !priced,
       )
       .accounts({
         admin: wallet.publicKey,
@@ -234,11 +286,33 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         systemProgram: SystemProgram.programId,
       })
       .rpc();
-    log("admin_register_asset", `${asset} assetConfig=${assetConfig.toBase58()} ltv=${ltvBps}bps tx=${sig}`);
+    log("admin_register_asset", `${asset} assetConfig=${assetConfig.toBase58()} tx=${sig}`);
+    if (!priced) return;
+
+    const sourceProgram = pricing.kind === "scaledUiAmount" ? TOKEN_2022_PROGRAM_ID : PYTH_RECEIVER_PROGRAM_ID;
+    const base = pricing.kind === "redemptionRate" ? assetConfigPda(ASSET_MINTS[pricing.base])[0] : OMITTED_ACCOUNT;
+    const sourceSig = await program.methods
+      .adminSetAssetPriceSource(priceSourceArg(asset), sourceProgram)
+      .accounts({
+        admin: wallet.publicKey,
+        protocolConfig,
+        assetConfig,
+        sourceAccount: priceSourceAccountFor(asset)!,
+        underlyingAssetConfig: base,
+      })
+      .rpc();
+    const enableSig = await program.methods
+      .adminUpdateAssetConfig(maxCollateral, ...risk, collateralEnabled, false)
+      .accounts({ admin: wallet.publicKey, protocolConfig, assetConfig })
+      .rpc();
+    log("admin_set_asset_price_source", `${asset} ${pricing.kind} txs=${sourceSig},${enableSig}`);
   },
 
   "initialize-reserve": async ({ args, wallet, program }) => {
     const asset = assetKeyFromString(requireArg(args, "asset"));
+    if (!POOL_ASSETS.includes(asset)) {
+      throw new Error(`${asset} is margin collateral only; lending pools are ${POOL_ASSETS.join(", ")}`);
+    }
     const mint = ASSET_MINTS[asset];
     const decimals = ASSET_DECIMALS[asset];
     const rateCurve = rateCurveFromArgs(args);
@@ -304,7 +378,7 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const maxPriceAgeSecs = Number(optionalArg(args, "max-price-age-secs", "3600"));
     const maxCollateral = toBaseUnits(optionalArg(args, "max-collateral", "0"), decimals);
     const collateralEnabled = optionalArg(args, "collateral-enabled", "true") === "true";
-    const borrowEnabled = optionalArg(args, "borrow-enabled", "true") === "true";
+    const borrowEnabled = optionalArg(args, "borrow-enabled", String(POOL_ASSETS.includes(asset))) === "true";
     const [protocolConfig] = protocolConfigPda();
     const [assetConfig] = assetConfigPda(mint);
     const sig = await program.methods
@@ -340,7 +414,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [protocolConfig] = protocolConfigPda();
     const [reserve] = reservePda(mint);
     const protocolConfigAccount = await fetchAccount(program, "protocolConfig", protocolConfig);
-    const treasuryAta = ata(protocolConfigAccount.treasury, mint);
+    const tp = tokenProgramFor(asset);
+    const treasuryAta = ata(protocolConfigAccount.treasury, mint, tp);
     const sig = await program.methods
       .adminCollectProtocolFees(amount)
       .accounts({
@@ -348,9 +423,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         protocolConfig,
         underlyingMint: mint,
         reserve,
-        liquidityVault: ata(reserve, mint),
+        liquidityVault: ata(reserve, mint, tp),
         treasuryAta,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
       })
       .rpc();
     log("admin_collect_protocol_fees", `${asset} amount=${amount.toString()} treasuryAta=${treasuryAta.toBase58()} tx=${sig}`);
@@ -494,7 +569,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         priceUpdate: priceAccounts[asset],
         destinationTokenAccount: ata(wallet.publicKey, mint, tp),
         marginVault,
-        priceSourceAccount: OMITTED_ACCOUNT, // plain assets are Pyth-priced
+        // JupSOL's SOL/USD feed; null for Pyth assets and xStocks (the program reads the mint)
+        priceSourceAccount: ASSET_PRICING[asset].kind === "redemptionRate" ? priceSourceAccountFor(asset)! : OMITTED_ACCOUNT,
         tokenProgram: tp,
       })
       .remainingAccounts(remainingAccounts)
@@ -507,10 +583,11 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const mint = ASSET_MINTS[asset];
     const [margin] = marginPda(wallet.publicKey);
     const [assetConfig] = assetConfigPda(mint);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
     const sig = await program.methods
       .userCloseCollateralPosition()
-      .accounts({ authority: wallet.publicKey, marginAccount: margin, assetConfig, mint, marginVault, tokenProgram: TOKEN_PROGRAM_ID })
+      .accounts({ authority: wallet.publicKey, marginAccount: margin, assetConfig, mint, marginVault, tokenProgram: tp })
       .rpc();
     log("user_close_collateral_position", `${asset} vault=${marginVault.toBase58()} rent reclaimed tx=${sig}`);
   },
@@ -564,7 +641,8 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
     const [assetConfig] = assetConfigPda(mint);
     const [reserve] = reservePda(mint);
     const [debtPosition] = debtPositionPda(margin, reserve);
-    const marginVault = ata(margin, mint);
+    const tp = tokenProgramFor(asset);
+    const marginVault = ata(margin, mint, tp);
 
     const priceAccounts = await refreshAllPrices(ctx);
     const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
@@ -583,9 +661,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         debtPosition,
         priceUpdate: priceAccounts[asset],
         mint,
-        reserveVault: ata(reserve, mint),
+        reserveVault: ata(reserve, mint, tp),
         marginVault,
-        tokenProgram: TOKEN_PROGRAM_ID,
+        tokenProgram: tp,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
@@ -613,9 +691,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         reserve,
         debtPosition,
         mint,
-        marginVault: ata(margin, mint),
-        reserveVault: ata(reserve, mint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        marginVault: ata(margin, mint, tokenProgramFor(asset)),
+        reserveVault: ata(reserve, mint, tokenProgramFor(asset)),
+        tokenProgram: tokenProgramFor(asset),
       })
       .rpc();
     log("user_repay_from_margin", `${asset} ${repayAll ? "repay_all" : `amount=${maxAssets.toString()}`} tx=${sig}`);
@@ -641,9 +719,9 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
         reserve,
         debtPosition,
         mint,
-        payerTokenAccount: ata(wallet.publicKey, mint),
-        reserveVault: ata(reserve, mint),
-        tokenProgram: TOKEN_PROGRAM_ID,
+        payerTokenAccount: ata(wallet.publicKey, mint, tokenProgramFor(asset)),
+        reserveVault: ata(reserve, mint, tokenProgramFor(asset)),
+        tokenProgram: tokenProgramFor(asset),
       })
       .rpc();
     log(
@@ -653,53 +731,31 @@ const COMMANDS: Record<string, (ctx: Ctx) => Promise<void>> = {
   },
 
   // -- liquidation --------------------------------------------------------------------------------
+  /**
+   * Whole-account liquidation (Solidity `liquidate`): when the account's HF ≤ 1.10, repays every
+   * debt in full from the wallet and sweeps every asset (Kamino cTokens included) to the wallet's
+   * ATAs, in one transaction. Collateral is swept first, so a debt in the same token as a
+   * collateral is partly repaid from what was just received.
+   */
   liquidate: async (ctx) => {
-    const { args, wallet, program } = ctx;
+    const { args, wallet, program, conn } = ctx;
     const marginOwner = new PublicKey(requireArg(args, "margin-owner"));
-    const debtAsset = assetKeyFromString(requireArg(args, "debt-asset"));
-    const collateralAsset = assetKeyFromString(requireArg(args, "collateral-asset"));
-    const debtMint = ASSET_MINTS[debtAsset];
-    const collateralMint = ASSET_MINTS[collateralAsset];
-    const repayAmount = toBaseUnits(requireArg(args, "repay-amount"), ASSET_DECIMALS[debtAsset]);
-    const minCollateralOut = new anchor.BN(optionalArg(args, "min-collateral-out", "0"));
-
     const [margin] = marginPda(marginOwner);
-    const [debtAssetConfig] = assetConfigPda(debtMint);
-    const [debtReserve] = reservePda(debtMint);
-    const [debtPosition] = debtPositionPda(margin, debtReserve);
-    const [collateralAssetConfig] = assetConfigPda(collateralMint);
+    const { health } = await computePositionHealth(program, conn, marginOwner);
+    log("health factor", formatHealthFactorWad(health.liquidationHealthFactorWad));
 
     const priceAccounts = await refreshAllPrices(ctx);
-    const remainingAccounts = await buildRemainingAccounts(program, margin, priceAccounts, {
-      excludeCollateral: collateralAsset,
-      excludeDebt: debtAsset,
-    });
-
+    const { metas, destinations } = await buildLiquidationAccounts(program, margin, priceAccounts, wallet.publicKey);
+    const createDestinations = destinations.map((d) =>
+      createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, d.account, wallet.publicKey, d.mint, d.tokenProgram),
+    );
     const sig = await program.methods
-      .publicLiquidate(repayAmount, minCollateralOut)
-      .accounts({
-        liquidator: wallet.publicKey,
-        marginAccount: margin,
-        debtAssetConfig,
-        debtReserve,
-        debtPosition,
-        debtPriceUpdate: priceAccounts[debtAsset],
-        debtMint,
-        liquidatorDebtSource: ata(wallet.publicKey, debtMint),
-        debtReserveVault: ata(debtReserve, debtMint),
-        collateralAssetConfig,
-        collateralPriceUpdate: priceAccounts[collateralAsset],
-        collateralMint,
-        liquidatorCollateralDestination: ata(wallet.publicKey, collateralMint),
-        collateralMarginVault: ata(margin, collateralMint),
-        collateralPriceSource: OMITTED_ACCOUNT, // plain assets are Pyth-priced
-        tokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .remainingAccounts(remainingAccounts)
+      .publicLiquidate()
+      .accounts({ liquidator: wallet.publicKey, marginAccount: margin })
+      .remainingAccounts(metas)
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }), ...createDestinations])
       .rpc();
-    log("public_liquidate", `margin_owner=${marginOwner.toBase58()} repaid ${debtAsset} seized ${collateralAsset} tx=${sig}`);
+    log("public_liquidate", `margin_owner=${marginOwner.toBase58()} swept ${destinations.length} assets tx=${sig}`);
   },
 
   // -- read-only views (no transaction, nothing signed) -------------------------------------------

@@ -10,7 +10,7 @@ use anchor_spl::token_interface::{
 /// and Token-2022 mints without the extension.
 ///
 /// Repays burn debt shares against what the vault actually received, so with a fee-bearing
-/// mint (e.g. the 1% PreStocks) transferring exactly the debt would leave part of it open.
+/// mint transferring exactly the debt would leave part of it open.
 /// Grossing up by the inverse fee lets a full repay clear the debt.
 pub fn gross_up_for_transfer_fee(mint_ai: &AccountInfo, token_program: &Pubkey, net_amount: u64) -> Result<u64> {
     use anchor_spl::token_2022::spl_token_2022::{

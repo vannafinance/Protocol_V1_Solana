@@ -10,8 +10,6 @@ import { AssetKey, ASSET_MINTS, tokenProgramFor } from "./devnet-env";
 export const KLEND = new PublicKey("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
 export const INSTRUCTIONS_SYSVAR = new PublicKey("Sysvar1nstructions1111111111111111111111111");
 
-const XSTOCKS_MARKET = new PublicKey("5wJeMrUYECGq41fxRESKALVcHnNX26TAWy4W98yULsua");
-const XSTOCKS_MARKET_AUTHORITY = new PublicKey("2Z7zhqp1eddmHNmEqexftST6DFPWmoL4QqfgiG5uJMJx");
 const MAIN_MARKET = new PublicKey("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF");
 const MAIN_MARKET_AUTHORITY = new PublicKey("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo");
 
@@ -19,7 +17,7 @@ const MAIN_MARKET_AUTHORITY = new PublicKey("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHq
 export const CTOKEN_DECIMALS = 6;
 
 /** A Kamino cToken, registered in Vanna as a collateral-only asset priced by its underlying. */
-export type ReceiptKey = "ktslax" | "kgooglx" | "kusdc" | "kwsol";
+export type ReceiptKey = "kusdc" | "kwsol";
 
 export interface KaminoReceipt {
   underlying: AssetKey;
@@ -31,22 +29,6 @@ export interface KaminoReceipt {
 }
 
 export const KAMINO_RECEIPTS: Record<ReceiptKey, KaminoReceipt> = {
-  ktslax: {
-    underlying: "tslax",
-    market: XSTOCKS_MARKET,
-    marketAuthority: XSTOCKS_MARKET_AUTHORITY,
-    reserve: new PublicKey("5iTiczqgUegqA3PpoNpotizMbY9n1sRWr3oL6igKvWuf"),
-    liquidityVault: new PublicKey("AvhRUjab47DCo9efnzmDha8xUeQFEs36Yywv1x8t3T2W"),
-    collateralMint: new PublicKey("6bZpUNY1qmbvQBgCmfQJUA377X63ATvnpCHYh8hQnfjC"),
-  },
-  kgooglx: {
-    underlying: "googlx",
-    market: XSTOCKS_MARKET,
-    marketAuthority: XSTOCKS_MARKET_AUTHORITY,
-    reserve: new PublicKey("4wg6rEkGgHaEuxMduP46C1xFZ24Lnp5YgdNkZAHxFzsN"),
-    liquidityVault: new PublicKey("5vjGDURj7kT6HZtoSmfG9NgTak7deQ9u3uWgdktXv32G"),
-    collateralMint: new PublicKey("FL41HF8KMuMmYHxGgHezsa5MLUKmNSsu32cC8Qru7TnB"),
-  },
   kusdc: {
     underlying: "usdc",
     market: MAIN_MARKET,
@@ -65,14 +47,12 @@ export const KAMINO_RECEIPTS: Record<ReceiptKey, KaminoReceipt> = {
   },
 };
 
-/** Accepts the receipt key or its underlying's symbol (`TSLAX` → `ktslax`, `SOL` → `kwsol`). */
+/** Accepts the receipt key or its underlying's symbol (`USDC` → `kusdc`, `SOL` → `kwsol`). */
 export function receiptKeyFromString(value: string): ReceiptKey {
   const v = value.toLowerCase().replace(/^k/, "");
-  if (v === "tslax" || v === "tsla") return "ktslax";
-  if (v === "googlx" || v === "googl") return "kgooglx";
   if (v === "usdc") return "kusdc";
   if (v === "wsol" || v === "sol") return "kwsol";
-  throw new Error(`unknown Kamino receipt "${value}" — expected TSLAX|GOOGLX|USDC|SOL`);
+  throw new Error(`unknown Kamino receipt "${value}" — expected USDC|SOL`);
 }
 
 /** sha256("global:deposit_reserve_liquidity")[0..8] */

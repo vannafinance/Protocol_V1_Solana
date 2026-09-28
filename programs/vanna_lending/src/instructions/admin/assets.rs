@@ -3,7 +3,8 @@
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::oracle::valuation::receipt_rate;
+use crate::oracle::pyth::{canonical_feed_account, read_price_update};
+use crate::oracle::valuation::{receipt_rate, ui_multiplier_wad};
 use crate::state::asset_config::{AssetConfig, PriceSource};
 use crate::state::protocol_config::ProtocolConfig;
 use anchor_lang::prelude::*;
@@ -172,11 +173,12 @@ pub struct AdminSetAssetPriceSource<'info> {
         bump = asset_config.bump
     )]
     pub asset_config: Box<Account<'info, AssetConfig>>,
-    /// CHECK: the account a non-Pyth source reads (the Kamino reserve); its owner, layout and
-    /// cToken mint are validated below. Omitted for `Pyth`.
-    pub source_account: Option<UncheckedAccount<'info>>,
-    /// The registered underlying asset of a receipt, whose feed and decimals must match.
+    /// CHECK: the account a non-Pyth source reads: the Kamino reserve, the asset's own mint
+    /// (Scaled UI Amount) or the base price feed (redemption rate). Validated below per source.
     /// Omitted for `Pyth`.
+    pub source_account: Option<UncheckedAccount<'info>>,
+    /// The registered asset a source is anchored to: a receipt's underlying, or a redemption
+    /// rate's base asset (e.g. SOL for JupSOL). Omitted for `Pyth` and `ScaledUiAmount`.
     #[account(seeds = [ASSET_SEED, underlying_asset_config.mint.as_ref()], bump = underlying_asset_config.bump)]
     pub underlying_asset_config: Option<Box<Account<'info, AssetConfig>>>,
 }
@@ -191,7 +193,14 @@ pub fn admin_set_asset_price_source(
 ) -> Result<()> {
     let accounts = &mut ctx.accounts;
     require!(!accounts.asset_config.collateral_enabled, VannaError::UnsupportedPriceSource);
+    if price_source != PriceSource::Pyth {
+        require!(
+            !accounts.asset_config.borrow_enabled && accounts.asset_config.reserve == Pubkey::default(),
+            VannaError::UnsupportedPriceSource
+        );
+    }
 
+    let source = accounts.source_account.as_ref().map(|a| a.to_account_info());
     let asset_config = &mut accounts.asset_config;
     asset_config.price_source = price_source;
     match price_source {
@@ -200,20 +209,36 @@ pub fn admin_set_asset_price_source(
             asset_config.price_source_program = Pubkey::default();
         }
         PriceSource::KaminoReceipt => {
-            require!(
-                !asset_config.borrow_enabled && asset_config.reserve == Pubkey::default(),
-                VannaError::UnsupportedPriceSource
-            );
-            let source = accounts.source_account.as_ref().ok_or(VannaError::InvalidPriceSource)?.to_account_info();
+            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
             asset_config.price_source_account = source.key();
             asset_config.price_source_program = source_program;
-            let rate = receipt_rate(asset_config, Some(&source))?;
+            let rate = receipt_rate(asset_config, Some(source))?;
 
             // The cToken is priced with the underlying's feed at the underlying's decimals.
             let underlying = accounts.underlying_asset_config.as_ref().ok_or(VannaError::InvalidPriceSource)?;
             require_keys_eq!(underlying.mint, rate.liquidity_mint, VannaError::InvalidKaminoAccounts);
             require!(underlying.decimals == rate.liquidity_decimals, VannaError::InvalidKaminoAccounts);
             require!(asset_config.price_feed_id == underlying.price_feed_id, VannaError::InvalidPriceFeed);
+        }
+        PriceSource::ScaledUiAmount => {
+            // The source is the asset's own Token-2022 mint, which must carry the extension.
+            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
+            require_keys_eq!(source.key(), asset_config.mint, VannaError::InvalidPriceSource);
+            require_keys_eq!(source_program, anchor_spl::token_2022::ID, VannaError::InvalidPriceSource);
+            ui_multiplier_wad(source, Clock::get()?.unix_timestamp)?;
+            asset_config.price_source_account = source.key();
+            asset_config.price_source_program = source_program;
+        }
+        PriceSource::RedemptionRate => {
+            // The source is the base asset's canonical Pyth feed account, pinned by address.
+            let source = source.as_ref().ok_or(VannaError::InvalidPriceSource)?;
+            let base = accounts.underlying_asset_config.as_ref().ok_or(VannaError::InvalidPriceSource)?;
+            require!(base.is_pyth_priced(), VannaError::InvalidPriceSource);
+            require_keys_eq!(source.key(), canonical_feed_account(&base.price_feed_id), VannaError::InvalidPriceSource);
+            require_keys_eq!(source_program, pyth_solana_receiver_sdk::ID, VannaError::InvalidPriceSource);
+            require!(read_price_update(source)?.price_message.feed_id == base.price_feed_id, VannaError::InvalidPriceFeed);
+            asset_config.price_source_account = source.key();
+            asset_config.price_source_program = source_program;
         }
     }
 

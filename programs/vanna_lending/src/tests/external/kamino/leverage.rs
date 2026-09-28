@@ -1,5 +1,5 @@
-//! Leverage: borrowing from Vanna into Kamino, cToken valuation, liquidation of cToken
-//! collateral, and the full 5x farm walkthrough.
+//! Leverage: borrowing from Vanna into Kamino, cToken valuation, whole-account liquidation of
+//! Kamino positions, and the full 5x farm walkthrough.
 
 use crate::common::kamino::*;
 use crate::common::mainnet::*;
@@ -58,48 +58,116 @@ fn csol_is_valued_at_sol_decimals_through_the_real_reserve() {
     env.borrow_usdc(&user, 15_000 * USDC, &health).expect("borrow against ~$2,000 of cSOL");
 }
 
-/// After SOL halves, a liquidator repays USDC and is paid in cSOL, sized through the real
-/// reserve's exchange rate: the seized cTokens redeem for repay × 1.05 of SOL value.
+/// Liquidation accounts for every position of `margin`, in slot order, sweeping to the
+/// liquidator's ATAs and repaying the USDC debt from its USDC ATA.
+fn whole_account(env: &mut Env, user: &solana_keypair::Keypair, margin: &Pubkey, liquidator: &Pubkey) -> Vec<LiqPosition> {
+    let assets = [
+        (MAINNET_USDC, env.usdc_price, None),
+        (NATIVE_MINT, env.sol_price, None),
+        (USDC_RESERVE.collateral_mint, env.usdc_price, Some(USDC_RESERVE.reserve)),
+        (SOL_RESERVE.collateral_mint, env.sol_price, Some(SOL_RESERVE.reserve)),
+    ];
+    let account = fetch_margin(&env.svm, &user.pubkey());
+    let mut positions = Vec::new();
+    for index in account.active_collateral_indexes() {
+        let (mint, price, source) = assets.into_iter().find(|(m, ..)| fetch_asset_config(&env.svm, m).asset_index == index).unwrap();
+        let destination = get_associated_token_address(liquidator, &mint);
+        if env.svm.get_account(&destination).is_none() {
+            set_token_balance(&mut env.svm, liquidator, &mint, 0);
+        }
+        positions.push(liq_collateral(&mint, &anchor_spl::token::ID, margin, &price, source.as_ref(), &destination));
+    }
+    let usdc_account = get_associated_token_address(liquidator, &MAINNET_USDC);
+    positions.push(liq_debt(&MAINNET_USDC, margin, &env.usdc_price, &usdc_account));
+    positions
+}
+
+/// cSOL plus the borrowed USDC back a USDC debt. After SOL halves (HF ≈ 1.067), a liquidator with
+/// no capital takes the whole account: the swept USDC repays the debt, and the swept cSOL redeems
+/// at Kamino for the 10 SOL behind it.
 #[test]
-fn liquidator_is_paid_in_ctokens_at_the_kamino_rate() {
+fn liquidator_takes_the_whole_account_including_ctokens() {
     let mut env = setup();
     let (user, margin) = env.user_with_collateral(NATIVE_MINT, 10 * SOL);
     env.supply(&user, &SOL_RESERVE, 10 * SOL, 1, &[]).unwrap();
     env.open_usdc_debt(&user);
-    let mut others = Vec::new();
+    let mut health = env.receipt_group(&margin, &SOL_RESERVE);
     if env.is_active(&user, &NATIVE_MINT) {
-        others.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price));
+        health.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price));
     }
-    let health: Vec<AccountMeta> = env.receipt_group(&margin, &SOL_RESERVE).into_iter().chain(others.iter().cloned()).collect();
     env.borrow_usdc(&user, 15_000 * USDC, &health).unwrap();
-
     // SOL $200 -> $100: HF = (1,000 + 15,000) / 15,000 ≈ 1.067.
     set_price(&mut env.svm, &env.sol_price, WSOL_FEED, WSOL_PRICE / 2, 0, -8, FIXTURE_UNIX_TIMESTAMP);
 
     let liquidator = funded_keypair(&mut env.svm);
-    set_token_balance(&mut env.svm, &liquidator.pubkey(), &MAINNET_USDC, 1_000 * USDC);
-    let mut remaining = collateral_group_metas(&MAINNET_USDC, &margin, &env.usdc_price);
-    remaining.extend(others);
-    let receipts_before = env.balance(&margin, &SOL_RESERVE.collateral_mint);
-    let ix = ix_public_liquidate_priced(
-        &liquidator.pubkey(),
-        &margin,
-        &MAINNET_USDC,
-        &env.usdc_price,
-        &SOL_RESERVE.collateral_mint,
-        &env.sol_price,
-        Some(SOL_RESERVE.reserve),
-        500 * USDC,
-        1,
-        &remaining,
-    );
-    send(&mut env.svm, &liquidator, &[ix], &[]).expect("liquidate cSOL collateral");
+    let usdc_account = set_token_balance(&mut env.svm, &liquidator.pubkey(), &MAINNET_USDC, 0);
+    let receipts = env.balance(&margin, &SOL_RESERVE.collateral_mint);
+    let positions = whole_account(&mut env, &user, &margin, &liquidator.pubkey());
+    send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions)], &[])
+        .expect("liquidate the whole account");
 
-    let seized = token_balance(&env.svm, &get_associated_token_address(&liquidator.pubkey(), &SOL_RESERVE.collateral_mint));
-    assert_eq!(receipts_before - env.balance(&margin, &SOL_RESERVE.collateral_mint), seized);
-    // $500 repaid × 1.05 bonus = $525 of SOL at $100 = 5.25 SOL, rounded down.
-    let lamports = underlying_for_receipts(&env.svm, &SOL_RESERVE, seized);
-    assert!(lamports <= 5_250_000_000 && lamports >= 5_249_990_000, "seized cSOL redeems for {lamports} lamports");
+    assert_eq!(token_balance(&env.svm, &usdc_account), 0, "the swept 15,000 USDC repaid the 15,000 USDC debt");
+    let csol = get_associated_token_address(&liquidator.pubkey(), &SOL_RESERVE.collateral_mint);
+    assert_eq!(token_balance(&env.svm, &csol), receipts, "every cSOL swept");
+    let account = fetch_margin(&env.svm, &user.pubkey());
+    assert_eq!((account.collateral_count, account.debt_count), (0, 0));
+
+    // The liquidator redeems the cSOL at Kamino itself.
+    let wsol = get_associated_token_address(&liquidator.pubkey(), &NATIVE_MINT);
+    let wsol = if env.svm.get_account(&wsol).is_some() { wsol } else { set_token_balance(&mut env.svm, &liquidator.pubkey(), &NATIVE_MINT, 0) };
+    let before = token_balance(&env.svm, &wsol);
+    let accounts = kamino_redeem_accounts(&SOL_RESERVE, &liquidator.pubkey(), &csol, &wsol);
+    send(&mut env.svm, &liquidator, &[kamino_direct_ix(kamino_call_data(REDEEM_RESERVE_COLLATERAL, receipts), accounts)], &[])
+        .expect("liquidator redeems cSOL at klend");
+    let lamports = token_balance(&env.svm, &wsol) - before;
+    assert!(lamports <= 10 * SOL && lamports + 2_000 >= 10 * SOL, "cSOL redeemed for {lamports} lamports");
+}
+
+/// A farm held entirely in Kamino (cSOL + cUSDC against a USDC debt) goes to the liquidator in one
+/// transaction; the liquidator repays the USDC debt and redeems both cTokens at Kamino.
+#[test]
+fn farm_fully_in_kamino_is_liquidated_in_one_transaction() {
+    let mut env = setup();
+    let (user, margin) = env.user_with_collateral(NATIVE_MINT, 10 * SOL);
+    env.supply(&user, &SOL_RESERVE, 10 * SOL, 1, &[]).unwrap();
+    env.open_usdc_debt(&user);
+    let mut csol = env.receipt_group(&margin, &SOL_RESERVE);
+    if env.is_active(&user, &NATIVE_MINT) {
+        csol.extend(collateral_group_metas(&NATIVE_MINT, &margin, &env.sol_price));
+    }
+    env.borrow_usdc(&user, 1_500 * USDC, &csol).unwrap();
+    let health: Vec<AccountMeta> = csol.iter().cloned().chain(debt_group_metas(&MAINNET_USDC, &margin, &env.usdc_price)).collect();
+    env.supply(&user, &USDC_RESERVE, 1_500 * USDC, 1, &health).expect("borrowed USDC into Kamino");
+    // SOL $200 -> $14: HF = (140 + 1,500) / 1,500 ≈ 1.093.
+    set_price(&mut env.svm, &env.sol_price, WSOL_FEED, 1_400_000_000, 0, -8, FIXTURE_UNIX_TIMESTAMP);
+
+    let liquidator = funded_keypair(&mut env.svm);
+    let usdc_account = set_token_balance(&mut env.svm, &liquidator.pubkey(), &MAINNET_USDC, 1_500 * USDC);
+    let (csol_before, cusdc_before) =
+        (env.balance(&margin, &SOL_RESERVE.collateral_mint), env.balance(&margin, &USDC_RESERVE.collateral_mint));
+    let positions = whole_account(&mut env, &user, &margin, &liquidator.pubkey());
+    send(&mut env.svm, &liquidator, &[ix_public_liquidate(&liquidator.pubkey(), &margin, &positions)], &[])
+        .expect("liquidate the Kamino farm");
+
+    let liq = liquidator.pubkey();
+    let cusdc = get_associated_token_address(&liq, &USDC_RESERVE.collateral_mint);
+    let csol_account = get_associated_token_address(&liq, &SOL_RESERVE.collateral_mint);
+    assert_eq!((token_balance(&env.svm, &csol_account), token_balance(&env.svm, &cusdc)), (csol_before, cusdc_before));
+    assert_eq!(fetch_margin(&env.svm, &user.pubkey()).collateral_count, 0);
+    assert_eq!(fetch_reserve(&env.svm, &MAINNET_USDC).total_borrow_assets, 0);
+
+    // Both receipt tokens redeem at Kamino.
+    let usdc_before = token_balance(&env.svm, &usdc_account);
+    let accounts = kamino_redeem_accounts(&USDC_RESERVE, &liq, &cusdc, &usdc_account);
+    send(&mut env.svm, &liquidator, &[kamino_direct_ix(kamino_call_data(REDEEM_RESERVE_COLLATERAL, cusdc_before), accounts)], &[])
+        .expect("redeem cUSDC");
+    let got = token_balance(&env.svm, &usdc_account) - usdc_before;
+    assert!(got <= 1_500 * USDC && got + 4 >= 1_500 * USDC, "cUSDC redeemed for {got}");
+    let wsol = get_associated_token_address(&liq, &NATIVE_MINT);
+    let wsol = if env.svm.get_account(&wsol).is_some() { wsol } else { set_token_balance(&mut env.svm, &liq, &NATIVE_MINT, 0) };
+    let accounts = kamino_redeem_accounts(&SOL_RESERVE, &liq, &csol_account, &wsol);
+    send(&mut env.svm, &liquidator, &[kamino_direct_ix(kamino_call_data(REDEEM_RESERVE_COLLATERAL, csol_before), accounts)], &[])
+        .expect("redeem cSOL");
 }
 
 /// Deposit 1,000 USDC, borrow 4,000 USDC from the Vanna pool (5x), supply all 5,000 to Kamino

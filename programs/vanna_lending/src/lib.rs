@@ -234,7 +234,7 @@ pub mod vanna_lending {
 
     // -- Account manager: liquidation ------------------------------------------------------------
 
-    pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
-        instructions::account_manager::public_liquidate(ctx, max_repay_assets, min_collateral_out)
+    pub fn public_liquidate<'info>(ctx: Context<'info, PublicLiquidate<'info>>) -> Result<()> {
+        instructions::account_manager::public_liquidate(ctx)
     }
 }

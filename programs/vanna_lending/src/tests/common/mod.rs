@@ -131,9 +131,82 @@ pub fn mint_to_wallet(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, mint_au
     ata
 }
 
+/// Balance of a classic SPL or Token-2022 account (the amount sits at the same offset in both).
 pub fn token_balance(svm: &LiteSVM, ata: &Pubkey) -> u64 {
     let acc = svm.get_account(ata).expect("token account missing");
-    spl_token_interface::state::Account::unpack(&acc.data).unwrap().amount
+    u64::from_le_bytes(acc.data[64..72].try_into().unwrap())
+}
+
+pub const TOKEN_2022: Pubkey = anchor_spl::token_2022::ID;
+
+/// ATA of `owner` for `mint` under `token_program` (classic SPL or Token-2022).
+pub fn ata_for(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    anchor_spl::associated_token::get_associated_token_address_with_program_id(owner, mint, token_program)
+}
+
+/// A Token-2022 mint with the Scaled UI Amount extension, like the xStocks. `multiplier` applies
+/// now; `scheduled` = `(new_multiplier, effective_timestamp)` schedules the next one.
+pub fn create_scaled_ui_mint(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    authority: &Keypair,
+    decimals: u8,
+    multiplier: f64,
+    scheduled: Option<(f64, i64)>,
+) -> Pubkey {
+    use anchor_spl::token_2022::spl_token_2022::extension::{scaled_ui_amount, ExtensionType};
+    use anchor_spl::token_2022::spl_token_2022::{instruction::initialize_mint2, state::Mint};
+    let mint_kp = Keypair::new();
+    let mint = mint_kp.pubkey();
+    let len = ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::ScaledUiAmount]).unwrap();
+    let rent = svm.minimum_balance_for_rent_exemption(len);
+    let mut ixs = vec![
+        create_account(&payer.pubkey(), &mint, rent, len as u64, &TOKEN_2022),
+        scaled_ui_amount::instruction::initialize(&TOKEN_2022, &mint, Some(authority.pubkey()), multiplier).unwrap(),
+        initialize_mint2(&TOKEN_2022, &mint, &authority.pubkey(), None, decimals).unwrap(),
+    ];
+    if let Some((new_multiplier, effective)) = scheduled {
+        ixs.push(
+            scaled_ui_amount::instruction::update_multiplier(&TOKEN_2022, &mint, &authority.pubkey(), &[], new_multiplier, effective)
+                .unwrap(),
+        );
+    }
+    let signers: &[&Keypair] = if scheduled.is_some() { &[&mint_kp, authority] } else { &[&mint_kp] };
+    let res = send(svm, payer, &ixs, signers);
+    assert!(res.is_ok(), "create_scaled_ui_mint failed: {res:?}");
+    mint
+}
+
+/// [`mint_to_wallet`] for a mint of either token program.
+pub fn mint_to_wallet_with(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    mint_authority: &Keypair,
+    owner: &Pubkey,
+    amount: u64,
+) -> Pubkey {
+    let ata = ata_for(owner, mint, token_program);
+    let create_ata_ix =
+        spl_associated_token_account::instruction::create_associated_token_account_idempotent(&payer.pubkey(), owner, mint, token_program);
+    let mint_ix = anchor_spl::token_2022::spl_token_2022::instruction::mint_to(token_program, mint, &ata, &mint_authority.pubkey(), &[], amount)
+        .unwrap();
+    let res = send(svm, payer, &[create_ata_ix, mint_ix], &[mint_authority]);
+    assert!(res.is_ok(), "mint_to_wallet_with failed: {res:?}");
+    ata
+}
+
+/// The last event of type `E` the program emitted in a transaction.
+pub fn event<E: anchor_lang::Event + anchor_lang::AnchorDeserialize + anchor_lang::Discriminator>(logs: &[String]) -> E {
+    use anchor_lang::__private::base64::{engine::general_purpose::STANDARD, Engine};
+    logs.iter()
+        .rev()
+        .filter_map(|l| l.strip_prefix("Program data: "))
+        .filter_map(|b64| STANDARD.decode(b64).ok())
+        .find(|bytes| bytes.starts_with(E::DISCRIMINATOR))
+        .map(|bytes| E::try_from_slice(&bytes[E::DISCRIMINATOR.len()..]).unwrap())
+        .expect("event not emitted")
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +285,10 @@ pub fn margin_vault_ata(margin: &Pubkey, mint: &Pubkey) -> Pubkey {
     get_associated_token_address(margin, mint)
 }
 
+pub fn margin_vault_ata_with(margin: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    ata_for(margin, mint, token_program)
+}
+
 pub fn debt_position_pda(margin: &Pubkey, reserve: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[DEBT_SEED, margin.as_ref(), reserve.as_ref()], &vanna_lending::ID)
 }
@@ -245,6 +322,43 @@ pub fn ix_initialize_protocol(admin: &Pubkey, treasury: &Pubkey, payer: &Pubkey,
 
 #[allow(clippy::too_many_arguments)]
 pub fn ix_admin_register_asset(
+    admin: &Pubkey,
+    payer: &Pubkey,
+    mint: &Pubkey,
+    price_feed_id: [u8; 32],
+    max_collateral_per_margin: u64,
+    ltv_bps: u16,
+    liquidation_threshold_bps: u16,
+    liquidation_bonus_bps: u16,
+    max_confidence_bps: u16,
+    max_price_age_secs: u32,
+    collateral_enabled: bool,
+    borrow_enabled: bool,
+) -> Instruction {
+    ix_admin_register_asset_raw(
+        admin, payer, mint, price_feed_id, max_collateral_per_margin, ltv_bps, liquidation_threshold_bps,
+        liquidation_bonus_bps, max_confidence_bps, max_price_age_secs, collateral_enabled, borrow_enabled,
+    )
+}
+
+/// Registration of a Token-2022 mint (e.g. an xStock).
+#[allow(clippy::too_many_arguments)]
+pub fn ix_admin_register_asset_2022(
+    admin: &Pubkey,
+    mint: &Pubkey,
+    price_feed_id: [u8; 32],
+    max_price_age_secs: u32,
+    collateral_enabled: bool,
+) -> Instruction {
+    let mut ix = ix_admin_register_asset_raw(
+        admin, admin, mint, price_feed_id, 0, 8_000, 8_500, 500, 1_000, max_price_age_secs, collateral_enabled, false,
+    );
+    ix.accounts[5].pubkey = TOKEN_2022; // AdminRegisterAsset::token_program
+    ix
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ix_admin_register_asset_raw(
     admin: &Pubkey,
     payer: &Pubkey,
     mint: &Pubkey,
@@ -455,8 +569,12 @@ pub fn ix_public_refresh_reserve(mint: &Pubkey) -> Instruction {
 }
 
 pub fn ix_user_close_collateral_position(authority: &Pubkey, margin: &Pubkey, mint: &Pubkey) -> Instruction {
+    ix_user_close_collateral_position_with(authority, margin, mint, &anchor_spl::token::ID)
+}
+
+pub fn ix_user_close_collateral_position_with(authority: &Pubkey, margin: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Instruction {
     let (asset_config, _) = asset_config_pda(mint);
-    let margin_vault = margin_vault_ata(margin, mint);
+    let margin_vault = margin_vault_ata_with(margin, mint, token_program);
     Instruction {
         program_id: vanna_lending::ID,
         accounts: vanna_lending::accounts::UserCloseCollateralPosition {
@@ -465,7 +583,7 @@ pub fn ix_user_close_collateral_position(authority: &Pubkey, margin: &Pubkey, mi
             asset_config,
             mint: *mint,
             margin_vault,
-            token_program: anchor_spl::token::ID,
+            token_program: *token_program,
         }
         .to_account_metas(None),
         data: vanna_lending::instruction::UserCloseCollateralPosition {}.data(),
@@ -574,10 +692,14 @@ pub fn ix_user_create_margin(authority: &Pubkey, payer: &Pubkey) -> Instruction 
 
 /// Creates the margin vault ATA on first use (`init_if_needed`).
 pub fn ix_user_deposit_collateral(authority: &Pubkey, margin: &Pubkey, mint: &Pubkey, amount: u64) -> Instruction {
+    ix_user_deposit_collateral_with(authority, margin, mint, &anchor_spl::token::ID, amount)
+}
+
+pub fn ix_user_deposit_collateral_with(authority: &Pubkey, margin: &Pubkey, mint: &Pubkey, token_program: &Pubkey, amount: u64) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
     let (asset_config, _) = asset_config_pda(mint);
-    let margin_vault = margin_vault_ata(margin, mint);
-    let source_token_account = get_associated_token_address(authority, mint);
+    let margin_vault = margin_vault_ata_with(margin, mint, token_program);
+    let source_token_account = ata_for(authority, mint, token_program);
     Instruction {
         program_id: vanna_lending::ID,
         accounts: vanna_lending::accounts::UserDepositCollateral {
@@ -588,7 +710,7 @@ pub fn ix_user_deposit_collateral(authority: &Pubkey, margin: &Pubkey, mint: &Pu
             mint: *mint,
             source_token_account,
             margin_vault,
-            token_program: anchor_spl::token::ID,
+            token_program: *token_program,
             associated_token_program: anchor_spl::associated_token::ID,
             system_program: anchor_lang::system_program::ID,
         }
@@ -705,10 +827,28 @@ pub fn ix_user_withdraw_collateral_priced(
     min_health_factor_wad: u128,
     remaining: &[AccountMeta],
 ) -> Instruction {
+    ix_user_withdraw_collateral_with(
+        authority, margin, mint, &anchor_spl::token::ID, price_update, price_source_account, amount, min_health_factor_wad,
+        remaining,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ix_user_withdraw_collateral_with(
+    authority: &Pubkey,
+    margin: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    price_update: &Pubkey,
+    price_source_account: Option<Pubkey>,
+    amount: u64,
+    min_health_factor_wad: u128,
+    remaining: &[AccountMeta],
+) -> Instruction {
     let (protocol_config, _) = protocol_config_pda();
     let (asset_config, _) = asset_config_pda(mint);
-    let margin_vault = margin_vault_ata(margin, mint);
-    let destination_token_account = get_associated_token_address(authority, mint);
+    let margin_vault = margin_vault_ata_with(margin, mint, token_program);
+    let destination_token_account = ata_for(authority, mint, token_program);
     let mut accounts = vanna_lending::accounts::UserWithdrawCollateral {
         authority: *authority,
         protocol_config,
@@ -719,7 +859,7 @@ pub fn ix_user_withdraw_collateral_priced(
         destination_token_account,
         margin_vault,
         price_source_account,
-        token_program: anchor_spl::token::ID,
+        token_program: *token_program,
     }
     .to_account_metas(None);
     accounts.extend_from_slice(remaining);
@@ -730,80 +870,63 @@ pub fn ix_user_withdraw_collateral_priced(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn ix_public_liquidate(
-    liquidator: &Pubkey,
-    margin: &Pubkey,
-    debt_mint: &Pubkey,
-    debt_price_update: &Pubkey,
-    collateral_mint: &Pubkey,
-    collateral_price_update: &Pubkey,
-    max_repay_assets: u64,
-    min_collateral_out: u64,
-    remaining: &[AccountMeta],
-) -> Instruction {
-    ix_public_liquidate_priced(
-        liquidator,
-        margin,
-        debt_mint,
-        debt_price_update,
-        collateral_mint,
-        collateral_price_update,
-        None,
-        max_repay_assets,
-        min_collateral_out,
-        remaining,
-    )
+/// Whole-account liquidation. `positions` are the liquidation groups of every active position
+/// (see [`liq_collateral`] / [`liq_debt`]), collaterals first, each in the margin's slot order.
+pub fn ix_public_liquidate(liquidator: &Pubkey, margin: &Pubkey, positions: &[LiqPosition]) -> Instruction {
+    let mut accounts = vanna_lending::accounts::PublicLiquidate { liquidator: *liquidator, margin_account: *margin }
+        .to_account_metas(None);
+    for p in positions {
+        accounts.extend_from_slice(&p.health);
+    }
+    for p in positions {
+        accounts.extend_from_slice(&p.settlement);
+    }
+    Instruction { program_id: vanna_lending::ID, accounts, data: vanna_lending::instruction::PublicLiquidate {}.data() }
 }
 
-/// Liquidation seizing collateral with a non-Pyth price source (e.g. a Kamino cToken).
-#[allow(clippy::too_many_arguments)]
-pub fn ix_public_liquidate_priced(
-    liquidator: &Pubkey,
+/// One position's accounts in a liquidation: its health group and its settlement accounts.
+pub struct LiqPosition {
+    pub health: Vec<AccountMeta>,
+    pub settlement: Vec<AccountMeta>,
+}
+
+/// A collateral swept to `destination`: `[asset_config, margin_vault (w), price, source?]` and
+/// `[mint, destination (w), token_program]`.
+pub fn liq_collateral(
+    mint: &Pubkey,
+    token_program: &Pubkey,
     margin: &Pubkey,
-    debt_mint: &Pubkey,
-    debt_price_update: &Pubkey,
-    collateral_mint: &Pubkey,
-    collateral_price_update: &Pubkey,
-    collateral_price_source: Option<Pubkey>,
-    max_repay_assets: u64,
-    min_collateral_out: u64,
-    remaining: &[AccountMeta],
-) -> Instruction {
-    let (debt_asset_config, _) = asset_config_pda(debt_mint);
-    let (debt_reserve, _) = reserve_pda(debt_mint);
-    let (debt_position, _) = debt_position_pda(margin, &debt_reserve);
-    let (collateral_asset_config, _) = asset_config_pda(collateral_mint);
-    let liquidator_debt_source = get_associated_token_address(liquidator, debt_mint);
-    let debt_reserve_vault = get_associated_token_address(&debt_reserve, debt_mint);
-    let liquidator_collateral_destination = get_associated_token_address(liquidator, collateral_mint);
-    let collateral_margin_vault = margin_vault_ata(margin, collateral_mint);
-    let mut accounts = vanna_lending::accounts::PublicLiquidate {
-        liquidator: *liquidator,
-        margin_account: *margin,
-        debt_asset_config,
-        debt_reserve,
-        debt_position,
-        debt_price_update: *debt_price_update,
-        debt_mint: *debt_mint,
-        liquidator_debt_source,
-        debt_reserve_vault,
-        collateral_asset_config,
-        collateral_price_update: *collateral_price_update,
-        collateral_mint: *collateral_mint,
-        liquidator_collateral_destination,
-        collateral_margin_vault,
-        collateral_price_source,
-        token_program: anchor_spl::token::ID,
-        associated_token_program: anchor_spl::associated_token::ID,
-        system_program: anchor_lang::system_program::ID,
+    price_update: &Pubkey,
+    source: Option<&Pubkey>,
+    destination: &Pubkey,
+) -> LiqPosition {
+    let mut health = collateral_group_with(mint, token_program, margin, price_update, source);
+    health[1].is_writable = true;
+    LiqPosition {
+        health,
+        settlement: vec![
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(*destination, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
     }
-    .to_account_metas(None);
-    accounts.extend_from_slice(remaining);
-    Instruction {
-        program_id: vanna_lending::ID,
-        accounts,
-        data: vanna_lending::instruction::PublicLiquidate { max_repay_assets, min_collateral_out }.data(),
+}
+
+/// A classic-SPL debt repaid in full from `source`: `[asset_config, reserve (w), debt_position (w),
+/// price]` and `[mint, reserve vault (w), source (w), token_program]`.
+pub fn liq_debt(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey, source: &Pubkey) -> LiqPosition {
+    let mut health = debt_group_metas(mint, margin, price_update);
+    health[1].is_writable = true;
+    health[2].is_writable = true;
+    let reserve = reserve_pda(mint).0;
+    LiqPosition {
+        health,
+        settlement: vec![
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(get_associated_token_address(&reserve, mint), false),
+            AccountMeta::new(*source, false),
+            AccountMeta::new_readonly(anchor_spl::token::ID, false),
+        ],
     }
 }
 
@@ -936,6 +1059,23 @@ pub fn collateral_group_metas(mint: &Pubkey, margin: &Pubkey, price_update: &Pub
 pub fn collateral_group_with_source(mint: &Pubkey, margin: &Pubkey, price_update: &Pubkey, source: &Pubkey) -> Vec<AccountMeta> {
     let mut metas = collateral_group_metas(mint, margin, price_update);
     metas.push(AccountMeta::new_readonly(*source, false));
+    metas
+}
+
+/// Collateral group for an asset of any token program, with its price-source account if any.
+pub fn collateral_group_with(
+    mint: &Pubkey,
+    token_program: &Pubkey,
+    margin: &Pubkey,
+    price_update: &Pubkey,
+    source: Option<&Pubkey>,
+) -> Vec<AccountMeta> {
+    let mut metas = vec![
+        AccountMeta::new_readonly(asset_config_pda(mint).0, false),
+        AccountMeta::new_readonly(margin_vault_ata_with(margin, mint, token_program), false),
+        AccountMeta::new_readonly(*price_update, false),
+    ];
+    metas.extend(source.map(|s| AccountMeta::new_readonly(*s, false)));
     metas
 }
 

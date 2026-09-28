@@ -4,7 +4,7 @@
 //! 2. Its adapter must allow the instruction and names the margin vault the call spends from, the
 //!    margin vault it credits, and the most it may spend (`CallPlan`).
 //! 3. The CPI is signed by the margin PDA only, those two vaults are the only margin-owned token
-//!    accounts passed to it, and a receipt leg must use its registered pricing reserve.
+//!    accounts passed to it, and a Kamino receipt leg must use its registered pricing reserve.
 //! 4. Afterwards: both vaults are still plain margin-owned accounts, no more than `max_spent` left
 //!    the spent vault, the received amount meets `min_received`, the account's health factor is
 //!    above 1.10, and the active-asset lists track the new balances.
@@ -15,8 +15,8 @@ use crate::errors::VannaError;
 use crate::events::*;
 use crate::math::health::{calculate_health, CollateralValuation};
 use crate::oracle::valuation::{collateral_value, find_source_account};
-use crate::risk_engine::scan_and_validate_positions;
-use crate::state::asset_config::AssetConfig;
+use crate::risk_engine::scan_positions;
+use crate::state::asset_config::{AssetConfig, PriceSource};
 use crate::state::integration::Integration;
 use crate::state::margin_account::MarginAccount;
 use crate::state::protocol_config::ProtocolConfig;
@@ -81,7 +81,8 @@ pub struct MarginExecute<'info> {
 }
 
 /// `remaining_accounts` = the external instruction's accounts (`cpi_account_count` of them, in
-/// that program's order), followed by the position-scan accounts for the health check.
+/// that program's order), then the position-scan accounts for the health check, then any
+/// price-source account a leg needs that isn't already passed (e.g. JupSOL's SOL/USD feed).
 pub fn margin_execute<'info>(
     mut ctx: Context<'info, MarginExecute<'info>>,
     data: Vec<u8>,
@@ -177,9 +178,10 @@ fn check_roles(plan: &CallPlan, cpi: &[AccountInfo], margin: &Pubkey, accounts: 
             require_keys_eq!(key_at(index)?, mint, VannaError::InvalidCallAccounts);
         }
     }
-    // A receipt leg must go through the reserve that prices it.
+    // A Kamino receipt leg must go through the reserve that prices it: the call changes that
+    // reserve's exchange rate, and the health check reads it afterwards.
     for asset in [&accounts.spent_asset, &accounts.received_asset] {
-        if !asset.is_pyth_priced() {
+        if asset.price_source == PriceSource::KaminoReceipt {
             let index = plan.price_source.ok_or(VannaError::InvalidCallAccounts)?;
             require_keys_eq!(key_at(index)?, asset.price_source_account, VannaError::InvalidCallAccounts);
         }
@@ -249,7 +251,7 @@ fn check_health<'info>(
 ) -> Result<u128> {
     let clock = Clock::get()?;
     let named = [accounts.spent_asset.asset_index, accounts.received_asset.asset_index];
-    let (mut collaterals, debts) = scan_and_validate_positions(
+    let (mut collaterals, debts, _) = scan_positions(
         &accounts.margin_account.key(),
         &accounts.margin_account,
         health_accounts,
@@ -258,7 +260,14 @@ fn check_health<'info>(
         &named,
         None,
     )?;
-    let candidates = [cpi_accounts, health_accounts];
+    // A leg's price source (its mint, a base price feed, a Kamino reserve) is looked up by key.
+    let passed = [
+        accounts.spent_mint.to_account_info(),
+        accounts.received_mint.to_account_info(),
+        accounts.spent_price_update.to_account_info(),
+        accounts.received_price_update.to_account_info(),
+    ];
+    let candidates = [&passed[..], cpi_accounts, health_accounts];
     for (asset, amount, price) in [
         (&accounts.spent_asset, accounts.spent_vault.amount, &accounts.spent_price_update),
         (&accounts.received_asset, accounts.received_vault.amount, &accounts.received_price_update),

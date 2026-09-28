@@ -1,21 +1,17 @@
 #!/usr/bin/env node
 /**
- * Surfpool fork helpers: xStock registration and funding, plus the external integrations that
- * go through `margin_execute`:
+ * Surfpool fork helpers: funding wallets with the protocol's assets, plus the external
+ * integrations that go through `margin_execute`:
  *
- *   Kamino:  `register-kamino`, `register-receipt --symbol X`, then
+ *   Funding: `fund --asset X --to PUBKEY --amount N` (any listed asset), `fund-sol` (native SOL)
+ *   Kamino:  `register-kamino`, `register-receipt --symbol USDC|SOL`, then
  *            `kamino-deposit` / `kamino-redeem --symbol X --amount N`
- *   Jupiter: `register-jupiter`, then `jupiter-swap --from SOL --to USDC --amount N`
+ *   Jupiter: `register-jupiter`, then `jupiter-swap --from usdc --to wsol --amount N`
  *
  *   npx tsx src/integrations-fork.ts <command> [--flag value ...]
  */
 import * as anchor from "@coral-xyz/anchor";
-import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
-  getAssociatedTokenAddressSync,
-} from "@solana/spl-token";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
   AddressLookupTableAccount,
   ComputeBudgetProgram,
@@ -25,11 +21,11 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from "@solana/web3.js";
-import { spawnSync } from "node:child_process";
 import { ata, optionalArg, parseArgs, requireArg, toBaseUnits } from "./devnet-cli";
 import {
   ASSET_DECIMALS,
   ASSET_MINTS,
+  ASSET_PRICING,
   AssetKey,
   DEVNET_RPC_URL,
   assetKeyFromString,
@@ -38,6 +34,7 @@ import {
   loadKeypair,
   log,
   programAs,
+  priceSourceAccountFor,
   PYTH_FEED_IDS,
   tokenProgramFor,
 } from "./devnet-env";
@@ -53,7 +50,7 @@ import {
   KLEND,
   receiptKeyFromString,
 } from "./kamino";
-import { assetConfigPda, integrationPda, marginPda, protocolConfigPda, reservePda, shareMintPda } from "./pda";
+import { assetConfigPda, integrationPda, marginPda, protocolConfigPda } from "./pda";
 
 type Ctx = {
   args: Record<string, string>;
@@ -80,49 +77,7 @@ async function callCheatcode(methodName: string, params: unknown[]): Promise<voi
   if (body.error) throw new Error(`${methodName}: ${body.error.message}`);
 }
 
-function stockKey(symbol: string): "tslax" | "googlx" {
-  const v = symbol.toLowerCase();
-  if (v === "tslax" || v === "tsla") return "tslax";
-  if (v === "googlx" || v === "googl") return "googlx";
-  throw new Error(`unsupported stock "${symbol}" — use TSLAX or GOOGLX`);
-}
-
-/** Runs a `devnet.ts` subcommand in a child process, streaming its output. */
-function runDevnet(...devnetArgs: string[]) {
-  return spawnSync("npx", ["tsx", "src/devnet.ts", ...devnetArgs], {
-    cwd: __dirname + "/..",
-    stdio: "inherit",
-    env: process.env,
-  });
-}
-
-function assetFromSymbolArg(args: Record<string, string>): AssetKey {
-  return assetKeyFromString((args.symbol ?? "TSLAX").toLowerCase());
-}
-
 const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
-  // -- delegates to devnet.ts ---------------------------------------------------------------------
-  "register-asset": async ({ args }) => {
-    const asset = assetFromSymbolArg(args);
-    log("delegating", `devnet.ts register-asset --asset ${asset}`);
-    const r = runDevnet("register-asset", "--asset", asset);
-    if (r.status !== 0) process.exit(r.status ?? 1);
-  },
-
-  "init-reserve": async ({ args }) => {
-    const asset = assetFromSymbolArg(args);
-    const r = runDevnet("initialize-reserve", "--asset", asset);
-    if (r.status !== 0) process.exit(r.status ?? 1);
-  },
-
-  "register-xstocks": async () => {
-    for (const asset of ["tslax", "googlx", "aaplx"] as AssetKey[]) {
-      runDevnet("register-asset", "--asset", asset);
-      runDevnet("initialize-reserve", "--asset", asset);
-    }
-    log("register-xstocks", "TSLAx + GOOGLx + AAPLx registered (or already present)");
-  },
-
   // -- fork funding (Surfpool cheatcodes / airdrop) -----------------------------------------------
   "fund-sol": async ({ args, conn }) => {
     const to = new PublicKey(requireArg(args, "to"));
@@ -132,110 +87,23 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
     log("fund-sol", `${amount} SOL → ${to.toBase58()} tx=${sig}`);
   },
 
-  "fund-usdc": async ({ args }) => {
+  /** Sets `--to`'s token balance of any listed asset (USDC, USDT, JitoSOL, JupSOL, JupUSD, NVDAx,
+   * TSLAx…) with the `surfnet_setTokenAccount` cheatcode. Use `fund-sol` for native SOL. */
+  fund: async ({ args }) => {
+    const asset = assetKeyFromString(requireArg(args, "asset"));
     const to = new PublicKey(requireArg(args, "to"));
-    const amount = Number(optionalArg(args, "amount", "1000"));
-    const raw = amount * 10 ** ASSET_DECIMALS.usdc;
+    const amount = requireArg(args, "amount");
+    const raw = toBaseUnits(amount, ASSET_DECIMALS[asset]);
     await callCheatcode("surfnet_setTokenAccount", [
       to.toBase58(),
-      ASSET_MINTS.usdc.toBase58(),
-      { amount: raw },
-      TOKEN_PROGRAM_ID.toBase58(),
+      ASSET_MINTS[asset].toBase58(),
+      { amount: Number(raw.toString()) },
+      tokenProgramFor(asset).toBase58(),
     ]);
-    log("fund-usdc", `+${amount} USDC → ${to.toBase58()}`);
+    log("fund", `${amount} ${asset} → ${to.toBase58()}`);
   },
 
-  "fund-tslax": async ({ args }) => {
-    const to = new PublicKey(requireArg(args, "to"));
-    const amount = Number(optionalArg(args, "amount", "100"));
-    const raw = amount * 10 ** ASSET_DECIMALS.tslax;
-    await callCheatcode("surfnet_setTokenAccount", [
-      to.toBase58(),
-      ASSET_MINTS.tslax.toBase58(),
-      { amount: raw },
-      TOKEN_2022_PROGRAM_ID.toBase58(),
-    ]);
-    log("fund-tslax", `+${amount} TSLAx → ${to.toBase58()}`);
-  },
-
-  "fund-xstock": async ({ args }) => {
-    const key = stockKey(requireArg(args, "symbol"));
-    const to = new PublicKey(requireArg(args, "to"));
-    const amount = Number(optionalArg(args, "amount", "50"));
-    const raw = amount * 10 ** ASSET_DECIMALS[key];
-    await callCheatcode("surfnet_setTokenAccount", [
-      to.toBase58(),
-      ASSET_MINTS[key].toBase58(),
-      { amount: raw },
-      tokenProgramFor(key).toBase58(),
-    ]);
-    log("fund-xstock", `+${amount} ${key} → ${to.toBase58()}`);
-  },
-
-  // -- lender / margin ----------------------------------------------------------------------------
-  "supply-tslax": async ({ args, wallet, program }) => {
-    const amount = optionalArg(args, "amount", "10");
-    const mint = ASSET_MINTS.tslax;
-    const raw = toBaseUnits(amount, ASSET_DECIMALS.tslax);
-    const [protocolConfig] = protocolConfigPda();
-    const [assetConfig] = assetConfigPda(mint);
-    const [reserve] = reservePda(mint);
-    const [shareMint] = shareMintPda(mint);
-    const lenderAta = getAssociatedTokenAddressSync(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
-    const vault = getAssociatedTokenAddressSync(mint, reserve, true, TOKEN_2022_PROGRAM_ID);
-    const shareAta = getAssociatedTokenAddressSync(shareMint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-    const sig = await method(program, "lender_supply", "lenderSupply")(raw, new anchor.BN(1))
-      .accounts({
-        lender: wallet.publicKey,
-        protocolConfig,
-        assetConfig,
-        reserve,
-        underlyingMint: mint,
-        lenderTokenAccount: lenderAta,
-        liquidityVault: vault,
-        shareMint,
-        lenderShareAccount: shareAta,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
-        shareTokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-    log("supply-tslax", `${amount} TSLAx tx=${sig}`);
-  },
-
-  "supply-xstock": async ({ args, wallet, program }) => {
-    const key = stockKey(requireArg(args, "symbol"));
-    const amount = optionalArg(args, "amount", "20");
-    const mint = ASSET_MINTS[key];
-    const tp = tokenProgramFor(key);
-    const raw = toBaseUnits(amount, ASSET_DECIMALS[key]);
-    const [protocolConfig] = protocolConfigPda();
-    const [assetConfig] = assetConfigPda(mint);
-    const [reserve] = reservePda(mint);
-    const [shareMint] = shareMintPda(mint);
-    const lenderAta = getAssociatedTokenAddressSync(mint, wallet.publicKey, false, tp);
-    const vault = getAssociatedTokenAddressSync(mint, reserve, true, tp);
-    const shareAta = getAssociatedTokenAddressSync(shareMint, wallet.publicKey, false, TOKEN_PROGRAM_ID);
-    const sig = await method(program, "lender_supply", "lenderSupply")(raw, new anchor.BN(1))
-      .accounts({
-        lender: wallet.publicKey,
-        protocolConfig,
-        assetConfig,
-        reserve,
-        underlyingMint: mint,
-        lenderTokenAccount: lenderAta,
-        liquidityVault: vault,
-        shareMint,
-        lenderShareAccount: shareAta,
-        tokenProgram: tp,
-        shareTokenProgram: TOKEN_PROGRAM_ID,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-    log("supply-xstock", `${amount} ${key} tx=${sig}`);
-  },
+  "fund-usdc": async (ctx) => commands.fund({ ...ctx, args: { asset: "usdc", amount: "1000", ...ctx.args } }),
 
   "create-margin": async ({ wallet, program }) => {
     const [protocolConfig] = protocolConfigPda();
@@ -379,6 +247,10 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
 
     const prices = await refreshAllPrices(conn, wallet);
     const health = await buildRemainingAccounts(program, margin, prices, { excludeCollateral: [from, to] });
+    // A JupSOL leg is valued × SOL/USD: pass that feed account after the health accounts.
+    const legSources = [from, to]
+      .filter((asset) => ASSET_PRICING[asset].kind === "redemptionRate")
+      .map((asset) => ({ pubkey: priceSourceAccountFor(asset)!, isWritable: false, isSigner: false }));
     const [protocolConfig] = protocolConfigPda();
     const ix = await method(program, "margin_execute", "marginExecute")(swap.data, swap.accounts.length, minReceived)
       .accounts({
@@ -400,7 +272,7 @@ const commands: Record<string, (ctx: Ctx) => Promise<void>> = {
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([...swap.accounts, ...health])
+      .remainingAccounts([...swap.accounts, ...health, ...legSources])
       .instruction();
 
     // A route plus the health scan exceeds a legacy transaction; Jupiter's lookup tables fit it.

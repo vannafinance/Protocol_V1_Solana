@@ -197,16 +197,29 @@ pub struct DebtRepaid {
     pub timestamp: i64,
 }
 
+/// One collateral balance swept to the liquidator (one per active collateral).
+#[event]
+pub struct CollateralSeized {
+    pub margin_account: Pubkey,
+    pub liquidator: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+    pub destination: Pubkey,
+    pub event_sequence: u64,
+    pub timestamp: i64,
+}
+
+/// A whole-account liquidation: every collateral swept (`CollateralSeized`) and every debt repaid
+/// (`DebtRepaid` with the liquidator as payer). Values are the pre-liquidation snapshot.
 #[event]
 pub struct Liquidated {
     pub margin_account: Pubkey,
     pub liquidator: Pubkey,
-    pub debt_reserve: Pubkey,
-    pub collateral_mint: Pubkey,
-    pub debt_repaid: u64,
-    pub collateral_seized: u64,
-    pub pre_liquidation_health_factor_wad: u128,
-    pub post_liquidation_health_factor_wad: u128,
+    pub collateral_value: u128,
+    pub debt_value: u128,
+    pub health_factor_wad: u128,
+    pub collaterals_seized: u8,
+    pub debts_repaid: u8,
     pub event_sequence: u64,
     pub timestamp: i64,
 }

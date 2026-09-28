@@ -128,18 +128,6 @@ impl Env {
     }
 }
 
-/// The last event of type `E` the program emitted in a transaction.
-pub(crate) fn event<E: anchor_lang::Event + anchor_lang::AnchorDeserialize + anchor_lang::Discriminator>(logs: &[String]) -> E {
-    use anchor_lang::__private::base64::{engine::general_purpose::STANDARD, Engine};
-    logs.iter()
-        .rev()
-        .filter_map(|l| l.strip_prefix("Program data: "))
-        .filter_map(|b64| STANDARD.decode(b64).ok())
-        .find(|bytes| bytes.starts_with(E::DISCRIMINATOR))
-        .map(|bytes| E::try_from_slice(&bytes[E::DISCRIMINATOR.len()..]).unwrap())
-        .expect("event not emitted")
-}
-
 /// USDC base units -> nano-USD at the $1.00 oracle price, as the program values it.
 pub(crate) fn usdc_value(amount: u64, round_up: bool) -> u128 {
     vanna_lending::math::health::normalize_token_value(amount, USDC_PRICE, -8, 6, round_up).unwrap()

@@ -1,28 +1,24 @@
-//! Liquidation of margin accounts at or below the 1.10 health threshold.
+//! Liquidation of margin accounts at or below the 1.10 health threshold, as in the Solidity
+//! AccountManager (`liquidate` → `_liquidate` → `sweepTo`): the liquidator repays every debt in
+//! full and receives every asset the account holds, including external-protocol receipts such as
+//! Kamino cTokens, in one instruction. There is no close factor, bonus or health-improvement
+//! check, so an account can be liquidated at any health factor ≤ 1.10, including below 1: the
+//! liquidator's reward is whatever the assets are worth beyond the debt.
 
 use crate::constants::*;
 use crate::errors::VannaError;
 use crate::events::*;
-use crate::math::fixed_point::{mul_div_floor, u64_from_u128};
-use crate::math::health::{calculate_health, normalize_token_value, CollateralValuation, DebtValuation};
+use crate::math::health::calculate_health;
 use crate::math::shares::debt_shares_to_assets_up;
-use crate::oracle::pyth::load_validated_price;
-use crate::oracle::valuation::{amount_for_value, collateral_value};
-use crate::risk_engine::scan_and_validate_positions;
+use crate::risk_engine::scan_positions;
 use crate::state::asset_config::AssetConfig;
 use crate::state::debt_position::DebtPosition;
 use crate::state::margin_account::MarginAccount;
 use crate::state::reserve::Reserve;
 use crate::validation::accounts::validate_asset_config;
-use crate::validation::token::{transfer_in_measured, transfer_out_checked_measured, verify_associated_token_account};
+use crate::validation::token::gross_up_for_transfer_fee;
 use anchor_lang::prelude::*;
-use anchor_spl::associated_token::AssociatedToken;
-use anchor_spl::token_interface::{Mint, TokenAccount, TokenInterface};
-use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
-
-// ---------------------------------------------------------------------------
-// public_liquidate
-// ---------------------------------------------------------------------------
+use anchor_spl::token_interface::{transfer_checked, TokenAccount, TransferChecked};
 
 #[derive(Accounts)]
 pub struct PublicLiquidate<'info> {
@@ -34,258 +30,159 @@ pub struct PublicLiquidate<'info> {
         bump = margin_account.bump
     )]
     pub margin_account: Box<Account<'info, MarginAccount>>,
-
-    #[account(seeds = [ASSET_SEED, debt_mint.key().as_ref()], bump = debt_asset_config.bump)]
-    pub debt_asset_config: Box<Account<'info, AssetConfig>>,
-    #[account(mut, seeds = [RESERVE_SEED, debt_mint.key().as_ref()], bump = debt_reserve.bump)]
-    pub debt_reserve: Box<Account<'info, Reserve>>,
-    #[account(
-        mut,
-        seeds = [DEBT_SEED, margin_account.key().as_ref(), debt_reserve.key().as_ref()],
-        bump = debt_position.bump
-    )]
-    pub debt_position: Box<Account<'info, DebtPosition>>,
-    pub debt_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub debt_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(
-        mut,
-        token::mint = debt_mint,
-        token::authority = liquidator,
-        token::token_program = token_program
-    )]
-    pub liquidator_debt_source: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(
-        mut,
-        token::mint = debt_mint,
-        token::authority = debt_reserve,
-        token::token_program = token_program
-    )]
-    pub debt_reserve_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    #[account(seeds = [ASSET_SEED, collateral_mint.key().as_ref()], bump = collateral_asset_config.bump)]
-    pub collateral_asset_config: Box<Account<'info, AssetConfig>>,
-    pub collateral_price_update: Box<Account<'info, PriceUpdateV2>>,
-    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
-    #[account(
-        init_if_needed,
-        payer = liquidator,
-        associated_token::mint = collateral_mint,
-        associated_token::authority = liquidator,
-        associated_token::token_program = token_program,
-    )]
-    pub liquidator_collateral_destination: Box<InterfaceAccount<'info, TokenAccount>>,
-    #[account(
-        mut,
-        token::mint = collateral_mint,
-        token::authority = margin_account,
-        token::token_program = token_program
-    )]
-    pub collateral_margin_vault: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the collateral asset's registered price-source account (e.g. its Kamino reserve);
-    /// checked by key in the valuation. Omitted for Pyth-priced collateral.
-    pub collateral_price_source: Option<UncheckedAccount<'info>>,
-
-    /// Debt and collateral legs must share a token program (classic SPL or Token-2022).
-    pub token_program: Interface<'info, TokenInterface>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub system_program: Program<'info, System>,
 }
 
-pub fn public_liquidate(ctx: Context<PublicLiquidate>, max_repay_assets: u64, min_collateral_out: u64) -> Result<()> {
-    require!(ctx.accounts.collateral_asset_config.collateral_enabled, VannaError::AssetNotCollateralEnabled);
-    require!(max_repay_assets > 0, VannaError::ZeroAmount);
-    validate_asset_config(
-        &ctx.accounts.debt_asset_config,
-        &ctx.accounts.debt_mint.key(),
-        &ctx.accounts.token_program.key(),
-    )?;
-    validate_asset_config(
-        &ctx.accounts.collateral_asset_config,
-        &ctx.accounts.collateral_mint.key(),
-        &ctx.accounts.token_program.key(),
-    )?;
-    verify_associated_token_account(
-        &ctx.accounts.collateral_margin_vault.key(),
-        &ctx.accounts.margin_account.key(),
-        &ctx.accounts.collateral_mint.key(),
-        &ctx.accounts.token_program.key(),
-    )?;
-
+/// `remaining_accounts`, in this order:
+/// 1. The health accounts of every active position (the `risk_engine` layout, nothing skipped),
+///    with each margin vault, reserve and debt position writable.
+/// 2. Per active collateral, in the same order: `[mint, destination (w), token_program]`. The
+///    destination is any token account of that mint, usually the liquidator's ATA.
+/// 3. Per active debt, in the same order: `[mint, reserve liquidity vault (w), source (w),
+///    token_program]`. The source is a token account the liquidator owns.
+///
+/// Collateral is swept before debts are repaid, so the liquidator can repay a debt with the same
+/// token swept from the account (e.g. USDC) and only needs to bring the difference.
+pub fn public_liquidate<'info>(ctx: Context<'info, PublicLiquidate<'info>>) -> Result<()> {
     let clock = Clock::get()?;
-    ctx.accounts.debt_reserve.accrue_interest(clock.unix_timestamp)?;
-
     let margin_key = ctx.accounts.margin_account.key();
-    let (other_collateral_valuations, other_debt_valuations) = scan_and_validate_positions(
+
+    // Solidity: `if (riskEngine.isAccountHealthy(account)) revert AccountNotLiquidatable()`.
+    let (collaterals, debts, health_len) = scan_positions(
         &margin_key,
         &ctx.accounts.margin_account,
         ctx.remaining_accounts,
         ctx.program_id,
         &clock,
-        &[ctx.accounts.collateral_asset_config.asset_index],
-        Some(ctx.accounts.debt_asset_config.asset_index),
+        &[],
+        None,
     )?;
+    let health = calculate_health(&collaterals, &debts)?;
+    require!(health.is_liquidatable(), VannaError::PositionHealthy);
 
-    let debt_price = load_validated_price(&ctx.accounts.debt_asset_config, &ctx.accounts.debt_price_update, &clock)?;
-    let collateral_source = ctx.accounts.collateral_price_source.as_ref().map(|a| a.to_account_info());
+    let (groups, settlement) = ctx.remaining_accounts.split_at(health_len);
+    let mut settlement = settlement.iter();
+    let mut next_settlement = || settlement.next().ok_or(VannaError::IncompletePositionAccounts);
+    let mut group = 0usize;
 
-    let current_debt_assets = debt_shares_to_assets_up(
-        ctx.accounts.debt_position.borrow_shares,
-        ctx.accounts.debt_reserve.total_borrow_shares,
-        ctx.accounts.debt_reserve.total_borrow_assets,
-    )?;
-    require!(current_debt_assets > 0, VannaError::PositionHealthy);
-    let current_debt_value = normalize_token_value(
-        current_debt_assets,
-        debt_price.price,
-        debt_price.exponent,
-        ctx.accounts.debt_asset_config.decimals,
-        true,
-    )?;
-    let collateral_vault_balance_before = ctx.accounts.collateral_margin_vault.amount;
-    let current_collateral_value = collateral_value(
-        &ctx.accounts.collateral_asset_config,
-        collateral_vault_balance_before,
-        &ctx.accounts.collateral_price_update,
-        collateral_source.as_ref(),
-        &clock,
-    )?;
+    let liquidator = ctx.accounts.liquidator.to_account_info();
+    let margin_info = ctx.accounts.margin_account.to_account_info();
+    let margin = &mut ctx.accounts.margin_account;
+    let authority_key = margin.authority;
+    let margin_bump = [margin.bump];
+    let margin_seeds: &[&[&[u8]]] = &[&[MARGIN_SEED, authority_key.as_ref(), &margin_bump]];
 
-    let mut pre_debts = other_debt_valuations.clone();
-    pre_debts.push(DebtValuation { debt_value: current_debt_value });
-    let mut pre_collaterals = other_collateral_valuations.clone();
-    pre_collaterals.push(CollateralValuation {
-        collateral_value: current_collateral_value,
-    });
-    let health_before = calculate_health(&pre_collaterals, &pre_debts)?;
-    require!(health_before.is_liquidatable(), VannaError::PositionHealthy);
+    // sweepTo(liquidator): every collateral vault is emptied into the liquidator's accounts.
+    let collateral_indexes: Vec<u16> = margin.active_collateral_indexes().collect();
+    let collaterals_seized = collateral_indexes.len() as u8;
+    for index in collateral_indexes {
+        let asset = Account::<AssetConfig>::try_from(&groups[group])?;
+        let vault = &groups[group + 1];
+        group += if asset.is_pyth_priced() { 3 } else { 4 };
+        let (mint, destination, token_program) = (next_settlement()?, next_settlement()?, next_settlement()?);
+        validate_asset_config(&asset, &mint.key(), &token_program.key())?;
 
-    let close_factor_cap = u64_from_u128(mul_div_floor(current_debt_assets as u128, CLOSE_FACTOR_BPS as u128, 10_000)?)?;
-    let repay_amount = max_repay_assets.min(current_debt_assets).min(close_factor_cap.max(1));
-    require!(repay_amount > 0, VannaError::ZeroAmount);
-
-    let repay_value = normalize_token_value(
-        repay_amount,
-        debt_price.price,
-        debt_price.exponent,
-        ctx.accounts.debt_asset_config.decimals,
-        true,
-    )?;
-    let bonus_numerator = 10_000u128
-        .checked_add(ctx.accounts.collateral_asset_config.liquidation_bonus_bps as u128)
-        .ok_or(VannaError::MathOverflow)?;
-    let seize_value = mul_div_floor(repay_value, bonus_numerator, 10_000)?;
-    let mut seize_amount = amount_for_value(
-        &ctx.accounts.collateral_asset_config,
-        seize_value,
-        &ctx.accounts.collateral_price_update,
-        collateral_source.as_ref(),
-        &clock,
-    )?;
-    seize_amount = seize_amount.min(collateral_vault_balance_before);
-    require!(seize_amount >= min_collateral_out, VannaError::SlippageExceeded);
-
-    // Pull the repay tokens before mutating any state; burn shares against what was actually
-    // received (fee-bearing mints deliver less than `repay_amount`).
-    let received_repay = transfer_in_measured(
-        &ctx.accounts.token_program,
-        &ctx.accounts.debt_mint,
-        &ctx.accounts.liquidator_debt_source,
-        &mut ctx.accounts.debt_reserve_vault,
-        &ctx.accounts.liquidator,
-        repay_amount,
-    )?;
-
-    let debt_shares_burned = if received_repay >= current_debt_assets {
-        ctx.accounts.debt_position.borrow_shares
-    } else {
-        mul_div_floor(
-            received_repay as u128,
-            ctx.accounts.debt_reserve.total_borrow_shares,
-            ctx.accounts.debt_reserve.total_borrow_assets as u128,
-        )?
-        .min(ctx.accounts.debt_position.borrow_shares)
-    };
-
-    ctx.accounts.debt_reserve.accounted_liquidity_assets = ctx
-        .accounts
-        .debt_reserve
-        .accounted_liquidity_assets
-        .checked_add(received_repay)
-        .ok_or(VannaError::MathOverflow)?;
-    ctx.accounts.debt_reserve.total_borrow_assets =
-        ctx.accounts.debt_reserve.total_borrow_assets.saturating_sub(received_repay);
-    ctx.accounts.debt_reserve.total_borrow_shares =
-        ctx.accounts.debt_reserve.total_borrow_shares.saturating_sub(debt_shares_burned);
-    ctx.accounts.debt_position.debit_shares(debt_shares_burned)?;
-    if ctx.accounts.debt_position.borrow_shares == 0 {
-        ctx.accounts
-            .margin_account
-            .remove_active_debt(ctx.accounts.debt_asset_config.asset_index)?;
+        let amount = InterfaceAccount::<TokenAccount>::try_from(vault)?.amount;
+        if amount > 0 {
+            transfer(token_program, vault, mint, destination, &margin_info, margin_seeds, amount, asset.decimals)?;
+        }
+        margin.remove_active_collateral(index)?;
+        emit!(CollateralSeized {
+            margin_account: margin_key,
+            liquidator: liquidator.key(),
+            mint: asset.mint,
+            amount,
+            destination: destination.key(),
+            event_sequence: margin.next_event_sequence()?,
+            timestamp: clock.unix_timestamp,
+        });
     }
 
-    let authority_key = ctx.accounts.margin_account.authority;
-    let margin_bump = ctx.accounts.margin_account.bump;
-    let margin_signer_seeds: &[&[&[u8]]] = &[&[MARGIN_SEED, authority_key.as_ref(), &[margin_bump]]];
-    let margin_account_info = ctx.accounts.margin_account.to_account_info();
-    let seized = transfer_out_checked_measured(
-        &ctx.accounts.token_program,
-        &ctx.accounts.collateral_mint,
-        &ctx.accounts.collateral_margin_vault,
-        &mut ctx.accounts.liquidator_collateral_destination,
-        &margin_account_info,
-        margin_signer_seeds,
-        seize_amount,
-    )?;
-    let post_collateral_vault_balance = collateral_vault_balance_before
-        .checked_sub(seized)
-        .ok_or(VannaError::MathUnderflow)?;
-    if post_collateral_vault_balance == 0 {
-        ctx.accounts
-            .margin_account
-            .remove_active_collateral(ctx.accounts.collateral_asset_config.asset_index)?;
+    // For each borrow: updateState, repay the full borrow balance, collectFrom, removeBorrow.
+    let debt_indexes: Vec<u16> = margin.active_debt_indexes().collect();
+    let debts_repaid = debt_indexes.len() as u8;
+    for index in debt_indexes {
+        let asset = Account::<AssetConfig>::try_from(&groups[group])?;
+        let mut reserve = Account::<Reserve>::try_from(&groups[group + 1])?;
+        let mut position = Account::<DebtPosition>::try_from(&groups[group + 2])?;
+        group += 4;
+        let (mint, reserve_vault, source, token_program) =
+            (next_settlement()?, next_settlement()?, next_settlement()?, next_settlement()?);
+        validate_asset_config(&asset, &mint.key(), &token_program.key())?;
+        require_keys_eq!(reserve_vault.key(), reserve.liquidity_vault, VannaError::InvalidVaultAuthority);
+
+        reserve.accrue_interest(clock.unix_timestamp)?;
+        let debt = debt_shares_to_assets_up(position.borrow_shares, reserve.total_borrow_shares, reserve.total_borrow_assets)?;
+        let gross = gross_up_for_transfer_fee(mint, &token_program.key(), debt)?;
+        let vault_before = InterfaceAccount::<TokenAccount>::try_from(reserve_vault)?.amount;
+        transfer(token_program, source, mint, reserve_vault, &liquidator, &[], gross, asset.decimals)?;
+        let received = InterfaceAccount::<TokenAccount>::try_from(reserve_vault)?
+            .amount
+            .checked_sub(vault_before)
+            .ok_or(VannaError::MathUnderflow)?;
+        require!(received >= debt, VannaError::OutstandingDebt);
+
+        let shares = position.borrow_shares;
+        reserve.accounted_liquidity_assets = reserve
+            .accounted_liquidity_assets
+            .checked_add(received)
+            .ok_or(VannaError::MathOverflow)?;
+        reserve.total_borrow_assets = reserve.total_borrow_assets.saturating_sub(debt);
+        reserve.total_borrow_shares = reserve
+            .total_borrow_shares
+            .checked_sub(shares)
+            .ok_or(VannaError::MathUnderflow)?;
+        position.debit_shares(shares)?;
+        reserve.exit(ctx.program_id)?;
+        position.exit(ctx.program_id)?;
+        margin.remove_active_debt(index)?;
+
+        emit!(DebtRepaid {
+            margin_account: margin_key,
+            reserve: reserve.key(),
+            payer: liquidator.key(),
+            assets: received,
+            debt_shares_burned: shares,
+            remaining_debt_shares: 0,
+            event_sequence: margin.next_event_sequence()?,
+            timestamp: clock.unix_timestamp,
+        });
     }
+    require!(next_settlement().is_err(), VannaError::IncompletePositionAccounts);
 
-    let post_debt_assets = debt_shares_to_assets_up(
-        ctx.accounts.debt_position.borrow_shares,
-        ctx.accounts.debt_reserve.total_borrow_shares,
-        ctx.accounts.debt_reserve.total_borrow_assets,
-    )?;
-    let post_debt_value = if post_debt_assets == 0 {
-        0
-    } else {
-        normalize_token_value(post_debt_assets, debt_price.price, debt_price.exponent, ctx.accounts.debt_asset_config.decimals, true)?
-    };
-    let post_collateral_value = collateral_value(
-        &ctx.accounts.collateral_asset_config,
-        post_collateral_vault_balance,
-        &ctx.accounts.collateral_price_update,
-        collateral_source.as_ref(),
-        &clock,
-    )?;
-    let mut post_debts = other_debt_valuations;
-    post_debts.push(DebtValuation { debt_value: post_debt_value });
-    let mut post_collaterals = other_collateral_valuations;
-    post_collaterals.push(CollateralValuation {
-        collateral_value: post_collateral_value,
-    });
-    let health_after = calculate_health(&post_collaterals, &post_debts)?;
-    require!(
-        health_after.total_debt_value == 0 || health_after.liquidation_health_factor_wad > health_before.liquidation_health_factor_wad,
-        VannaError::HealthFactorTooLow
-    );
-
-    let event_sequence = ctx.accounts.margin_account.next_event_sequence()?;
     emit!(Liquidated {
-        margin_account: ctx.accounts.margin_account.key(),
-        liquidator: ctx.accounts.liquidator.key(),
-        debt_reserve: ctx.accounts.debt_reserve.key(),
-        collateral_mint: ctx.accounts.collateral_mint.key(),
-        debt_repaid: received_repay,
-        collateral_seized: seized,
-        pre_liquidation_health_factor_wad: health_before.liquidation_health_factor_wad,
-        post_liquidation_health_factor_wad: health_after.liquidation_health_factor_wad,
-        event_sequence,
+        margin_account: margin_key,
+        liquidator: liquidator.key(),
+        collateral_value: health.liquidation_collateral_value,
+        debt_value: health.total_debt_value,
+        health_factor_wad: health.liquidation_health_factor_wad,
+        collaterals_seized,
+        debts_repaid,
+        event_sequence: margin.next_event_sequence()?,
         timestamp: clock.unix_timestamp,
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer<'info>(
+    token_program: &AccountInfo<'info>,
+    from: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+    decimals: u8,
+) -> Result<()> {
+    let accounts = TransferChecked {
+        from: from.clone(),
+        mint: mint.clone(),
+        to: to.clone(),
+        authority: authority.clone(),
+    };
+    transfer_checked(
+        CpiContext::new_with_signer(token_program.key(), accounts, signer_seeds),
+        amount,
+        decimals,
+    )
 }
