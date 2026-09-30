@@ -2,11 +2,6 @@ import * as anchor from "@coral-xyz/anchor";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Connection, PublicKey } from "@solana/web3.js";
 
-/**
- * Minimal `--flag value` / `--flag` (boolean) parser — no external CLI framework needed.
- * Pass the flag portion of argv explicitly (e.g. everything after the subcommand name); defaults
- * to `process.argv.slice(2)` for callers with no subcommand of their own.
- */
 export function parseArgs(argv: string[] = process.argv.slice(2)): Record<string, string> {
   const out: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
@@ -36,11 +31,6 @@ export function optionalArg(args: Record<string, string>, key: string, fallback:
   return args[key] ?? fallback;
 }
 
-/**
- * Converts a human-readable decimal amount (e.g. "12.5") to raw base units for a mint with
- * `decimals` decimal places, as an exact integer string operation — no floating point, so large or
- * precise amounts round-trip exactly.
- */
 export function toBaseUnits(humanAmount: string, decimals: number): anchor.BN {
   const negative = humanAmount.startsWith("-");
   const unsigned = negative ? humanAmount.slice(1) : humanAmount;
@@ -66,4 +56,3 @@ export async function tokenBalance(connection: Connection, tokenAccount: PublicK
   const info = await connection.getTokenAccountBalance(tokenAccount, "confirmed");
   return BigInt(info.value.amount);
 }
-

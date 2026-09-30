@@ -7,13 +7,15 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-vanna_lending = "BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg"
+vanna_credit_layer = "BZ812nUv4Qhr2p1JVgmoJGjYTGk1brAXckyhFSCNH3Zg"
+vanna_oracle = "FXY5DRfekMUTbUp4uyCFpCZmCccrp6kPq3hTM4GRihnc"
+vanna_validator = "6fND3vhtstp486iE6rsSNVUox3kcjNNRsSLAN7ZPs7th"
 
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "cargo test --manifest-path programs/vanna_lending/Cargo.toml"
+test = "cargo test --manifest-path programs/vanna_credit_layer/Cargo.toml"
 
 [hooks]

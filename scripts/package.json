@@ -1,13 +1,14 @@
 {
-  "name": "vanna-lending-scripts",
+  "name": "vanna-credit-layer-scripts",
   "version": "0.2.0",
   "private": true,
   "type": "commonjs",
-  "description": "One CLI script covering every vanna_lending instruction, run against a real Devnet deployment.",
+  "description": "CLI scripts covering every Vanna credit layer instruction, run against a local mainnet fork.",
   "scripts": {
     "postinstall": "patch-package",
     "devnet": "tsx src/devnet.ts",
-    "integrations-fork": "tsx src/integrations-fork.ts"
+    "integrations-fork": "tsx src/integrations-fork.ts",
+    "deploy-fork": "tsx src/deploy-fork.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

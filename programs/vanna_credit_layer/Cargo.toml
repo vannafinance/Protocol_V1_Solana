@@ -1,0 +1,93 @@
+[package]
+name = "vanna_credit_layer"
+version = "0.1.0"
+description = "Vanna credit layer: lending pools, cross-margin accounts, liquidation and margin_execute"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "vanna_credit_layer"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = { version = "1.1.2", features = ["init-if-needed"] }
+anchor-spl = { version = "1.1.2", features = ["token_2022"] }
+
+[dev-dependencies]
+bytemuck = "1"
+pyth-solana-receiver-sdk = "2.0.0"
+vanna_oracle = { path = "../vanna_oracle", features = ["no-entrypoint"] }
+vanna_validator = { path = "../vanna_validator", features = ["no-entrypoint"] }
+litesvm = "0.10.0"
+solana-message = "3.0.1"
+solana-transaction = "3.0.2"
+solana-signer = "3.0.0"
+solana-keypair = "3.0.1"
+solana-account = "3.4.0"
+solana-system-interface = "3.3.0"
+solana-program-pack = "3.1.0"
+spl-token-interface = "2.0.0"
+flate2 = "1"
+serde_json = "1"
+solana-last-restart-slot = { version = "3.2.0", features = ["sysvar"] }
+
+[[test]]
+name = "test_admin_and_lifecycle"
+path = "src/tests/test_admin_and_lifecycle.rs"
+
+[[test]]
+name = "test_full_flow"
+path = "src/tests/test_full_flow.rs"
+
+[[test]]
+name = "test_liquidation"
+path = "src/tests/test_liquidation.rs"
+
+[[test]]
+name = "test_security"
+path = "src/tests/test_security.rs"
+
+[[test]]
+name = "test_interest_rate"
+path = "src/tests/test_interest_rate.rs"
+
+[[test]]
+name = "test_math"
+path = "src/tests/test_math.rs"
+
+[[test]]
+name = "test_state"
+path = "src/tests/test_state.rs"
+
+[[test]]
+name = "test_oracle"
+path = "src/tests/test_oracle.rs"
+
+[[test]]
+name = "test_oracle_live"
+path = "src/tests/test_oracle_live.rs"
+
+[[test]]
+name = "kamino"
+path = "src/tests/external/kamino/main.rs"
+
+[[test]]
+name = "jupiter"
+path = "src/tests/external/jupiter/main.rs"
+
+[[test]]
+name = "gmtrade"
+path = "src/tests/external/gmtrade/main.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

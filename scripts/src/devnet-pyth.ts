@@ -7,26 +7,21 @@ import { PYTH_FEED_IDS, PYTH_RECEIVER_PROGRAM_ID, PYTH_SHARD_ID, PythFeedKey, py
 
 const HERMES_URL = process.env.HERMES_URL ?? "https://hermes.pyth.network";
 
-/** Hermes requires an API key (since the 2026-08-26 Pyth Core upgrade), sent as a bearer token. */
 function hermesClient(): HermesClient {
   const key = process.env.PYTH_API_KEY;
   return new HermesClient(HERMES_URL, key ? { headers: { Authorization: `Bearer ${key}` } } : undefined);
 }
 
-/** Fallback values written on the local Surfpool fork only when Hermes is unreachable (e.g. no
- * PYTH_API_KEY). They are what each feed publishes: USD per token, except `jupsolRate`, the
- * JUPSOL/SOL redemption rate. Never used against a real cluster. */
 const REFERENCE_PRICE: Record<PythFeedKey, number> = {
   usdc: 1,
   usdt: 1,
   wsol: 118,
   jupsolRate: 1.21,
   jupusd: 1,
+  eth: 2700,
+  btc: 100000,
 };
 
-
-/** `PriceUpdateV2` layout with a fully verified (1-byte) `verification_level`, as the push
- * oracle writes it. */
 const PRICE_UPDATE_V2_DISCRIMINATOR = Buffer.from([0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
 const PRICE_FEED_ID_OFFSET = 41;
 export const PRICE_OFFSET = 73;
@@ -45,8 +40,6 @@ function hexToBytes(hex: string): Buffer {
 
 const priceFeedAccountAddress = pythFeedAccount;
 
-/** Builds a fresh PriceUpdateV2 account buffer from a template (any existing PriceUpdateV2 —
- * layout is identical across feeds), rewriting the feed ID/price/timestamps. */
 function buildForkPriceAccountData(template: Buffer, feedId: string, usdPrice: number): Buffer {
   const data = Buffer.from(template);
   if (data.length < MIN_PRICE_ACCOUNT_SIZE) {
@@ -79,15 +72,10 @@ export async function callForkCheatcode(rpcUrl: string, method: string, params: 
   if (body.error) throw new Error(`${method} failed: ${body.error.message}`);
 }
 
-/** Fabricates (or refreshes) `feed`'s PriceUpdateV2 account directly on the Surfpool fork via
- * the `surfnet_setAccount` cheatcode — no Hermes call, no wallet signature. Used as the fallback
- * whenever real Hermes is unreachable (401 without an API key). */
 async function fabricatePrice(connection: Connection, feed: PythFeedKey): Promise<PublicKey> {
   const feedId = PYTH_FEED_IDS[feed];
   const address = priceFeedAccountAddress(feedId);
 
-  // Any existing PriceUpdateV2 account (this asset's own, if already fabricated once, else any
-  // other feed's) works as the byte-layout template — the layout is identical for every feed.
   let template = await connection.getAccountInfo(address);
   if (!template?.owner.equals(PYTH_RECEIVER_PROGRAM_ID)) {
     const solAddress = priceFeedAccountAddress(PYTH_FEED_IDS.wsol);
@@ -101,7 +89,8 @@ async function fabricatePrice(connection: Connection, feed: PythFeedKey): Promis
     );
   }
 
-  const price = REFERENCE_PRICE[feed];
+  const override = process.env[`FORK_PRICE_${feed.toUpperCase()}`];
+  const price = override ? Number(override) : REFERENCE_PRICE[feed];
   const data = buildForkPriceAccountData(template.data, feedId, price);
   await callForkCheatcode(connection.rpcEndpoint, "surfnet_setAccount", [
     address.toBase58(),
@@ -116,14 +105,6 @@ async function fabricatePrice(connection: Connection, feed: PythFeedKey): Promis
   return address;
 }
 
-/**
- * Posts a fresh Pyth price update for `feed` to its shard-0 price-feed account (the account assets
- * pin) and returns that account's address.
- *
- * Tries a real, signed Hermes update first (what a production integration does); falls back to
- * fabricating the PriceUpdateV2 directly on the local Surfpool fork via `surfnet_setAccount` when
- * Hermes is unreachable (e.g. no PYTH_API_KEY).
- */
 export async function refreshPrice(
   connection: Connection,
   wallet: anchor.Wallet,

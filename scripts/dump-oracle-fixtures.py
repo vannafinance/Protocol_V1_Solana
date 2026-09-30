@@ -1,19 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerates the oracle fixtures the price tests load into LiteSVM
-(programs/vanna_lending/src/tests/fixtures/oracles/), all read at one slot:
 
-- Kamino's Scope `OraclePrices` account (Chainlink + Pyth Lazer prices for every asset);
-- the Pyth push oracle's shard-0 price-feed accounts for USDC, USDT, SOL, JitoSOL,
-  JupSOL/SOL (redemption rate) and JupUSD;
-- the eight mints (NVDAx and TSLAx are Token-2022).
-
-Accounts are stored as `owner (32) | lamports (u64 LE) | executable (u8) | data`, like the
-mainnet fixtures, and `snapshot.rs` records the slot's block time, which the tests pin the clock
-to. Kept apart from `fixtures/mainnet/` so refreshing prices never touches the klend / Jupiter
-state those tests depend on.
-
-    python3 scripts/dump-oracle-fixtures.py [--rpc https://api.mainnet-beta.solana.com]
-"""
 import argparse
 import base64
 import json
@@ -23,27 +9,24 @@ import time
 import urllib.request
 
 ACCOUNTS = [
-    "3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH",  # Kamino Scope OraclePrices
-    # Pyth push oracle, shard 0
-    "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX",  # USDC/USD
-    "HT2PLQBcG5EiCcNSaMHAjSgd9F98ecpATbk4Sk5oYuM",  # USDT/USD
-    "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",  # SOL/USD
-    "AxaxyeDT8JnWERSaTKvFXvPKkEdxnamKSqpWbsSjYg1g",  # JITOSOL/USD
-    "D7UqeBmCEmhGXGYfi2y9RfoCa7t1Xw5iZLBeYZ3sxFSe",  # JUPSOL/SOL.RR
-    "AqSwMCZYnEdnGoFCSLtWVnWf4xyCJuePcztmYWq8SBwp",  # JUPUSD/USD
-    # Mints
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "So11111111111111111111111111111111111111112",  # WSOL
-    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # JitoSOL
-    "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v",  # JupSOL
-    "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD",  # JupUSD
-    "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",  # NVDAx (Token-2022)
-    "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB",  # TSLAx (Token-2022)
+    "3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH",
+    "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX",
+    "HT2PLQBcG5EiCcNSaMHAjSgd9F98ecpATbk4Sk5oYuM",
+    "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+    "AxaxyeDT8JnWERSaTKvFXvPKkEdxnamKSqpWbsSjYg1g",
+    "D7UqeBmCEmhGXGYfi2y9RfoCa7t1Xw5iZLBeYZ3sxFSe",
+    "AqSwMCZYnEdnGoFCSLtWVnWf4xyCJuePcztmYWq8SBwp",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "So11111111111111111111111111111111111111112",
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+    "jupSoLaHXQiZZTSfEWMTRRgpnyFm8f6sZdosWBjx93v",
+    "JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD",
+    "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
+    "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB",
 ]
-OUT = os.path.join(os.path.dirname(__file__), "..", "programs", "vanna_lending", "src", "tests", "fixtures", "oracles")
+OUT = os.path.join(os.path.dirname(__file__), "..", "programs", "vanna_credit_layer", "src", "tests", "fixtures", "oracles")
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
 
 def b58decode(s: str) -> bytes:
     n = 0
@@ -52,12 +35,10 @@ def b58decode(s: str) -> bytes:
     raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return b"\0" * (len(s) - len(s.lstrip("1"))) + raw
 
-
 def rpc_call(rpc: str, method: str, params: list) -> dict:
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
     request = urllib.request.Request(rpc, body.encode(), {"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(request))["result"]
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -80,7 +61,6 @@ def main() -> None:
         f.write(f"pub const ORACLE_SNAPSHOT_SLOT: u64 = {slot};\n")
         f.write(f"pub const ORACLE_SNAPSHOT_UNIX_TIMESTAMP: i64 = {block_time or int(time.time())};\n")
     print(f"{len(ACCOUNTS)} accounts at slot {slot} (block time {block_time})")
-
 
 if __name__ == "__main__":
     main()

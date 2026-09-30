@@ -1,7 +1,3 @@
-/**
- * Kamino klend client helpers for the `KaminoLend` adapter (`programs/.../adapters/kamino.rs`):
- * reserve addresses, the two allowed instructions, and cToken valuation for display.
- */
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { AccountMeta, Connection, PublicKey } from "@solana/web3.js";
 import { ata } from "./devnet-cli";
@@ -13,10 +9,8 @@ export const INSTRUCTIONS_SYSVAR = new PublicKey("Sysvar1nstructions111111111111
 const MAIN_MARKET = new PublicKey("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF");
 const MAIN_MARKET_AUTHORITY = new PublicKey("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo");
 
-/** Every klend cToken mint has 6 decimals, whatever its underlying's. */
 export const CTOKEN_DECIMALS = 6;
 
-/** A Kamino cToken, registered in Vanna as a collateral-only asset priced by its underlying. */
 export type ReceiptKey = "kusdc" | "kwsol";
 
 export interface KaminoReceipt {
@@ -47,7 +41,6 @@ export const KAMINO_RECEIPTS: Record<ReceiptKey, KaminoReceipt> = {
   },
 };
 
-/** Accepts the receipt key or its underlying's symbol (`USDC` → `kusdc`, `SOL` → `kwsol`). */
 export function receiptKeyFromString(value: string): ReceiptKey {
   const v = value.toLowerCase().replace(/^k/, "");
   if (v === "usdc") return "kusdc";
@@ -55,9 +48,7 @@ export function receiptKeyFromString(value: string): ReceiptKey {
   throw new Error(`unknown Kamino receipt "${value}" — expected USDC|SOL`);
 }
 
-/** sha256("global:deposit_reserve_liquidity")[0..8] */
 const DEPOSIT_RESERVE_LIQUIDITY = Buffer.from([169, 201, 30, 126, 6, 205, 102, 68]);
-/** sha256("global:redeem_reserve_collateral")[0..8] */
 const REDEEM_RESERVE_COLLATERAL = Buffer.from([234, 117, 181, 125, 185, 142, 220, 29]);
 
 export type KaminoCall = "deposit" | "redeem";
@@ -69,7 +60,6 @@ export function kaminoCallData(call: KaminoCall, amount: bigint): Buffer {
   return data;
 }
 
-/** The 12 klend accounts for `call`, in klend's order, with the margin PDA as owner. */
 export function kaminoCallAccounts(call: KaminoCall, receipt: KaminoReceipt, margin: PublicKey): AccountMeta[] {
   const underlyingMint = ASSET_MINTS[receipt.underlying];
   const liquidityProgram = tokenProgramFor(receipt.underlying);
@@ -105,10 +95,6 @@ export function kaminoCallAccounts(call: KaminoCall, receipt: KaminoReceipt, mar
       ];
 }
 
-/**
- * Underlying amount `receipts` cTokens redeem for, from the klend `Reserve` (same offsets and
- * rounding as `adapters/kamino.rs::read_reserve_rate`).
- */
 export async function receiptUnderlying(conn: Connection, receipt: KaminoReceipt, receipts: bigint): Promise<bigint> {
   if (receipts === 0n) return 0n;
   const info = await conn.getAccountInfo(receipt.reserve);

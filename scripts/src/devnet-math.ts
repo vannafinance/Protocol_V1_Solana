@@ -1,15 +1,8 @@
-/**
- * BigInt replicas of the on-chain math in `programs/vanna_lending/src/math/*.rs`, for display only
- * (live health factor, current debt, APRs). The program re-validates everything it executes, so if
- * this ever disagrees with it, the program is right.
- */
-
 export const WAD = 10n ** 18n;
 export const BALANCE_TO_BORROW_THRESHOLD_WAD = 1_100_000_000_000_000_000n;
 export const USD_VALUE_DECIMALS = 9;
 export const BASIS_POINTS = 10_000n;
 export const SECONDS_PER_YEAR = 31_556_952n;
-/** Anchor decodes Rust's `u128::MAX` health-factor sentinel ("infinite health") as this value. */
 export const U128_MAX = (1n << 128n) - 1n;
 
 export function mulDivFloor(a: bigint, b: bigint, c: bigint): bigint {
@@ -24,10 +17,6 @@ function pow10(n: number): bigint {
   return 10n ** BigInt(n);
 }
 
-/**
- * `math/health.rs::normalize_token_value`
- * value = token_amount * price * 10^(price_exponent - token_decimals + USD_VALUE_DECIMALS)
- */
 export function normalizeTokenValue(
   tokenAmount: bigint,
   price: bigint,
@@ -44,24 +33,18 @@ export function normalizeTokenValue(
   return roundUp ? mulDivCeil(base, 1n, factor) : mulDivFloor(base, 1n, factor);
 }
 
-/** `state/reserve.rs::RateCurve` — WAD-scaled borrow-rate curve coefficients. */
 export interface RateCurve {
   linearCoeffWad: bigint;
   jumpCoeffWad: bigint;
   rateMultiplierWad: bigint;
 }
 
-/**
- * `math/interest.rs::utilization_wad`
- * utilization = total_borrows / (liquidity + total_borrows)
- */
 export function utilizationWad(accountedLiquidityAssets: bigint, totalBorrowAssets: bigint): bigint {
   const gross = accountedLiquidityAssets + totalBorrowAssets;
   if (gross === 0n) return 0n;
   return mulDivFloor(totalBorrowAssets, WAD, gross);
 }
 
-/** `math/interest.rs::wad_pow` — square-and-multiply, each step rounded half-up. */
 function wadPow(base: bigint, exp: number): bigint {
   if (base === 0n) return exp === 0 ? WAD : 0n;
   const half = WAD / 2n;
@@ -73,10 +56,6 @@ function wadPow(base: bigint, exp: number): bigint {
   return result;
 }
 
-/**
- * `math/interest.rs::borrow_rate_per_second_wad`
- * borrow_rate = rate_multiplier * (u * linear_coeff + u^32 * linear_coeff + u^64 * jump_coeff) / SECONDS_PER_YEAR
- */
 export function borrowRatePerSecondWad(curve: RateCurve, utilWad: bigint): bigint {
   const polynomial =
     mulDivFloor(utilWad, curve.linearCoeffWad, WAD) +
@@ -102,11 +81,6 @@ export interface AccrualResult {
   interestAccrued: bigint;
 }
 
-/**
- * `math/interest.rs::accrue`, projected to `now`. On-chain fields are only current as of
- * `last_update_timestamp`; this brings them up to date without a transaction.
- * interest = ceil(total_borrows * borrow_rate * elapsed), protocol_fee = interest * reserve_factor
- */
 export function accrue(reserve: ReserveLike, now: bigint): AccrualResult {
   const elapsed = now - reserve.lastUpdateTimestamp;
   if (elapsed <= 0n || reserve.totalBorrowAssets === 0n) {
@@ -131,10 +105,6 @@ export function accrue(reserve: ReserveLike, now: bigint): AccrualResult {
   return { newTotalBorrowAssets, newAccruedProtocolFees, newBorrowIndexWad, interestAccrued: interest };
 }
 
-/**
- * `math/shares.rs::debt_shares_to_assets_up`
- * debt = ceil(borrow_shares * total_borrows / total_borrow_shares)
- */
 export function debtSharesToAssetsUp(borrowShares: bigint, totalBorrowShares: bigint, totalBorrowAssets: bigint): bigint {
   if (totalBorrowShares === 0n) return 0n;
   return mulDivCeil(borrowShares, totalBorrowAssets, totalBorrowShares);
@@ -161,10 +131,6 @@ function healthFactorWad(collateralValue: bigint, debtValue: bigint): bigint {
   return mulDivFloor(collateralValue, WAD, debtValue);
 }
 
-/**
- * `math/health.rs::calculate_health`
- * health_factor = sum(collateral_usd) / sum(debt_usd); healthy when debt == 0 or health_factor > 1.10
- */
 export function calculateHealth(collaterals: CollateralValuation[], debts: DebtValuation[]): HealthSnapshot {
   const totalCollateralValue = collaterals.reduce((sum, c) => sum + c.collateralValue, 0n);
   const totalDebtValue = debts.reduce((sum, d) => sum + d.debtValue, 0n);
@@ -178,7 +144,6 @@ export function calculateHealth(collaterals: CollateralValuation[], debts: DebtV
   };
 }
 
-/** Formats a WAD-scaled (1e18) health factor as a short decimal string, or "∞" for no debt. */
 export function formatHealthFactorWad(wad: bigint): string {
   if (wad === U128_MAX) return "∞ (no debt)";
   const whole = wad / WAD;
@@ -186,7 +151,6 @@ export function formatHealthFactorWad(wad: bigint): string {
   return `${whole}.${frac.toString().padStart(4, "0")}`;
 }
 
-/** Formats a nano-USD value (1e9 per dollar, see `USD_VALUE_DECIMALS`) as a `$` string. */
 export function formatUsd(nanoUsd: bigint): string {
   const scale = pow10(USD_VALUE_DECIMALS);
   const whole = nanoUsd / scale;
@@ -194,7 +158,6 @@ export function formatUsd(nanoUsd: bigint): string {
   return `$${whole}.${frac.toString().padStart(2, "0")}`;
 }
 
-/** Formats a raw token amount as a human decimal string for the given mint decimals. */
 export function formatTokenAmount(raw: bigint, decimals: number): string {
   const scale = pow10(decimals);
   const whole = raw / scale;

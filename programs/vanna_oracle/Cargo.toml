@@ -1,0 +1,30 @@
+[package]
+name = "vanna_oracle"
+version = "0.1.0"
+description = "Vanna's oracle: the value of every holding (token prices, venue accounts)"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "vanna_oracle"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "vanna_credit_layer/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = "1.1.2"
+anchor-spl = { version = "1.1.2", features = ["token_2022"] }
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+pyth-solana-receiver-sdk = "2.0.0"
+vanna_credit_layer = { path = "../vanna_credit_layer", features = ["no-entrypoint"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
