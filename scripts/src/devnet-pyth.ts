@@ -19,6 +19,7 @@ const REFERENCE_PRICE_USD: Record<AssetKey, number> = {
   aaplx: 340,
   anthropic: 1020,
   openai: 1030,
+  skr: 0.1,
 };
 
 const PYTH_RECEIVER_PROGRAM_ID = new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");

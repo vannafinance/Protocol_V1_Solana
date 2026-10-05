@@ -14,6 +14,8 @@ npx tsx src/devnet.ts register-asset --asset anthropic || true
 npx tsx src/devnet.ts initialize-reserve --asset anthropic || true
 npx tsx src/devnet.ts register-asset --asset openai || true
 npx tsx src/devnet.ts initialize-reserve --asset openai || true
+npx tsx src/devnet.ts register-asset --asset skr || true
+npx tsx src/devnet.ts initialize-reserve --asset skr || true
 npx tsx src/lite-fork.ts register-xstocks || true
 npx tsx src/lite-fork.ts register-lite-strategy --symbol TSLAX || true
 npx tsx src/lite-fork.ts register-lite-strategy --symbol GOOGLX || true
@@ -23,4 +25,4 @@ npx tsx src/lite-fork.ts register-lite-strategy --symbol GOOGLX || true
 # margin collateral and needs no lite_strategy.
 npx tsx src/lite-fork.ts register-lite-strategy --symbol USDC || true
 npx tsx src/lite-fork.ts register-lite-strategy --symbol SOL || true
-echo "==> Bootstrap done (SOL/USDC/TSLAx/GOOGLx/AAPLx/ANTHROPIC/OPENAI + lite strategies)."
+echo "==> Bootstrap done (SOL/USDC/TSLAx/GOOGLx/AAPLx/ANTHROPIC/OPENAI/SKR + lite strategies)."

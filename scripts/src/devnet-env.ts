@@ -15,7 +15,7 @@ import * as path from "node:path";
 export const DEVNET_RPC_URL =
   process.env.DEVNET_RPC_URL ?? process.env.FORK_RPC_URL ?? "http://127.0.0.1:8899";
 
-export type AssetKey = "usdc" | "wsol" | "tslax" | "googlx" | "aaplx" | "anthropic" | "openai";
+export type AssetKey = "usdc" | "wsol" | "tslax" | "googlx" | "aaplx" | "anthropic" | "openai" | "skr";
 
 /** Real mainnet USDC (cloned onto the Surfpool fork by address). */
 export const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
@@ -26,6 +26,9 @@ export const AAPLX_MINT = new PublicKey("XsbEhLAtcf6HdfpFZ5xEMdqW8nfAvcsP5bdudRL
 /** Real mainnet PreStocks (prestocks.com) tokens — Token-2022, no real Pyth feed exists. */
 export const ANTHROPIC_MINT = new PublicKey("Pren1FvFX6J3E4kXhJuCiAD5aDmGEb7qJRncwA8Lkhw");
 export const OPENAI_MINT = new PublicKey("PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF");
+/** Solana Mobile's Seeker token — real mainnet mint, classic SPL (not Token-2022), has its own
+ *  real Pyth feed (unlike the PreStocks above, which have none). */
+export const SKR_MINT = new PublicKey("SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3");
 
 export const ASSET_MINTS: Record<AssetKey, PublicKey> = {
   usdc: USDC_MINT,
@@ -35,6 +38,7 @@ export const ASSET_MINTS: Record<AssetKey, PublicKey> = {
   aaplx: AAPLX_MINT,
   anthropic: ANTHROPIC_MINT,
   openai: OPENAI_MINT,
+  skr: SKR_MINT,
 };
 export const ASSET_DECIMALS: Record<AssetKey, number> = {
   usdc: 6,
@@ -44,6 +48,7 @@ export const ASSET_DECIMALS: Record<AssetKey, number> = {
   aaplx: 8,
   anthropic: 9,
   openai: 9,
+  skr: 6,
 };
 
 export const ASSET_TOKEN_PROGRAM: Record<AssetKey, PublicKey> = {
@@ -54,12 +59,14 @@ export const ASSET_TOKEN_PROGRAM: Record<AssetKey, PublicKey> = {
   aaplx: TOKEN_2022_PROGRAM_ID,
   anthropic: TOKEN_2022_PROGRAM_ID,
   openai: TOKEN_2022_PROGRAM_ID,
+  skr: TOKEN_PROGRAM_ID,
 };
 
 /**
  * Pyth price feed IDs (chain-agnostic; same hex on every cluster). Anthropic/OpenAI have no real
  * Pyth feed — these are synthetic sentinels (`sha256("PRESTOCKS/<SYMBOL>/USD")`) used only to
- * derive a stable fabricated PriceUpdateV2 account address on the fork.
+ * derive a stable fabricated PriceUpdateV2 account address on the fork. SKR's feed IS real
+ * (verified live via Hermes `v2/price_feeds?query=SKR`, symbol `Crypto.SKR/USD`).
  */
 export const PYTH_FEED_IDS: Record<AssetKey, string> = {
   usdc: "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
@@ -69,6 +76,7 @@ export const PYTH_FEED_IDS: Record<AssetKey, string> = {
   aaplx: "aaba35e6f33fb973bb2201d48a79ae24795affa6ba8bd50a93dcaf7da0030f36",
   anthropic: "e2b7d8199aa16dfcefcb89b6614e0a95c08bc283745412d209d0b3ca099b0721",
   openai: "1847efd0848d500cd781f05957ca787d64e80cfc7cefd734337fc9858626e634",
+  skr: "38846ec4d0dbe808091817f5c0d6ab8058e25422348ddf97db52b6c378a93bf9",
 };
 
 export const PYTH_SHARD_ID = 0;
@@ -83,8 +91,8 @@ export function feedIdToBytes(hex: string): number[] {
 
 export function assetKeyFromString(value: string): AssetKey {
   const v = value.toLowerCase();
-  if (v === "usdc" || v === "wsol" || v === "tslax" || v === "googlx" || v === "aaplx" || v === "anthropic" || v === "openai") return v;
-  throw new Error(`unknown asset "${value}" — expected usdc|wsol|tslax|googlx|aaplx|anthropic|openai`);
+  if (v === "usdc" || v === "wsol" || v === "tslax" || v === "googlx" || v === "aaplx" || v === "anthropic" || v === "openai" || v === "skr") return v;
+  throw new Error(`unknown asset "${value}" — expected usdc|wsol|tslax|googlx|aaplx|anthropic|openai|skr`);
 }
 
 export function tokenProgramFor(asset: AssetKey): PublicKey {

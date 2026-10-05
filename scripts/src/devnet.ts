@@ -56,6 +56,7 @@ const RISK_DEFAULTS: Record<AssetKey, { ltv: number; liqThreshold: number; liqBo
   aaplx: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
   anthropic: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
   openai: { ltv: 5500, liqThreshold: 6500, liqBonus: 700 },
+  skr: { ltv: 5000, liqThreshold: 6000, liqBonus: 800 },
 };
 
 interface Ctx {
@@ -69,7 +70,7 @@ interface Ctx {
 /** Refreshes real Pyth prices for every registered asset — needed by any instruction that scans
  * every active position on a margin account (borrow, withdraw-collateral, liquidate). */
 async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> {
-  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai (including Kamino collateral)");
+  log("refreshing Pyth prices", "usdc + wsol + tslax + googlx + aaplx + anthropic + openai + skr (including Kamino collateral)");
   return {
     usdc: await refreshPrice(ctx.conn, ctx.anchorWallet, "usdc"),
     wsol: await refreshPrice(ctx.conn, ctx.anchorWallet, "wsol"),
@@ -78,6 +79,7 @@ async function refreshAllPrices(ctx: Ctx): Promise<Record<AssetKey, PublicKey>> 
     aaplx: await refreshPrice(ctx.conn, ctx.anchorWallet, "aaplx"),
     anthropic: await refreshPrice(ctx.conn, ctx.anchorWallet, "anthropic"),
     openai: await refreshPrice(ctx.conn, ctx.anchorWallet, "openai"),
+    skr: await refreshPrice(ctx.conn, ctx.anchorWallet, "skr"),
   };
 }
 
