@@ -19,7 +19,8 @@ const REFERENCE_PRICE_USD: Record<AssetKey, number> = {
   aaplx: 340,
   anthropic: 1020,
   openai: 1030,
-  skr: 0.1,
+  // Real live USD price (verified via DexScreener's public API, highest-liquidity SKR/USDC pair).
+  skr: 0.018,
 };
 
 const PYTH_RECEIVER_PROGRAM_ID = new PublicKey("rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ");
